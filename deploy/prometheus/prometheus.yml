@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: controller
+    static_configs:
+      - targets: ["controller:8080"]
+
+  - job_name: workers
+    static_configs:
+      - targets:
+          - "worker1:8001"
+          - "worker2:8001"
+          - "worker3:8001"
+          - "worker4:8001"
