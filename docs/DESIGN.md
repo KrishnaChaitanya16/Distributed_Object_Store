@@ -536,6 +536,8 @@ Row 5 — Per-Worker
 | Gossip protocol for worker discovery | Overkill for 4 workers. Heartbeat lease table is sufficient. |
 | Raft / Paxos consensus | Single controller — no consensus needed. |
 | Hinted handoff | R=2 self-healing covers the same failure scenario more simply. |
+| Object versioning | Significant schema complexity, 3-4 day cost, low marginal value over existing feature set. CAS already deduplicates unchanged chunks across re-uploads. Deferred post-submission. |
+| RBAC / User Authentication | Not in project requirements. Chunk-level RBAC is semantically wrong in a CAS system (chunks are shared across owners via dedup). Access control belongs at the object level. `owner_id` field reserved in ObjectManifest for future extension. Auth middleware would be injected at transport layer without touching service or storage layers. |
 
 ---
 
@@ -544,6 +546,7 @@ Row 5 — Per-Worker
 | Date | Change | Reason |
 |---|---|---|
 | 2026-11-02 | Document created | Initial architecture design session |
+| 2026-11-04 | Added RBAC and object versioning to cut list | Not in requirements, too costly for Nov 20 deadline; owner_id field reserved in model |
 | 2026-11-02 | Added CV formula and 14% imbalance justification for 50 vnodes | Confirmed choice is deliberate, not arbitrary |
 | 2026-11-02 | Incorporated 9 correctness gaps into relevant sections | Gap analysis identified data-loss races, atomicity issues, and storm conditions |
 

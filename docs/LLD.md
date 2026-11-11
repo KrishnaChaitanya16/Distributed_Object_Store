@@ -301,77 +301,122 @@ Re-registration             → ONLINE   (cancels pending heal if within 30s win
 
 ## 5. Key Interfaces
 
-These are the ports in the hexagonal model. Service layer depends only on these — never on concrete types.
+The service layer depends only on these interfaces — never on concrete types. Each interface has exactly one implementation, injected at startup from `cmd/*/main.go`.
 
 ```go
 // pkg/models/interfaces.go
+// package models
+// imports: context, io, time, errors
+
+// --- Sentinel errors ---
+var (
+    ErrNotFound      = errors.New("not found")
+    ErrAlreadyExists = errors.New("already exists")
+    ErrNoWorkers     = errors.New("no healthy workers available")
+    ErrLockHeld      = errors.New("idempotency key already processing")
+)
 
 // MetadataRepository — implemented by internal/controller/metadata
+// Only package that imports bbolt. All methods are goroutine-safe (bbolt handles locking).
 type MetadataRepository interface {
     // Objects
-    CreateObject(ctx context.Context, obj *ObjectManifest) error
-    GetObject(ctx context.Context, id string) (*ObjectManifest, error)
-    CommitObject(ctx context.Context, id string, idempotencyKey string, response []byte) error
-    DeleteObject(ctx context.Context, id string) error
-    ListObjects(ctx context.Context, limit, offset int) ([]*ObjectManifest, error)
-    UpdateMetadata(ctx context.Context, id string, patch map[string]string, ifMatch int64) (*ObjectManifest, error)
+    SaveObject(ctx context.Context, obj *ObjectManifest) error
+    GetObject(ctx context.Context, objectID string) (*ObjectManifest, error)
+    UpdateObjectStatus(ctx context.Context, objectID string, status ObjectStatus) error
+    ListObjects(ctx context.Context) ([]*ObjectManifest, error)
+    ListObjectsByStatus(ctx context.Context, status ObjectStatus) ([]*ObjectManifest, error)
+    DeleteObject(ctx context.Context, objectID string) error
+
+    // ChunkRefs — ordered per-object chunk list, stored in separate obj_chunks bucket
+    // Implementation uses bbolt cursor to avoid loading all refs into memory at once.
+    SaveChunkRefs(ctx context.Context, objectID string, refs []ChunkRef) error
+    GetChunkRefs(ctx context.Context, objectID string) ([]ChunkRef, error)
 
     // Chunks
+    SaveChunk(ctx context.Context, chunk *ChunkRecord) error
     GetChunk(ctx context.Context, chunkID string) (*ChunkRecord, error)
-    CreateChunk(ctx context.Context, chunk *ChunkRecord) error
-    MarkChunkDurable(ctx context.Context, chunkID string) error
-    IncrementChunkRef(ctx context.Context, chunkID string) error
-    DecrementChunkRef(ctx context.Context, chunkID string) (newCount int, err error)
-    MarkChunkPendingDelete(ctx context.Context, chunkID string) error
-    ListPendingDeleteChunks(ctx context.Context) ([]*ChunkRecord, error)
-    ListDegradedChunks(ctx context.Context) ([]*ChunkRecord, error)
+    UpdateChunkState(ctx context.Context, chunkID string, state ChunkState) error
+    AddChunkReplica(ctx context.Context, chunkID string, replica Replica) error
+    RemoveChunkReplica(ctx context.Context, chunkID string, workerID string) error
+    IncrementChunkRefCount(ctx context.Context, chunkID string) error
+    // Returns new count — caller deletes the chunk if count == 0
+    DecrementChunkRefCount(ctx context.Context, chunkID string) (newCount int, err error)
+    DeleteChunk(ctx context.Context, chunkID string) error
+    ListChunksByState(ctx context.Context, state ChunkState) ([]*ChunkRecord, error)
+    ListUnderReplicatedChunks(ctx context.Context, minReplicas int) ([]*ChunkRecord, error)
 
     // Workers
-    UpsertWorker(ctx context.Context, w *WorkerRecord) error
-    GetWorker(ctx context.Context, id string) (*WorkerRecord, error)
+    SaveWorker(ctx context.Context, worker *WorkerRecord) error
+    GetWorker(ctx context.Context, workerID string) (*WorkerRecord, error)
+    UpdateWorkerStatus(ctx context.Context, workerID string, status WorkerStatus) error
     ListWorkers(ctx context.Context) ([]*WorkerRecord, error)
-    UpdateWorkerStatus(ctx context.Context, id string, status WorkerStatus) error
 
-    // Idempotency
-    GetIdempotencyRecord(ctx context.Context, key string) (*IdempotencyRecord, error)
-    SetIdempotencyProcessing(ctx context.Context, key string) error
+    // Idempotency — must be called in this sequence for 2PC upload correctness:
+    //   1. AcquireIdempotencyLock — returns existing record if key seen before
+    //   2. ... do upload work ...
+    //   3. CommitIdempotencyResult — atomically flip PROCESSING → COMMITTED
+    // Returns (nil, nil) if lock was just acquired (proceed with upload).
+    // Returns (record, nil) if key already exists — replay the cached response.
+    AcquireIdempotencyLock(ctx context.Context, key string) (existing *IdempotencyRecord, err error)
+    CommitIdempotencyResult(ctx context.Context, key string, statusCode int, body []byte) error
+    PurgeExpiredIdempotencyKeys(ctx context.Context) error
 }
 
 // PlacementStrategy — implemented by internal/controller/ring
+// Pure in-memory, no I/O. All methods are goroutine-safe (sync.RWMutex inside).
 type PlacementStrategy interface {
+    // Returns ErrNoWorkers if ring is empty.
     Primary(chunkID string) (workerID string, err error)
+    // Returns ErrNoWorkers if no healthy worker other than excludeWorkerID exists.
     Secondary(chunkID string, excludeWorkerID string) (workerID string, err error)
-    AddWorker(workerID string)
+    AddWorker(workerID string, address string)
     RemoveWorker(workerID string)
+    Workers() []string
 }
 
 // ChunkStore — implemented by internal/worker/storage
+// Only package that touches the filesystem. All writes are atomic (temp→fsync→rename→fsync dir).
 type ChunkStore interface {
-    Write(ctx context.Context, chunkID string, r io.Reader) error
-    Read(ctx context.Context, chunkID string, w io.Writer) error
+    // Write streams data to disk atomically, appends CRC32C footer.
+    Write(ctx context.Context, chunkID string, data io.Reader, size int64) error
+    // Read returns a ReadCloser — caller MUST close it. Enables zero-copy sendfile path.
+    Read(ctx context.Context, chunkID string) (io.ReadCloser, error)
     Delete(ctx context.Context, chunkID string) error
-    Exists(ctx context.Context, chunkID string) bool
+    Exists(ctx context.Context, chunkID string) (bool, error)
     List(ctx context.Context) ([]string, error)
-    VerifyCRC(ctx context.Context, chunkID string) (bool, error)
+    // VerifyCRC reads stored footer and recomputes CRC32C — used by background scrubber.
+    VerifyCRC(ctx context.Context, chunkID string) (ok bool, err error)
 }
 
 // WorkerClientPool — implemented by internal/controller/workerclient
+// Wraps all outbound HTTP calls to workers. Each call goes through the worker's circuit breaker.
+// Takes workerAddr (host:port) not workerID — the pool is stateless; callers resolve the address.
 type WorkerClientPool interface {
-    PutChunk(ctx context.Context, workerID string, chunkID string, r io.Reader, size int64) error
-    GetChunk(ctx context.Context, workerID string, chunkID string, w io.Writer) error
-    DeleteChunk(ctx context.Context, workerID string, chunkID string) error
-    ReplicatePeer(ctx context.Context, sourceWorkerID string, chunkID string, targetAddr string) error
-    ListChunks(ctx context.Context, workerID string) ([]string, error)
+    PutChunk(ctx context.Context, workerAddr string, chunkID string, data io.Reader, size int64) error
+    // Returns ReadCloser — caller MUST close it.
+    GetChunk(ctx context.Context, workerAddr string, chunkID string) (io.ReadCloser, error)
+    DeleteChunk(ctx context.Context, workerAddr string, chunkID string) error
+    // Tells sourceAddr to stream chunkID directly to targetAddr (P2P — controller not in data path).
+    ReplicatePeer(ctx context.Context, sourceAddr string, chunkID string, targetAddr string) error
+    ListChunks(ctx context.Context, workerAddr string) ([]string, error)
 }
 
 // HealthMonitor — implemented by internal/controller/health
+// In-memory lease table. No context needed — all reads are map lookups under RWMutex.
 type HealthMonitor interface {
+    // RecordHeartbeat is called on every heartbeat and on worker registration.
     RecordHeartbeat(workerID string)
     GetWorkerStatus(workerID string) WorkerStatus
     ListOnlineWorkers() []string
+    // Subscribe returns a channel that receives an event each time a worker goes OFFLINE.
+    // The healing goroutine blocks on this channel — idiomatic Go Observer pattern.
+    Subscribe() <-chan WorkerOfflineEvent
 }
 
 // ExistenceFilter — implemented by internal/controller/bloom
+// Probabilistic: MightExist can return true for a chunk that doesn't exist (false positive).
+// Never returns false for a chunk that does exist (no false negatives).
+// No Remove method — standard bloom filters don't support deletion.
 type ExistenceFilter interface {
     MightExist(chunkID string) bool
     Add(chunkID string)
@@ -710,3 +755,4 @@ cmd/worker/main.go
 |---|---|---|
 | 2026-11-02 | LLD created | Architecture style, modules, interfaces, and patterns finalized |
 | 2026-11-02 | Replaced Hexagonal with Layered Architecture, all patterns mapped to GoF | Hexagonal is an architectural philosophy not a GoF pattern; replaced non-GoF patterns (Circuit Breaker→State, Saga→Command, Repository→Facade/Proxy) |
+| 2026-11-11 | Finalized all 6 interface signatures in §5 with full method set, sentinel errors, and inline rationale comments | Ready for implementation — interfaces are the contract both tracks code against |
