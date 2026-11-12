@@ -1,26 +1,13 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
-	"strconv"
+	"os/signal"
+	"syscall"
+
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/config"
 )
-
-func main() {
-	cfg := loadConfig()
-	log.Printf("worker %s starting on :%d  data=%s  controller=%s",
-		cfg.workerID, cfg.port, cfg.dataDir, cfg.controllerAddr)
-
-	// TODO: construct ChunkStore (internal/worker/storage)
-	// TODO: construct scrubber goroutine
-	// TODO: register HTTP routes (PUT/GET/DELETE chunk, inventory, replicate-peer)
-	// TODO: register with controller (with retry + backoff)
-	// TODO: start heartbeat goroutine (every 2s)
-	// TODO: start HTTP server + graceful shutdown on SIGTERM
-
-	fmt.Println("worker wired — replace TODOs with real wiring")
-}
 
 type workerConfig struct {
 	workerID       string
@@ -29,33 +16,41 @@ type workerConfig struct {
 	controllerAddr string
 }
 
-func loadConfig() workerConfig {
-	wid := os.Getenv("WORKER_ID")
-	if wid == "" {
-		log.Fatal("WORKER_ID env var is required")
+func main() {
+	cfg, err := loadConfig(os.Getenv)
+	if err != nil {
+		log.Fatalf("worker config: %v", err)
+	}
+	log.Printf("worker %s starting on :%d data=%s controller=%s", cfg.workerID, cfg.port, cfg.dataDir, cfg.controllerAddr)
+
+	// TODO: wire ChunkStore, scrubber, HTTP routes, registration + heartbeat loops
+
+	waitForShutdown()
+}
+
+func loadConfig(getenv config.Getenv) (workerConfig, error) {
+	id, err := config.Required(getenv, "WORKER_ID")
+	if err != nil {
+		return workerConfig{}, err
+	}
+	port, err := config.Port(getenv, "WORKER_PORT", 8001)
+	if err != nil {
+		return workerConfig{}, err
+	}
+	ctrl, err := config.HostPort(getenv, "CONTROLLER_ADDRESS", "controller:8080")
+	if err != nil {
+		return workerConfig{}, err
 	}
 	return workerConfig{
-		workerID:       wid,
-		port:           envInt("WORKER_PORT", 8001),
-		dataDir:        envStr("DATA_DIR", "/data"),
-		controllerAddr: envStr("CONTROLLER_ADDRESS", "controller:8080"),
-	}
+		workerID:       id,
+		port:           port,
+		dataDir:        config.Str(getenv, "DATA_DIR", "/data"),
+		controllerAddr: ctrl,
+	}, nil
 }
 
-func envStr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			log.Fatalf("invalid %s=%q: %v", key, v, err)
-		}
-		return n
-	}
-	return def
+func waitForShutdown() {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	log.Printf("received %s, shutting down", <-sig)
 }

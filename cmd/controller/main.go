@@ -1,29 +1,13 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
-	"strconv"
+	"os/signal"
+	"syscall"
+
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/config"
 )
-
-func main() {
-	cfg := loadConfig()
-	log.Printf("controller starting on :%d  db=%s", cfg.port, cfg.dbPath)
-
-	// TODO: open bbolt db
-	// TODO: construct MetadataRepository
-	// TODO: construct PlacementStrategy (hash ring)
-	// TODO: construct ExistenceFilter (bloom)
-	// TODO: construct HealthMonitor + subscribe to offline events
-	// TODO: construct WorkerClientPool
-	// TODO: construct service layer
-	// TODO: start background goroutines (healer, reconciler, GC)
-	// TODO: register HTTP routes
-	// TODO: start HTTP server + graceful shutdown on SIGTERM
-
-	fmt.Println("controller wired — replace TODOs with real wiring")
-}
 
 type controllerConfig struct {
 	port       int
@@ -31,28 +15,37 @@ type controllerConfig struct {
 	vnodeCount int
 }
 
-func loadConfig() controllerConfig {
+func main() {
+	cfg, err := loadConfig(os.Getenv)
+	if err != nil {
+		log.Fatalf("controller config: %v", err)
+	}
+	log.Printf("controller starting on :%d db=%s vnodes=%d", cfg.port, cfg.dbPath, cfg.vnodeCount)
+
+	// TODO: wire bbolt, MetadataRepository, PlacementStrategy, ExistenceFilter, HealthMonitor, WorkerClientPool
+	// TODO: start healer, reconciler, GC goroutines and the HTTP server
+
+	waitForShutdown()
+}
+
+func loadConfig(getenv config.Getenv) (controllerConfig, error) {
+	port, err := config.Port(getenv, "CONTROLLER_PORT", 8080)
+	if err != nil {
+		return controllerConfig{}, err
+	}
+	vnodes, err := config.PositiveInt(getenv, "VNODE_COUNT", 50)
+	if err != nil {
+		return controllerConfig{}, err
+	}
 	return controllerConfig{
-		port:       envInt("CONTROLLER_PORT", 8080),
-		dbPath:     envStr("DB_PATH", "/data/meta.db"),
-		vnodeCount: envInt("VNODE_COUNT", 50),
-	}
+		port:       port,
+		dbPath:     config.Str(getenv, "DB_PATH", "/data/meta.db"),
+		vnodeCount: vnodes,
+	}, nil
 }
 
-func envStr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			log.Fatalf("invalid %s=%q: %v", key, v, err)
-		}
-		return n
-	}
-	return def
+func waitForShutdown() {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	log.Printf("received %s, shutting down", <-sig)
 }
