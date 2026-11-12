@@ -1,0 +1,151 @@
+networks:
+  minidfs:
+    driver: bridge
+
+volumes:
+  controller-data:
+  worker1-data:
+  worker2-data:
+  worker3-data:
+  worker4-data:
+  prometheus-data:
+  grafana-data:
+
+services:
+
+  # ── Controller ────────────────────────────────────────────────────────────
+  controller:
+    build:
+      context: ..
+      dockerfile: cmd/controller/Dockerfile
+    container_name: controller
+    networks: [minidfs]
+    ports:
+      - "${CONTROLLER_HOST_PORT:-8080}:8080"  # public REST API
+      - "${WEBUI_HOST_PORT:-8081}:8081"  # web UI
+    volumes:
+      - controller-data:/data
+    environment:
+      CONTROLLER_PORT: "8080"
+      DB_PATH: /data/meta.db
+      VNODE_COUNT: "50"
+      HEARTBEAT_TIMEOUT_S: "6"
+      HEDGE_THRESHOLD_MS: "25"
+      CIRCUIT_BREAKER_FAILURES: "3"
+      CIRCUIT_BREAKER_COOLDOWN_S: "10"
+      STAGED_TIMEOUT_MIN: "5"
+      IDEMPOTENCY_TTL_H: "24"
+      BLOOM_FP_RATE: "0.01"
+    restart: unless-stopped
+
+  # ── Workers ───────────────────────────────────────────────────────────────
+  worker1:
+    build:
+      context: ..
+      dockerfile: cmd/worker/Dockerfile
+    container_name: worker1
+    networks: [minidfs]
+    ports:
+      - "${WORKER1_HOST_PORT:-8001}:8001"
+    volumes:
+      - worker1-data:/data
+    environment:
+      WORKER_ID: worker1
+      WORKER_PORT: "8001"
+      DATA_DIR: /data
+      CONTROLLER_ADDRESS: controller:8080
+      HEARTBEAT_INTERVAL_S: "2"
+      SCRUB_INTERVAL_S: "30"
+    depends_on: [controller]
+    restart: unless-stopped
+
+  worker2:
+    build:
+      context: ..
+      dockerfile: cmd/worker/Dockerfile
+    container_name: worker2
+    networks: [minidfs]
+    ports:
+      - "${WORKER2_HOST_PORT:-8002}:8001"
+    volumes:
+      - worker2-data:/data
+    environment:
+      WORKER_ID: worker2
+      WORKER_PORT: "8001"
+      DATA_DIR: /data
+      CONTROLLER_ADDRESS: controller:8080
+      HEARTBEAT_INTERVAL_S: "2"
+      SCRUB_INTERVAL_S: "30"
+    depends_on: [controller]
+    restart: unless-stopped
+
+  worker3:
+    build:
+      context: ..
+      dockerfile: cmd/worker/Dockerfile
+    container_name: worker3
+    networks: [minidfs]
+    ports:
+      - "${WORKER3_HOST_PORT:-8003}:8001"
+    volumes:
+      - worker3-data:/data
+    environment:
+      WORKER_ID: worker3
+      WORKER_PORT: "8001"
+      DATA_DIR: /data
+      CONTROLLER_ADDRESS: controller:8080
+      HEARTBEAT_INTERVAL_S: "2"
+      SCRUB_INTERVAL_S: "30"
+    depends_on: [controller]
+    restart: unless-stopped
+
+  worker4:
+    build:
+      context: ..
+      dockerfile: cmd/worker/Dockerfile
+    container_name: worker4
+    networks: [minidfs]
+    ports:
+      - "${WORKER4_HOST_PORT:-8004}:8001"
+    volumes:
+      - worker4-data:/data
+    environment:
+      WORKER_ID: worker4
+      WORKER_PORT: "8001"
+      DATA_DIR: /data
+      CONTROLLER_ADDRESS: controller:8080
+      HEARTBEAT_INTERVAL_S: "2"
+      SCRUB_INTERVAL_S: "30"
+    depends_on: [controller]
+    restart: unless-stopped
+
+  # ── Observability ─────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: prometheus
+    networks: [minidfs]
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: grafana
+    networks: [minidfs]
+    ports:
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on: [prometheus]
+    restart: unless-stopped
