@@ -29,7 +29,7 @@ func (s *Store) Read(ctx context.Context, chunkID string) (io.ReadCloser, error)
 		f.Close()
 		return nil, ErrCorruptChunk
 	}
-	return &chunkReader{lr: io.LimitedReader{R: f, N: dataLen}, f: f}, nil
+	return &chunkReader{lr: io.LimitedReader{R: f, N: dataLen}, f: f, size: dataLen}, nil
 }
 
 // VerifyCRC reports whether the stored data still matches its footer; a truncated file is reported as not ok.
@@ -84,9 +84,13 @@ func (s *Store) open(chunkID string) (*os.File, int64, error) {
 
 // chunkReader hands io.Copy an *io.LimitedReader over *os.File so net.TCPConn can use sendfile(2).
 type chunkReader struct {
-	lr io.LimitedReader
-	f  *os.File
+	lr   io.LimitedReader
+	f    *os.File
+	size int64
 }
+
+// Size is the data length, so HTTP handlers can set Content-Length and keep the sendfile path.
+func (c *chunkReader) Size() int64 { return c.size }
 
 func (c *chunkReader) Read(p []byte) (int, error) { return c.lr.Read(p) }
 

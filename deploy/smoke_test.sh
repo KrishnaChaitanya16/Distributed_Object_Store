@@ -57,17 +57,37 @@ docker run --rm -e WORKER_ID=w -e CONTROLLER_ADDRESS=controller "$img" >/dev/nul
 cimg=$(docker inspect -f '{{.Config.Image}}' controller)
 docker run --rm -e VNODE_COUNT=0 "$cimg" >/dev/null 2>&1; check "controller VNODE_COUNT=0 exit code" "$?" "1"
 
+echo "== worker data plane over real HTTP"
+W1="http://localhost:$WORKER1_HOST_PORT"
+W2="http://localhost:$WORKER2_HOST_PORT"
+tmp=$(mktemp -d); trap 'cleanup; rm -rf "$tmp"' EXIT
+head -c 1048576 /dev/urandom > "$tmp/chunk"
+id=$(sha256sum "$tmp/chunk" | cut -d' ' -f1)
+code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+check "PUT 1 MiB chunk to worker1" "$(code -X PUT --data-binary @"$tmp/chunk" "$W1/internal/chunks/$id")" "201"
+curl -s "$W1/internal/chunks/$id" -o "$tmp/back"
+check "GET returns identical bytes" "$(sha256sum < "$tmp/back" | cut -d' ' -f1)" "$id"
+check "PUT with wrong hash rejected" "$(code -X PUT --data-binary 'x' "$W1/internal/chunks/$id")" "400"
+check "worker1 inventory lists the chunk" "$(curl -s "$W1/internal/workers/worker1/chunks" | grep -c "$id")" "1"
+check "worker2 does not have it yet" "$(code "$W2/internal/chunks/$id")" "404"
+check "replicate-peer worker1 -> worker2" "$(code -X POST -d "{\"chunk_id\":\"$id\",\"target_addr\":\"worker2:8001\"}" "$W1/internal/workers/replicate-peer")" "204"
+curl -s "$W2/internal/chunks/$id" -o "$tmp/peer"
+check "worker2 copy is identical" "$(sha256sum < "$tmp/peer" | cut -d' ' -f1)" "$id"
+check "worker1 keeps retrying registration" "$(docker logs worker1 2>&1 | grep -c 'register attempt' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
+
 echo "== graceful stop and restart keep data"
-docker exec worker2 sh -c 'echo persisted > /data/marker' >/dev/null 2>&1
 start=$(date +%s)
 docker stop -t 10 worker2 >/dev/null 2>&1
 took=$(( $(date +%s) - start ))
 check "worker2 exits 0 on SIGTERM" "$(docker inspect -f '{{.State.ExitCode}}' worker2)" "0"
 check "worker2 stops before kill timeout" "$([ "$took" -lt 5 ] && echo yes || echo no)" "yes"
-check "worker2 logged shutdown" "$(docker logs worker2 2>&1 | grep -c 'received terminated')" "1"
+check "worker2 logged shutdown" "$(docker logs worker2 2>&1 | grep -c 'worker worker2 shutting down')" "1"
+check "worker2 unreachable while stopped" "$(code --max-time 2 "$W2/internal/chunks/$id")" "000"
 docker start worker2 >/dev/null 2>&1; sleep 2
 check "worker2 running after restart" "$(state worker2)" "running"
-check "worker2 volume survived restart" "$(docker exec worker2 cat /data/marker 2>/dev/null)" "persisted"
+curl -s "$W2/internal/chunks/$id" -o "$tmp/after"
+check "worker2 chunk survived restart" "$(sha256sum < "$tmp/after" | cut -d' ' -f1)" "$id"
+check "worker2 delete" "$(code -X DELETE "$W2/internal/chunks/$id")" "204"
 
 echo "== result: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -792,3 +792,20 @@ func TestNewFailsOnUnreadableDir(t *testing.T) {
 		t.Fatal("expected error scanning unreadable chunk dir")
 	}
 }
+
+func TestReadReportsSize(t *testing.T) {
+	for _, n := range []int{0, 1, 5000, MaxChunkSize} {
+		s, _ := newStore(t)
+		data, id := chunk(t, n)
+		put(t, s, data, id)
+		rc, err := s.Read(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sz, ok := rc.(interface{ Size() int64 })
+		if !ok || sz.Size() != int64(n) {
+			t.Fatalf("Size() missing or wrong for %d-byte chunk", n)
+		}
+		rc.Close()
+	}
+}
