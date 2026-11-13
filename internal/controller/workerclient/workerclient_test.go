@@ -73,7 +73,7 @@ func workerAddr(srv *httptest.Server) string {
 func TestPool_PutChunk_Success(t *testing.T) {
 	srv, pool := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPut, r.Method)
-		assert.Equal(t, "/chunks/abc123", r.URL.Path)
+		assert.Equal(t, "/internal/chunks/abc123", r.URL.Path)
 		body, _ := io.ReadAll(r.Body)
 		assert.Equal(t, "hello", string(body))
 		w.WriteHeader(http.StatusCreated)
@@ -99,7 +99,7 @@ func TestPool_PutChunk_WorkerError(t *testing.T) {
 func TestPool_GetChunk_Success(t *testing.T) {
 	srv, pool := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
-		assert.Equal(t, "/chunks/abc123", r.URL.Path)
+		assert.Equal(t, "/internal/chunks/abc123", r.URL.Path)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("chunkdata")) //nolint:errcheck
 	})
@@ -137,9 +137,10 @@ func TestPool_DeleteChunk_Success(t *testing.T) {
 func TestPool_ReplicatePeer_Success(t *testing.T) {
 	srv, pool := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPost, r.Method)
-		assert.Equal(t, "/chunks/abc123/replicate", r.URL.Path)
+		assert.Equal(t, "/internal/workers/replicate-peer", r.URL.Path)
 		var body map[string]string
 		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		assert.Equal(t, "abc123", body["chunk_id"])
 		assert.Equal(t, "10.0.0.5:8080", body["target_addr"])
 		w.WriteHeader(http.StatusOK)
 	})
@@ -152,12 +153,12 @@ func TestPool_ReplicatePeer_Success(t *testing.T) {
 func TestPool_ListChunks_Success(t *testing.T) {
 	srv, pool := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
-		assert.Equal(t, "/chunks", r.URL.Path)
-		json.NewEncoder(w).Encode([]string{"id1", "id2", "id3"}) //nolint:errcheck
+		assert.Equal(t, "/internal/workers/w1/chunks", r.URL.Path)
+		json.NewEncoder(w).Encode(map[string]any{"worker_id": "w1", "chunk_ids": []string{"id1", "id2", "id3"}, "count": 3}) //nolint:errcheck
 	})
 	defer srv.Close()
 
-	ids, err := pool.ListChunks(context.Background(), workerAddr(srv))
+	ids, err := pool.ListChunks(context.Background(), workerAddr(srv), "w1")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"id1", "id2", "id3"}, ids)
 }

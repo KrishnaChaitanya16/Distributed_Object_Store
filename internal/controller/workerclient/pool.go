@@ -96,11 +96,11 @@ func (p *Pool) ReplicatePeer(ctx context.Context, sourceAddr string, chunkID str
 	})
 }
 
-func (p *Pool) ListChunks(ctx context.Context, workerAddr string) ([]string, error) {
+func (p *Pool) ListChunks(ctx context.Context, workerAddr string, workerID string) ([]string, error) {
 	var ids []string
 	err := p.call(workerAddr, func(c *workerClient) error {
 		var e error
-		ids, e = c.ListChunks(ctx)
+		ids, e = c.ListChunks(ctx, workerID)
 		return e
 	})
 	return ids, err

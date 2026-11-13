@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"time"
+
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -18,6 +20,70 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(objects) //nolint:errcheck
+}
+
+// GET /api/v1/objects/{id}/metadata — returns metadata without downloading data.
+func (s *Server) handleGetMetadata(w http.ResponseWriter, r *http.Request) {
+	objectID := r.PathValue("id")
+	manifest, err := s.meta.GetObject(r.Context(), objectID)
+	if err != nil {
+		if errors.Is(err, models.ErrNotFound) {
+			http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	if manifest.Status != models.StatusCommitted {
+		http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(manifest) //nolint:errcheck
+}
+
+// PATCH /api/v1/objects/{id}/metadata — updates custom metadata key-value pairs.
+func (s *Server) handlePatchMetadata(w http.ResponseWriter, r *http.Request) {
+	objectID := r.PathValue("id")
+	log := slog.With("handler", "patch-metadata", "object_id", objectID)
+
+	manifest, err := s.meta.GetObject(r.Context(), objectID)
+	if err != nil {
+		if errors.Is(err, models.ErrNotFound) {
+			http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
+			return
+		}
+		log.Error("get object", "err", err)
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	if manifest.Status != models.StatusCommitted {
+		http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
+		return
+	}
+
+	var patch map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	if manifest.CustomMetadata == nil {
+		manifest.CustomMetadata = make(map[string]string)
+	}
+	for k, v := range patch {
+		manifest.CustomMetadata[k] = v
+	}
+	manifest.ModifiedAt = time.Now().UTC()
+
+	if err := s.meta.SaveObject(r.Context(), manifest); err != nil {
+		log.Error("save object", "err", err)
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(manifest) //nolint:errcheck
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {

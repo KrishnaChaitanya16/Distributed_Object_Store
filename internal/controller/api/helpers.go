@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"io"
+	"strconv"
 )
 
 // newID generates a random 16-byte hex object ID.
@@ -28,4 +29,8 @@ func noCancel(_ interface{ Done() <-chan struct{} }) context.Context {
 
 func noCancel2() context.Context {
 	return context.Background()
+}
+
+func itoa(n int) string {
+	return strconv.Itoa(n)
 }

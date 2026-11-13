@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
 // workerClient makes HTTP calls to a single worker node.
@@ -21,7 +23,7 @@ func newWorkerClient(baseURL string, httpClient *http.Client) *workerClient {
 
 // PutChunk streams chunk data to the worker via PUT /chunks/{chunkID}.
 func (c *workerClient) PutChunk(ctx context.Context, chunkID string, data io.Reader, size int64) error {
-	url := fmt.Sprintf("%s/chunks/%s", c.baseURL, chunkID)
+	url := fmt.Sprintf("%s/internal/chunks/%s", c.baseURL, chunkID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, data)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -45,7 +47,7 @@ func (c *workerClient) PutChunk(ctx context.Context, chunkID string, data io.Rea
 // GetChunk fetches chunk data from the worker via GET /chunks/{chunkID}.
 // Caller must close the returned ReadCloser.
 func (c *workerClient) GetChunk(ctx context.Context, chunkID string) (io.ReadCloser, error) {
-	url := fmt.Sprintf("%s/chunks/%s", c.baseURL, chunkID)
+	url := fmt.Sprintf("%s/internal/chunks/%s", c.baseURL, chunkID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -68,7 +70,7 @@ func (c *workerClient) GetChunk(ctx context.Context, chunkID string) (io.ReadClo
 
 // DeleteChunk removes a chunk from the worker via DELETE /chunks/{chunkID}.
 func (c *workerClient) DeleteChunk(ctx context.Context, chunkID string) error {
-	url := fmt.Sprintf("%s/chunks/%s", c.baseURL, chunkID)
+	url := fmt.Sprintf("%s/internal/chunks/%s", c.baseURL, chunkID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -90,9 +92,9 @@ func (c *workerClient) DeleteChunk(ctx context.Context, chunkID string) error {
 // ReplicatePeer tells the source worker to stream a chunk directly to targetAddr
 // via POST /chunks/{chunkID}/replicate.
 func (c *workerClient) ReplicatePeer(ctx context.Context, chunkID string, targetAddr string) error {
-	url := fmt.Sprintf("%s/chunks/%s/replicate", c.baseURL, chunkID)
+	url := fmt.Sprintf("%s/internal/workers/replicate-peer", c.baseURL)
 
-	body, err := json.Marshal(map[string]string{"target_addr": targetAddr})
+	body, err := json.Marshal(map[string]string{"chunk_id": chunkID, "target_addr": targetAddr})
 	if err != nil {
 		return fmt.Errorf("marshal replicate body: %w", err)
 	}
@@ -118,9 +120,9 @@ func (c *workerClient) ReplicatePeer(ctx context.Context, chunkID string, target
 	return nil
 }
 
-// ListChunks fetches the list of chunk IDs stored on the worker via GET /chunks.
-func (c *workerClient) ListChunks(ctx context.Context) ([]string, error) {
-	url := fmt.Sprintf("%s/chunks", c.baseURL)
+// ListChunks fetches the list of chunk IDs stored on the worker via GET /internal/workers/{workerID}/chunks.
+func (c *workerClient) ListChunks(ctx context.Context, workerID string) ([]string, error) {
+	url := fmt.Sprintf("%s/internal/workers/%s/chunks", c.baseURL, workerID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -136,9 +138,9 @@ func (c *workerClient) ListChunks(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("list chunks: worker returned %d", resp.StatusCode)
 	}
 
-	var ids []string
-	if err := json.NewDecoder(resp.Body).Decode(&ids); err != nil {
+	var inv models.InventoryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&inv); err != nil {
 		return nil, fmt.Errorf("decode chunk list: %w", err)
 	}
-	return ids, nil
+	return inv.ChunkIDs, nil
 }

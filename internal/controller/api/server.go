@@ -8,7 +8,7 @@ import (
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
-const chunkSize = 4 * 1024 * 1024 // 4 MiB
+const chunkSize = 1 * 1024 * 1024 // 1 MiB — per spec §4
 
 // Server wires together all controller dependencies and serves the REST API.
 type Server struct {
@@ -34,10 +34,17 @@ func New(
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /objects", s.handleUpload)
-	mux.HandleFunc("GET /objects", s.handleList)
-	mux.HandleFunc("GET /objects/{id}", s.handleDownload)
-	mux.HandleFunc("DELETE /objects/{id}", s.handleDelete)
+	// Client-facing API — §5
+	mux.HandleFunc("POST /api/v1/objects", s.handleUpload)
+	mux.HandleFunc("GET /api/v1/objects", s.handleList)
+	mux.HandleFunc("GET /api/v1/objects/{id}", s.handleDownload)
+	mux.HandleFunc("GET /api/v1/objects/{id}/metadata", s.handleGetMetadata)
+	mux.HandleFunc("PATCH /api/v1/objects/{id}/metadata", s.handlePatchMetadata)
+	mux.HandleFunc("DELETE /api/v1/objects/{id}", s.handleDelete)
+
+	// Internal worker API — §6
+	mux.HandleFunc("POST /internal/workers/register", s.handleRegisterWorker)
+	mux.HandleFunc("POST /internal/workers/heartbeat", s.handleHeartbeat)
 
 	s.http = &http.Server{
 		Addr:         addr,

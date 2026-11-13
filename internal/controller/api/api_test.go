@@ -43,7 +43,7 @@ func (f *fakeWorkerPool) GetChunk(_ context.Context, workerAddr, chunkID string)
 }
 func (f *fakeWorkerPool) DeleteChunk(_ context.Context, _, _ string) error { return nil }
 func (f *fakeWorkerPool) ReplicatePeer(_ context.Context, _, _, _ string) error { return nil }
-func (f *fakeWorkerPool) ListChunks(_ context.Context, _ string) ([]string, error) { return nil, nil }
+func (f *fakeWorkerPool) ListChunks(_ context.Context, _, _ string) ([]string, error) { return nil, nil }
 
 type fakePlacement struct{ workers []string }
 
@@ -118,7 +118,7 @@ func TestUpload_SmallFile(t *testing.T) {
 	srv, _ := newTestServer(t)
 	body, ct := multipartBody(t, "hello.txt", "hello world")
 
-	req := httptest.NewRequest(http.MethodPost, "/objects", body)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
 	req.Header.Set("Content-Type", ct)
 	rec := httptest.NewRecorder()
 
@@ -138,7 +138,7 @@ func TestUpload_Download_RoundTrip(t *testing.T) {
 
 	// upload
 	body, ct := multipartBody(t, "data.bin", content)
-	req := httptest.NewRequest(http.MethodPost, "/objects", body)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
 	req.Header.Set("Content-Type", ct)
 	rec := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec, req)
@@ -148,7 +148,7 @@ func TestUpload_Download_RoundTrip(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&upResp))
 
 	// download
-	req2 := httptest.NewRequest(http.MethodGet, "/objects/"+upResp.ObjectID, nil)
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/objects/"+upResp.ObjectID, nil)
 	rec2 := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec2, req2)
 	require.Equal(t, http.StatusOK, rec2.Code)
@@ -159,7 +159,7 @@ func TestUpload_Download_RoundTrip(t *testing.T) {
 
 func TestDownload_NotFound(t *testing.T) {
 	srv, _ := newTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/objects/doesnotexist", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/objects/doesnotexist", nil)
 	rec := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
@@ -171,14 +171,14 @@ func TestList_ReturnsCommittedObjects(t *testing.T) {
 	// upload two objects
 	for _, name := range []string{"a.txt", "b.txt"} {
 		body, ct := multipartBody(t, name, "content")
-		req := httptest.NewRequest(http.MethodPost, "/objects", body)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
 		req.Header.Set("Content-Type", ct)
 		rec := httptest.NewRecorder()
 		srv.http.Handler.ServeHTTP(rec, req)
 		require.Equal(t, http.StatusCreated, rec.Code)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/objects", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/objects", nil)
 	rec := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -191,7 +191,7 @@ func TestList_ReturnsCommittedObjects(t *testing.T) {
 func TestDelete_RemovesObject(t *testing.T) {
 	srv, _ := newTestServer(t)
 	body, ct := multipartBody(t, "del.txt", "bye")
-	req := httptest.NewRequest(http.MethodPost, "/objects", body)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
 	req.Header.Set("Content-Type", ct)
 	rec := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec, req)
@@ -201,13 +201,13 @@ func TestDelete_RemovesObject(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&upResp))
 
 	// delete
-	req2 := httptest.NewRequest(http.MethodDelete, "/objects/"+upResp.ObjectID, nil)
+	req2 := httptest.NewRequest(http.MethodDelete, "/api/v1/objects/"+upResp.ObjectID, nil)
 	rec2 := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec2, req2)
 	assert.Equal(t, http.StatusNoContent, rec2.Code)
 
 	// download should now 404
-	req3 := httptest.NewRequest(http.MethodGet, "/objects/"+upResp.ObjectID, nil)
+	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/objects/"+upResp.ObjectID, nil)
 	rec3 := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec3, req3)
 	assert.Equal(t, http.StatusNotFound, rec3.Code)
@@ -215,7 +215,7 @@ func TestDelete_RemovesObject(t *testing.T) {
 
 func TestDelete_NotFound(t *testing.T) {
 	srv, _ := newTestServer(t)
-	req := httptest.NewRequest(http.MethodDelete, "/objects/ghost", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/objects/ghost", nil)
 	rec := httptest.NewRecorder()
 	srv.http.Handler.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
