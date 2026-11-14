@@ -19,7 +19,7 @@ type vnode struct {
 // All methods are goroutine-safe.
 type Ring struct {
 	mu      sync.RWMutex
-	vnodes  []vnode          // sorted by hash
+	vnodes  []vnode           // sorted by hash
 	workers map[string]string // workerID → address
 }
 

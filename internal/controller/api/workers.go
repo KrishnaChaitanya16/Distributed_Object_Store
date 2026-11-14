@@ -52,6 +52,8 @@ func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 
 // POST /internal/workers/heartbeat  — called by worker every 2 s to stay ONLINE.
 // Body: {"worker_id": "w1"}
+// Returns 404 if the worker is not registered — the worker will then re-register,
+// which re-adds it to the placement ring after a controller restart.
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		WorkerID string `json:"worker_id"`
@@ -60,6 +62,13 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "worker_id required", http.StatusBadRequest)
 		return
 	}
+
+	if _, err := s.meta.GetWorker(r.Context(), req.WorkerID); err != nil {
+		// Worker not in bbolt — controller may have restarted. Tell worker to re-register.
+		http.Error(w, "worker not registered", http.StatusNotFound)
+		return
+	}
+
 	s.health.RecordHeartbeat(req.WorkerID)
 	w.WriteHeader(http.StatusNoContent)
 }

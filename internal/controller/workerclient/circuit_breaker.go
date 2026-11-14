@@ -10,23 +10,23 @@ import (
 var ErrCircuitOpen = errors.New("circuit breaker open — worker unavailable")
 
 const (
-	failureThreshold = 5               // consecutive failures before opening
+	failureThreshold = 5                // consecutive failures before opening
 	halfOpenTimeout  = 30 * time.Second // time in OPEN before trying HALF_OPEN
 )
 
 type cbState int
 
 const (
-	stateClosed   cbState = iota
+	stateClosed cbState = iota
 	stateOpen
 	stateHalfOpen
 )
 
 // circuitBreaker is a per-worker GoF State machine: CLOSED → OPEN → HALF_OPEN → CLOSED.
 type circuitBreaker struct {
-	mu           sync.Mutex
-	state        cbState
-	failures     int
+	mu            sync.Mutex
+	state         cbState
+	failures      int
 	lastFailureAt time.Time
 }
 
