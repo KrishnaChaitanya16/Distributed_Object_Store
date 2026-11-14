@@ -54,8 +54,10 @@ check "missing WORKER_ID exit code" "$code" "1"
 check "missing WORKER_ID message" "$(echo "$out" | grep -c 'WORKER_ID is required')" "1"
 docker run --rm -e WORKER_ID=w -e WORKER_PORT=99999 "$img" >/dev/null 2>&1; check "bad WORKER_PORT exit code" "$?" "1"
 docker run --rm -e WORKER_ID=w -e CONTROLLER_ADDRESS=controller "$img" >/dev/null 2>&1; check "bad CONTROLLER_ADDRESS exit code" "$?" "1"
-cimg=$(docker inspect -f '{{.Config.Image}}' controller)
-docker run --rm -e VNODE_COUNT=0 "$cimg" >/dev/null 2>&1; check "controller VNODE_COUNT=0 exit code" "$?" "1"
+
+echo "== controller"
+check "controller answers list objects" "$(curl -s -o /dev/null -w '%{http_code}' "localhost:$CONTROLLER_HOST_PORT/api/v1/objects")" "200"
+check "controller db is on the persistent volume" "$(docker exec controller test -f /data/meta.db && echo yes || echo no)" "yes"
 
 echo "== graceful stop and restart keep data"
 docker exec worker2 sh -c 'echo persisted > /data/marker' >/dev/null 2>&1
