@@ -542,6 +542,132 @@ func TestIntegration_Heartbeat_KnownWorker_Returns204(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 }
 
+// ── ring-recovery regression tests ───────────────────────────────────────────
+
+// TestIntegration_RingRebuild_AfterRestart simulates a controller restart: same bbolt,
+// fresh empty ring. Upload must succeed because the ring re-populates from bbolt.
+func TestIntegration_RingRebuild_AfterRestart(t *testing.T) {
+	dbPath := t.TempDir() + "/meta.db"
+
+	// --- first controller: register workers and upload ---
+	store1, err := metadata.NewMetadataStore(dbPath)
+	require.NoError(t, err)
+
+	ring1 := placement.NewRing()
+	ring1.AddWorker("w1", "localhost:9001")
+	ring1.AddWorker("w2", "localhost:9002")
+	ring1.AddWorker("w3", "localhost:9003")
+	ring1.AddWorker("w4", "localhost:9004")
+
+	ctx := context.Background()
+	for _, rec := range []struct {
+		id   string
+		port int
+	}{
+		{"w1", 9001}, {"w2", 9002}, {"w3", 9003}, {"w4", 9004},
+	} {
+		store1.SaveWorker(ctx, &models.WorkerRecord{
+			WorkerID: rec.id, Address: "localhost", Port: rec.port,
+			Status: models.WorkerOnline, VnodeCount: 50,
+		})
+	}
+
+	workers := newChunkStore()
+	srv1 := New(":0", store1, ring1, workers, &fakeHealth{})
+	h1 := &testHarness{srv: srv1, store: store1, ring: ring1, workers: workers, logs: &logCapture{}}
+	resp := h1.upload(t, "pre-restart.txt", "data before restart")
+	assert.NotEmpty(t, resp.ObjectID)
+	store1.Close()
+
+	// --- second controller: same bbolt, fresh empty ring (simulates restart) ---
+	store2, err := metadata.NewMetadataStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { store2.Close() })
+
+	ring2 := placement.NewRing()
+	// Rebuild ring from bbolt — same logic as main.go on startup
+	known, err := store2.ListWorkers(ctx)
+	require.NoError(t, err)
+	for _, w := range known {
+		ring2.AddWorker(w.WorkerID, fmt.Sprintf("%s:%d", w.Address, w.Port))
+	}
+
+	srv2 := New(":0", store2, ring2, workers, &fakeHealth{})
+	h2 := &testHarness{srv: srv2, store: store2, ring: ring2, workers: workers, logs: &logCapture{}}
+
+	resp2 := h2.upload(t, "post-restart.txt", "data after restart")
+	assert.NotEmpty(t, resp2.ObjectID, "upload must succeed after ring rebuild from bbolt")
+}
+
+// TestIntegration_Heartbeat_ReAddsWorkerRemovedFromRing verifies that a heartbeat
+// from a worker that was dropped from the ring (e.g. marked OFFLINE then back) puts
+// it back so chunks can be placed on it again.
+func TestIntegration_Heartbeat_ReAddsWorkerRemovedFromRing(t *testing.T) {
+	h := newHarness(t)
+
+	// Remove w1 from ring to simulate it having been declared OFFLINE
+	h.ring.RemoveWorker("w1")
+
+	// Send a heartbeat for w1
+	body, _ := json.Marshal(map[string]string{"worker_id": "w1"})
+	req := httptest.NewRequest(http.MethodPost, "/internal/workers/heartbeat", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := h.do(req)
+	assert.Equal(t, http.StatusNoContent, rec.Code, "heartbeat should succeed")
+
+	// w1 must be back in the ring
+	workers := h.ring.Workers()
+	found := false
+	for _, id := range workers {
+		if id == "w1" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "w1 must be back in the ring after heartbeat")
+}
+
+// TestIntegration_Heartbeat_UnknownDatabase_Returns404 ensures that a worker the
+// database has never seen still gets a 404, triggering full re-registration.
+func TestIntegration_Heartbeat_NeverSeenWorker_Returns404(t *testing.T) {
+	h := newHarness(t)
+
+	body, _ := json.Marshal(map[string]string{"worker_id": "ghost-worker"})
+	req := httptest.NewRequest(http.MethodPost, "/internal/workers/heartbeat", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := h.do(req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// TestIntegration_EmptyDatabase_BootsClean verifies the controller starts up and
+// serves requests correctly with a brand-new empty database (no stored workers).
+func TestIntegration_EmptyDatabase_BootsClean(t *testing.T) {
+	store, err := metadata.NewMetadataStore(t.TempDir() + "/empty.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+
+	ring := placement.NewRing()
+	srv := New(":0", store, ring, newChunkStore(), &fakeHealth{})
+
+	// List objects on empty db — must not crash
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/objects", nil)
+	rec := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Upload on empty ring — must return 503, not panic
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("file", "test.txt")
+	io.WriteString(fw, "data")
+	mw.Close()
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/objects", &buf)
+	req2.Header.Set("Content-Type", mw.FormDataContentType())
+	rec2 := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec2, req2)
+	assert.Equal(t, http.StatusServiceUnavailable, rec2.Code, "empty ring must return 503, not panic")
+}
+
 func TestIntegration_CAS_RefCount_DecrementsToZero_DeletesFromWorkers(t *testing.T) {
 	h := newHarness(t)
 	content := "shared chunk content"
