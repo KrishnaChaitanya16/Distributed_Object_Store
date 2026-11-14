@@ -60,6 +60,11 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "worker_id required", http.StatusBadRequest)
 		return
 	}
+	if _, err := s.meta.GetWorker(r.Context(), req.WorkerID); err != nil {
+		http.Error(w, "worker not registered", http.StatusNotFound)
+		return
+	}
+
 	s.health.RecordHeartbeat(req.WorkerID)
 	w.WriteHeader(http.StatusNoContent)
 }
