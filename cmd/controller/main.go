@@ -57,6 +57,19 @@ func main() {
 	table := health.NewLeaseTable()
 	mon := health.NewMonitor(table)
 
+	// Re-populate ring and lease table from bbolt so uploads work immediately after a controller restart.
+	// Workers that are actually offline will be marked OFFLINE by the health monitor ~6 s later.
+	if knownWorkers, err := store.ListWorkers(context.Background()); err != nil {
+		slog.Warn("could not pre-populate ring from bbolt", "err", err)
+	} else {
+		for _, w := range knownWorkers {
+			addr := fmt.Sprintf("%s:%d", w.Address, w.Port)
+			ring.AddWorker(w.WorkerID, addr)
+			table.RecordHeartbeat(w.WorkerID)
+			slog.Info("ring pre-populated from bbolt", "worker_id", w.WorkerID, "addr", addr)
+		}
+	}
+
 	// --- background goroutines ---
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

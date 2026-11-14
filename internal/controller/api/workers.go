@@ -62,11 +62,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "worker_id required", http.StatusBadRequest)
 		return
 	}
-	if _, err := s.meta.GetWorker(r.Context(), req.WorkerID); err != nil {
+	record, err := s.meta.GetWorker(r.Context(), req.WorkerID)
+	if err != nil {
 		http.Error(w, "worker not registered", http.StatusNotFound)
 		return
 	}
 
+	// Re-add to ring in case the controller restarted and lost its in-memory ring.
+	// AddWorker is a no-op if the worker is already present.
+	s.placement.AddWorker(req.WorkerID, addrOf(record))
 	s.health.RecordHeartbeat(req.WorkerID)
 	w.WriteHeader(http.StatusNoContent)
 }
