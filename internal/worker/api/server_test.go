@@ -280,8 +280,23 @@ func TestDelete(t *testing.T) {
 	putChunk(t, w, data, id)
 	expect(t, do(t, http.MethodDelete, w.url("/internal/chunks/"+id), nil), http.StatusNoContent, "")
 	expect(t, do(t, http.MethodGet, w.url("/internal/chunks/"+id), nil), http.StatusNotFound, "CHUNK_NOT_FOUND")
-	expect(t, do(t, http.MethodDelete, w.url("/internal/chunks/"+id), nil), http.StatusNotFound, "CHUNK_NOT_FOUND")
+	expect(t, do(t, http.MethodDelete, w.url("/internal/chunks/"+id), nil), http.StatusNoContent, "")
 	expect(t, do(t, http.MethodDelete, w.url("/internal/chunks/xyz"), nil), http.StatusBadRequest, "INVALID_CHUNK_ID")
+}
+
+func TestDeleteIsIdempotent(t *testing.T) {
+	w := newWorker(t, "w1")
+	_, neverStored := chunk(t, 10)
+	for i := 0; i < 3; i++ {
+		expect(t, do(t, http.MethodDelete, w.url("/internal/chunks/"+neverStored), nil), http.StatusNoContent, "")
+	}
+	data, id := chunk(t, 10)
+	putChunk(t, w, data, id)
+	expect(t, do(t, http.MethodDelete, w.url("/internal/chunks/"+id), nil), http.StatusNoContent, "")
+	putChunk(t, w, data, id)
+	if !bytes.Equal(getBody(t, w, id), data) {
+		t.Fatal("chunk could not be stored again after delete")
+	}
 }
 
 func TestDeleteStorageFailure(t *testing.T) {
@@ -359,7 +374,7 @@ func TestReplicatePeerCopiesChunk(t *testing.T) {
 			a, b := newWorker(t, "w1"), newWorker(t, "w2")
 			data, id := chunk(t, n)
 			putChunk(t, a, data, id)
-			expect(t, replicate(t, a, replJSON(id, b.addr())), http.StatusNoContent, "")
+			expect(t, replicate(t, a, replJSON(id, b.addr())), http.StatusOK, "")
 			if !bytes.Equal(getBody(t, b, id), data) {
 				t.Fatal("target copy differs")
 			}
@@ -379,7 +394,7 @@ func TestReplicatePeerOverwritesExistingTargetCopy(t *testing.T) {
 	putChunk(t, a, data, id)
 	putChunk(t, b, data, id)
 	flip(t, filepath.Join(b.dir, id+".bin"), 5)
-	expect(t, replicate(t, a, replJSON(id, b.addr())), http.StatusNoContent, "")
+	expect(t, replicate(t, a, replJSON(id, b.addr())), http.StatusOK, "")
 	if ok, _ := b.store.VerifyCRC(context.Background(), id); !ok {
 		t.Fatal("replicate-peer did not repair the target copy")
 	}
@@ -497,7 +512,7 @@ func TestConcurrentRequests(t *testing.T) {
 				resp.Body.Close()
 			}
 			resp, err := http.Post(a.url("/internal/workers/replicate-peer"), "application/json", strings.NewReader(replJSON(id, b.addr())))
-			if err != nil || resp.StatusCode != http.StatusNoContent {
+			if err != nil || resp.StatusCode != http.StatusOK {
 				t.Errorf("replicate failed: %v", err)
 				return
 			}

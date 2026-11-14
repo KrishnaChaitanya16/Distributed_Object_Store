@@ -88,15 +88,14 @@ func (s *Server) getChunk(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// deleteChunk is idempotent: deleting a chunk that is already gone succeeds, so GC retries never get stuck.
 func (s *Server) deleteChunk(w http.ResponseWriter, r *http.Request) {
 	err := s.store.Delete(r.Context(), r.PathValue("id"))
 	switch {
-	case err == nil:
+	case err == nil, errors.Is(err, models.ErrNotFound):
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, storage.ErrInvalidChunkID):
 		writeErr(w, http.StatusBadRequest, "INVALID_CHUNK_ID", err.Error())
-	case errors.Is(err, models.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "CHUNK_NOT_FOUND", "chunk not found")
 	default:
 		s.internalErr(w, "STORAGE_ERROR", "delete chunk", err)
 	}
@@ -161,7 +160,7 @@ func (s *Server) replicatePeer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "PEER_REJECTED", fmt.Sprintf("target answered %d", resp.StatusCode))
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusOK)
 }
 
 // openChunk reads a chunk or writes the matching error response and returns ok=false.

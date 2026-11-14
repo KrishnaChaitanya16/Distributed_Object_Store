@@ -59,6 +59,29 @@ echo "== controller"
 check "controller answers list objects" "$(curl -s -o /dev/null -w '%{http_code}' "localhost:$CONTROLLER_HOST_PORT/api/v1/objects")" "200"
 check "controller db is on the persistent volume" "$(docker exec controller test -f /data/meta.db && echo yes || echo no)" "yes"
 
+echo "== end to end through the controller"
+C="http://localhost:$CONTROLLER_HOST_PORT"
+tmpe=$(mktemp -d)
+for w in worker1 worker2 worker3 worker4; do
+	check "$w registered with controller" "$(docker logs "$w" 2>&1 | grep -c "registered with controller as $w")" "1"
+done
+head -c 2621440 /dev/urandom > "$tmpe/obj"
+up=$(curl -s -w '\n%{http_code}' -F "file=@$tmpe/obj" "$C/api/v1/objects")
+check "upload 2.5 MiB object" "$(echo "$up" | tail -1)" "201"
+oid=$(echo "$up" | head -1 | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+check "upload split into 3 chunks" "$(echo "$up" | head -1 | grep -o '"chunks":[0-9]*' | cut -d: -f2)" "3"
+curl -s "$C/api/v1/objects/$oid" -o "$tmpe/back"
+check "download is byte-identical" "$(sha256sum < "$tmpe/back" | cut -d' ' -f1)" "$(sha256sum < "$tmpe/obj" | cut -d' ' -f1)"
+for w in 1 2 3 4; do
+	p=$(eval echo "\$WORKER${w}_HOST_PORT")
+	curl -s "localhost:$p/internal/workers/worker$w/chunks" | grep -o '[0-9a-f]\{64\}'
+done | sort | uniq -c > "$tmpe/replicas"
+check "3 distinct chunks stored" "$(wc -l < "$tmpe/replicas" | tr -d ' ')" "3"
+check "every chunk on exactly 2 workers" "$(awk '$1 != 2' "$tmpe/replicas" | wc -l | tr -d ' ')" "0"
+check "delete object" "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$C/api/v1/objects/$oid")" "204"
+check "deleted object is gone" "$(curl -s -o /dev/null -w '%{http_code}' "$C/api/v1/objects/$oid")" "404"
+rm -rf "$tmpe"
+
 echo "== worker data plane over real HTTP"
 W1="http://localhost:$WORKER1_HOST_PORT"
 W2="http://localhost:$WORKER2_HOST_PORT"
@@ -72,10 +95,9 @@ check "GET returns identical bytes" "$(sha256sum < "$tmp/back" | cut -d' ' -f1)"
 check "PUT with wrong hash rejected" "$(code -X PUT --data-binary 'x' "$W1/internal/chunks/$id")" "400"
 check "worker1 inventory lists the chunk" "$(curl -s "$W1/internal/workers/worker1/chunks" | grep -c "$id")" "1"
 check "worker2 does not have it yet" "$(code "$W2/internal/chunks/$id")" "404"
-check "replicate-peer worker1 -> worker2" "$(code -X POST -d "{\"chunk_id\":\"$id\",\"target_addr\":\"worker2:8001\"}" "$W1/internal/workers/replicate-peer")" "204"
+check "replicate-peer worker1 -> worker2" "$(code -X POST -d "{\"chunk_id\":\"$id\",\"target_addr\":\"worker2:8001\"}" "$W1/internal/workers/replicate-peer")" "200"
 curl -s "$W2/internal/chunks/$id" -o "$tmp/peer"
 check "worker2 copy is identical" "$(sha256sum < "$tmp/peer" | cut -d' ' -f1)" "$id"
-check "worker1 keeps retrying registration" "$(docker logs worker1 2>&1 | grep -c 'register attempt' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
 
 echo "== graceful stop and restart keep data"
 start=$(date +%s)
@@ -90,6 +112,7 @@ check "worker2 running after restart" "$(state worker2)" "running"
 curl -s "$W2/internal/chunks/$id" -o "$tmp/after"
 check "worker2 chunk survived restart" "$(sha256sum < "$tmp/after" | cut -d' ' -f1)" "$id"
 check "worker2 delete" "$(code -X DELETE "$W2/internal/chunks/$id")" "204"
+check "worker2 repeat delete is idempotent" "$(code -X DELETE "$W2/internal/chunks/$id")" "204"
 
 echo "== result: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
