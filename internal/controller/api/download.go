@@ -60,19 +60,26 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 // streamChunk fetches one chunk from primary, falls back to secondary on error.
 func (s *Server) streamChunk(r *http.Request, w io.Writer, ref models.ChunkRef, log *slog.Logger) error {
 	primaryAddr := s.workerAddr(ref.PrimaryID)
+	log.Debug("fetching chunk from primary", "chunk_id", ref.ChunkID, "index", ref.Index, "worker_id", ref.PrimaryID, "addr", primaryAddr)
+
 	rc, err := s.workers.GetChunk(r.Context(), primaryAddr, ref.ChunkID)
 	if err != nil {
 		log.Warn("primary chunk fetch failed — trying secondary",
 			"chunk_id", ref.ChunkID, "primary", ref.PrimaryID, "err", err)
 
 		secondaryAddr := s.workerAddr(ref.SecondaryID)
+		log.Debug("fetching chunk from secondary", "chunk_id", ref.ChunkID, "worker_id", ref.SecondaryID, "addr", secondaryAddr)
 		rc, err = s.workers.GetChunk(r.Context(), secondaryAddr, ref.ChunkID)
 		if err != nil {
 			return err
 		}
+		log.Debug("chunk fetched from secondary", "chunk_id", ref.ChunkID, "worker_id", ref.SecondaryID)
+	} else {
+		log.Debug("chunk fetched from primary", "chunk_id", ref.ChunkID, "worker_id", ref.PrimaryID)
 	}
 	defer rc.Close()
 
-	_, err = io.Copy(w, rc)
+	n, err := io.Copy(w, rc)
+	log.Debug("chunk streamed to client", "chunk_id", ref.ChunkID, "bytes", n)
 	return err
 }

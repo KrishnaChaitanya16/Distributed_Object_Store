@@ -107,7 +107,7 @@ type WorkerClientPool interface {
 	// ReplicatePeer instructs sourceAddr to stream chunkID directly to targetAddr.
 	// The controller is not in the data path — this is a P2P transfer.
 	ReplicatePeer(ctx context.Context, sourceAddr string, chunkID string, targetAddr string) error
-	ListChunks(ctx context.Context, workerAddr string) ([]string, error)
+	ListChunks(ctx context.Context, workerAddr string, workerID string) ([]string, error)
 }
 
 // HealthMonitor is implemented by internal/controller/health.

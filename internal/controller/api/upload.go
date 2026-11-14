@@ -70,6 +70,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		sum := sha256.Sum256(chunk)
 		chunkID := hex.EncodeToString(sum[:])
 
+		log.Debug("chunk hashed", "index", index, "chunk_id", chunkID, "size_bytes", n, "offset", totalSize-int64(n))
+
 		// placement
 		primaryID, err := s.placement.Primary(chunkID)
 		if err != nil {
@@ -84,9 +86,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		log.Debug("chunk placed", "index", index, "chunk_id", chunkID, "primary", primaryID, "secondary", secondaryID)
+
 		// save chunk record (idempotent upsert — dedup: same chunkID means same bytes)
 		exists, _ := s.meta.GetChunk(r.Context(), chunkID)
 		if exists == nil {
+			log.Debug("chunk is new — saving to bbolt and pushing to workers", "chunk_id", chunkID)
 			rec := &models.ChunkRecord{
 				ChunkID:   chunkID,
 				SizeBytes: n,
@@ -103,8 +108,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "internal error", http.StatusInternalServerError)
 				return
 			}
+			log.Debug("chunk saved to bbolt", "chunk_id", chunkID, "state", "PENDING")
 
 			// push to both workers
+			log.Debug("pushing chunk to primary worker", "chunk_id", chunkID, "worker_id", primaryID, "addr", s.workerAddr(primaryID))
 			if err := s.workers.PutChunk(r.Context(), s.workerAddr(primaryID), chunkID,
 				newBytesReader(chunk), int64(n)); err != nil {
 				log.Error("put chunk primary", "chunk_id", chunkID, "worker", primaryID, "err", err)
@@ -112,6 +119,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "worker error", http.StatusBadGateway)
 				return
 			}
+			log.Debug("chunk stored on primary", "chunk_id", chunkID, "worker_id", primaryID)
+
+			log.Debug("pushing chunk to secondary worker", "chunk_id", chunkID, "worker_id", secondaryID, "addr", s.workerAddr(secondaryID))
 			if err := s.workers.PutChunk(r.Context(), s.workerAddr(secondaryID), chunkID,
 				newBytesReader(chunk), int64(n)); err != nil {
 				log.Error("put chunk secondary", "chunk_id", chunkID, "worker", secondaryID, "err", err)
@@ -119,12 +129,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "worker error", http.StatusBadGateway)
 				return
 			}
+			log.Debug("chunk stored on secondary", "chunk_id", chunkID, "worker_id", secondaryID)
 
 			if err := s.meta.UpdateChunkState(r.Context(), chunkID, models.ChunkDurable); err != nil {
 				s.rollback(r.Context(), objectID, log)
 				http.Error(w, "internal error", http.StatusInternalServerError)
 				return
 			}
+			log.Debug("chunk state updated in bbolt", "chunk_id", chunkID, "state", "DURABLE")
+		} else {
+			log.Debug("chunk already exists (dedup) — skipping worker push", "chunk_id", chunkID)
 		}
 
 		if err := s.meta.IncrementChunkRefCount(r.Context(), chunkID); err != nil {
