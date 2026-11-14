@@ -16,6 +16,7 @@ type Server struct {
 	placement models.PlacementStrategy
 	workers   models.WorkerClientPool
 	health    models.HealthMonitor
+	mux       *http.ServeMux
 	http      *http.Server
 }
 
@@ -46,6 +47,7 @@ func New(
 	mux.HandleFunc("POST /internal/workers/register", s.handleRegisterWorker)
 	mux.HandleFunc("POST /internal/workers/heartbeat", s.handleHeartbeat)
 
+	s.mux = mux
 	s.http = &http.Server{
 		Addr:         addr,
 		Handler:      mux,
@@ -54,6 +56,9 @@ func New(
 	}
 	return s
 }
+
+// Handler returns the HTTP mux. Used in tests to wrap the server in httptest.NewServer.
+func (s *Server) Handler() http.Handler { return s.mux }
 
 func (s *Server) Start() error {
 	return s.http.ListenAndServe()

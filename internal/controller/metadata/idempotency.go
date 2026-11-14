@@ -21,8 +21,8 @@ const (
 // Three outcomes:
 //   - (nil, nil)        — lock just acquired, key written as PROCESSING. Caller proceeds.
 //   - (record, nil)     — key already exists. Caller replays based on record.Status:
-//                           PROCESSING → return 409 (another request in flight)
-//                           COMMITTED  → return cached response
+//     PROCESSING → return 409 (another request in flight)
+//     COMMITTED  → return cached response
 //   - (nil, err)        — bbolt failure
 func (s *MetadataStore) AcquireIdempotencyLock(_ context.Context, key string) (*models.IdempotencyRecord, error) {
 	var existing *models.IdempotencyRecord

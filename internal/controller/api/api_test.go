@@ -41,9 +41,11 @@ func (f *fakeWorkerPool) GetChunk(_ context.Context, workerAddr, chunkID string)
 	}
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
-func (f *fakeWorkerPool) DeleteChunk(_ context.Context, _, _ string) error { return nil }
+func (f *fakeWorkerPool) DeleteChunk(_ context.Context, _, _ string) error      { return nil }
 func (f *fakeWorkerPool) ReplicatePeer(_ context.Context, _, _, _ string) error { return nil }
-func (f *fakeWorkerPool) ListChunks(_ context.Context, _, _ string) ([]string, error) { return nil, nil }
+func (f *fakeWorkerPool) ListChunks(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
 
 type fakePlacement struct{ workers []string }
 
@@ -61,16 +63,16 @@ func (f *fakePlacement) Secondary(_ string, exclude string) (string, error) {
 	}
 	return "", models.ErrNoWorkers
 }
-func (f *fakePlacement) AddWorker(_, _ string)  {}
-func (f *fakePlacement) RemoveWorker(_ string)  {}
-func (f *fakePlacement) Workers() []string       { return f.workers }
+func (f *fakePlacement) AddWorker(_, _ string) {}
+func (f *fakePlacement) RemoveWorker(_ string) {}
+func (f *fakePlacement) Workers() []string     { return f.workers }
 
 type fakeHealth struct{}
 
-func (f *fakeHealth) RecordHeartbeat(_ string)                              {}
-func (f *fakeHealth) GetWorkerStatus(_ string) models.WorkerStatus         { return models.WorkerOnline }
-func (f *fakeHealth) ListOnlineWorkers() []string                          { return nil }
-func (f *fakeHealth) Subscribe() <-chan models.WorkerOfflineEvent           { return nil }
+func (f *fakeHealth) RecordHeartbeat(_ string)                     {}
+func (f *fakeHealth) GetWorkerStatus(_ string) models.WorkerStatus { return models.WorkerOnline }
+func (f *fakeHealth) ListOnlineWorkers() []string                  { return nil }
+func (f *fakeHealth) Subscribe() <-chan models.WorkerOfflineEvent  { return nil }
 
 // --- helpers ---
 

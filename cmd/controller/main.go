@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
-	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/config"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/api"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/health"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metadata"
@@ -17,25 +18,44 @@ import (
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/logger"
 )
 
+type controllerConfig struct {
+	addr   string
+	dbPath string
+}
+
+func loadConfig(getenv config.Getenv) (controllerConfig, error) {
+	port, err := config.Port(getenv, "CONTROLLER_PORT", 8080)
+	if err != nil {
+		return controllerConfig{}, err
+	}
+	dbPath := config.Str(getenv, "DB_PATH", "data/meta.db")
+	return controllerConfig{
+		addr:   fmt.Sprintf(":%d", port),
+		dbPath: dbPath,
+	}, nil
+}
+
 func main() {
-	addr   := flag.String("addr", ":8080", "controller listen address")
-	dbPath := flag.String("db", "data/meta.db", "bbolt database file path")
-	flag.Parse()
+	cfg, err := loadConfig(os.Getenv)
+	if err != nil {
+		slog.Error("controller config", "err", err)
+		os.Exit(1)
+	}
 
 	logger.Init()
 
 	// --- infrastructure ---
-	store, err := metadata.NewMetadataStore(*dbPath)
+	store, err := metadata.NewMetadataStore(cfg.dbPath)
 	if err != nil {
-		slog.Error("open metadata store", "path", *dbPath, "err", err)
+		slog.Error("open metadata store", "path", cfg.dbPath, "err", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 
-	ring  := placement.NewRing()
-	pool  := workerclient.New()
+	ring := placement.NewRing()
+	pool := workerclient.New()
 	table := health.NewLeaseTable()
-	mon   := health.NewMonitor(table)
+	mon := health.NewMonitor(table)
 
 	// --- background goroutines ---
 	ctx, cancel := context.WithCancel(context.Background())
@@ -48,9 +68,9 @@ func main() {
 	go watchOffline(ctx, table, ring)
 
 	// --- HTTP server ---
-	srv := api.New(*addr, store, ring, pool, table)
+	srv := api.New(cfg.addr, store, ring, pool, table)
 
-	slog.Info("controller starting", "addr", *addr, "db", *dbPath)
+	slog.Info("controller starting", "addr", cfg.addr, "db", cfg.dbPath)
 
 	go func() {
 		if err := srv.Start(); err != nil {
