@@ -82,6 +82,8 @@ func main() {
 
 	// --- HTTP server ---
 	srv := api.New(cfg.addr, store, ring, pool, table)
+	srv.PopulateBloom(context.Background())
+	slog.Info("bloom filter pre-populated from bbolt")
 
 	slog.Info("controller starting", "addr", cfg.addr, "db", cfg.dbPath)
 

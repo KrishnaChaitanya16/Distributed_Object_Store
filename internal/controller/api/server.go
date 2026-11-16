@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/dedup"
 )
 
 const chunkSize = 1 * 1024 * 1024 // 1 MiB — per spec §4
@@ -21,6 +22,7 @@ type Server struct {
 	mux       *http.ServeMux
 	http      *http.Server
 	hedgeMs   int // milliseconds before hedging to the secondary; 0 disables hedging
+	bloom     *dedup.Filter
 }
 
 func New(
@@ -43,6 +45,7 @@ func New(
 		workers:   workers,
 		health:    health,
 		hedgeMs:   hedgeMs,
+		bloom:     dedup.New(1_000_000, 0.01), // 1 M chunks, 1 % false-positive rate
 	}
 
 	mux := http.NewServeMux()
@@ -70,6 +73,18 @@ func New(
 
 // Handler returns the HTTP mux. Used in tests to wrap the server in httptest.NewServer.
 func (s *Server) Handler() http.Handler { return s.mux }
+
+// PopulateBloom pre-loads all DURABLE chunk IDs from bbolt into the bloom filter.
+// Call once after New(), before Start().
+func (s *Server) PopulateBloom(ctx context.Context) {
+	chunks, err := s.meta.ListChunksByState(ctx, models.ChunkDurable)
+	if err != nil {
+		return
+	}
+	for _, c := range chunks {
+		s.bloom.Add(c.ChunkID)
+	}
+}
 
 func (s *Server) Start() error {
 	return s.http.ListenAndServe()

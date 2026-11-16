@@ -88,9 +88,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 		log.Debug("chunk placed", "index", index, "chunk_id", chunkID, "primary", primaryID, "secondary", secondaryID)
 
-		// save chunk record (idempotent upsert — dedup: same chunkID means same bytes)
-		exists, _ := s.meta.GetChunk(r.Context(), chunkID)
-		if exists == nil {
+		// Bloom filter O(1) pre-check — skips bbolt round-trip for definitely-new chunks.
+		// False positives fall through to the GetChunk bbolt lookup.
+		chunkIsNew := !s.bloom.MightExist(chunkID)
+		if !chunkIsNew {
+			existing, _ := s.meta.GetChunk(r.Context(), chunkID)
+			chunkIsNew = existing == nil
+		}
+		if chunkIsNew {
 			log.Debug("chunk is new — saving to bbolt and pushing to workers", "chunk_id", chunkID)
 			rec := &models.ChunkRecord{
 				ChunkID:   chunkID,
@@ -137,6 +142,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			log.Debug("chunk state updated in bbolt", "chunk_id", chunkID, "state", "DURABLE")
+			s.bloom.Add(chunkID)
 		} else {
 			log.Debug("chunk already exists (dedup) — skipping worker push", "chunk_id", chunkID)
 		}
