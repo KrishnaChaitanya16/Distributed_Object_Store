@@ -1,10 +1,14 @@
 package api
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -35,7 +39,6 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// set headers before streaming
 	if manifest.ContentType != "" {
 		w.Header().Set("Content-Type", manifest.ContentType)
 	} else {
@@ -43,13 +46,12 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("X-Object-ID", objectID)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+manifest.Name+`"`)
+	w.Header().Set("Content-Length", strconv.FormatInt(manifest.SizeBytes, 10))
 	w.WriteHeader(http.StatusOK)
 
-	// stream chunks in order
 	for _, ref := range refs {
-		if err := s.streamChunk(r, w, ref, log); err != nil {
-			// headers already sent — can't change status, just close
-			log.Error("stream chunk failed", "chunk_id", ref.ChunkID, "err", err)
+		if err := s.streamChunk(r.Context(), w, ref, log); err != nil {
+			log.Error("stream chunk failed — cutting connection", "chunk_id", ref.ChunkID, "err", err)
 			return
 		}
 	}
@@ -57,29 +59,101 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	log.Info("download complete", "chunks", len(refs), "bytes", manifest.SizeBytes)
 }
 
-// streamChunk fetches one chunk from primary, falls back to secondary on error.
-func (s *Server) streamChunk(r *http.Request, w io.Writer, ref models.ChunkRef, log *slog.Logger) error {
+// streamChunk fetches one chunk using hedged reads: starts with the primary, and
+// if the primary hasn't responded within s.hedgeMs milliseconds, also fires the
+// secondary. Whichever replies first wins; the loser's context is cancelled.
+func (s *Server) streamChunk(ctx context.Context, w io.Writer, ref models.ChunkRef, log *slog.Logger) error {
+	type result struct {
+		rc       io.ReadCloser
+		err      error
+		workerID string
+	}
+
+	ch := make(chan result, 2)
+
+	pCtx, pCancel := context.WithCancel(ctx)
+	defer pCancel()
+
 	primaryAddr := s.workerAddr(ref.PrimaryID)
-	log.Debug("fetching chunk from primary", "chunk_id", ref.ChunkID, "index", ref.Index, "worker_id", ref.PrimaryID, "addr", primaryAddr)
+	log.Debug("fetching chunk from primary", "chunk_id", ref.ChunkID, "index", ref.Index,
+		"worker_id", ref.PrimaryID, "addr", primaryAddr)
 
-	rc, err := s.workers.GetChunk(r.Context(), primaryAddr, ref.ChunkID)
-	if err != nil {
-		log.Warn("primary chunk fetch failed — trying secondary",
-			"chunk_id", ref.ChunkID, "primary", ref.PrimaryID, "err", err)
+	go func() {
+		rc, err := s.workers.GetChunk(pCtx, primaryAddr, ref.ChunkID)
+		select {
+		case ch <- result{rc, err, ref.PrimaryID}:
+		default:
+		}
+	}()
 
-		secondaryAddr := s.workerAddr(ref.SecondaryID)
-		log.Debug("fetching chunk from secondary", "chunk_id", ref.ChunkID, "worker_id", ref.SecondaryID, "addr", secondaryAddr)
-		rc, err = s.workers.GetChunk(r.Context(), secondaryAddr, ref.ChunkID)
-		if err != nil {
+	threshold := time.Duration(s.hedgeMs) * time.Millisecond
+	timer := time.NewTimer(threshold)
+	defer timer.Stop()
+
+	sCtx, sCancel := context.WithCancel(ctx)
+	defer sCancel()
+
+	secondaryAddr := s.workerAddr(ref.SecondaryID)
+
+	select {
+	case r := <-ch:
+		// Primary responded before hedge threshold
+		timer.Stop()
+		if r.err == nil {
+			log.Debug("chunk fetched from primary", "chunk_id", ref.ChunkID, "worker_id", ref.PrimaryID)
+			defer r.rc.Close()
+			_, err := io.Copy(w, r.rc)
+			log.Debug("chunk streamed to client", "chunk_id", ref.ChunkID)
 			return err
 		}
-		log.Debug("chunk fetched from secondary", "chunk_id", ref.ChunkID, "worker_id", ref.SecondaryID)
-	} else {
-		log.Debug("chunk fetched from primary", "chunk_id", ref.ChunkID, "worker_id", ref.PrimaryID)
-	}
-	defer rc.Close()
+		// Primary failed fast — start secondary immediately
+		log.Warn("primary chunk fetch failed — trying secondary",
+			"chunk_id", ref.ChunkID, "worker_id", ref.PrimaryID, "err", r.err)
+		go func() {
+			rc, err := s.workers.GetChunk(sCtx, secondaryAddr, ref.ChunkID)
+			select {
+			case ch <- result{rc, err, ref.SecondaryID}:
+			default:
+			}
+		}()
 
-	n, err := io.Copy(w, rc)
-	log.Debug("chunk streamed to client", "chunk_id", ref.ChunkID, "bytes", n)
-	return err
+	case <-timer.C:
+		// Primary is slow — fire hedge request to secondary
+		log.Debug("hedging chunk fetch to secondary", "chunk_id", ref.ChunkID,
+			"threshold_ms", s.hedgeMs, "worker_id", ref.SecondaryID)
+		go func() {
+			rc, err := s.workers.GetChunk(sCtx, secondaryAddr, ref.ChunkID)
+			select {
+			case ch <- result{rc, err, ref.SecondaryID}:
+			default:
+			}
+		}()
+	}
+
+	// Collect up to two results; return on first success, error only if both fail
+	for attempts := 0; attempts < 2; attempts++ {
+		select {
+		case r := <-ch:
+			if r.err != nil {
+				log.Warn("chunk fetch failed", "chunk_id", ref.ChunkID,
+					"worker_id", r.workerID, "err", r.err)
+				continue
+			}
+			// Cancel the losing request
+			if r.workerID == ref.PrimaryID {
+				sCancel()
+			} else {
+				pCancel()
+			}
+			log.Debug("chunk fetched", "chunk_id", ref.ChunkID, "worker_id", r.workerID)
+			defer r.rc.Close()
+			_, err := io.Copy(w, r.rc)
+			log.Debug("chunk streamed to client", "chunk_id", ref.ChunkID)
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return fmt.Errorf("chunk %s: both replicas failed", ref.ChunkID)
 }
