@@ -119,6 +119,41 @@ func TestPositiveInt(t *testing.T) {
 	}
 }
 
+func TestNonNegativeInt(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     string
+		want    int
+		wantErr bool
+	}{
+		{"default", "", 10, false},
+		{"zero allowed", "0", 0, false},
+		{"zero with spaces", " 0 ", 0, false},
+		{"positive", "250", 250, false},
+		{"negative rejected", "-1", 0, true},
+		{"float rejected", "1.5", 0, true},
+		{"unit suffix rejected", "10ms", 0, true},
+		{"invalid rejected", "none", 0, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NonNegativeInt(fakeEnv(map[string]string{"K": c.val}), "K", 10)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, c.wantErr)
+			}
+			if !c.wantErr && got != c.want {
+				t.Fatalf("got %d want %d", got, c.want)
+			}
+		})
+	}
+	if _, err := NonNegativeInt(fakeEnv(nil), "K", -1); err == nil {
+		t.Fatal("invalid default must also be rejected")
+	}
+	if _, err := NonNegativeInt(fakeEnv(map[string]string{"SCRUB_PAUSE_MS": "-5"}), "SCRUB_PAUSE_MS", 0); err == nil || !strings.Contains(err.Error(), "SCRUB_PAUSE_MS") {
+		t.Fatalf("error must name the key, got %v", err)
+	}
+}
+
 func TestPort(t *testing.T) {
 	cases := []struct {
 		name    string

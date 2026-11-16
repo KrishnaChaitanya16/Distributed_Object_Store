@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -16,6 +17,7 @@ const (
 	footerSize   = 4
 	chunkExt     = ".bin"
 	tmpExt       = ".tmp"
+	lockStripes  = 256
 )
 
 var (
@@ -32,14 +34,22 @@ var _ models.ChunkStore = (*Store)(nil)
 
 // Store keeps each chunk as <dir>/<chunkID>.bin holding the data followed by a big-endian CRC32C footer.
 type Store struct {
-	dir string
+	dir        string
+	quarantine string
+	locks      [lockStripes]sync.Mutex
+	// beforeMove lets tests act between Quarantine's re-verify and its rename.
+	beforeMove func()
 }
 
-// New prepares <dataDir>/chunks and removes temp files left behind by a crash mid-write.
+// New prepares <dataDir>/chunks and <dataDir>/quarantine and removes temp files left behind by a crash mid-write.
 func New(dataDir string) (*Store, error) {
 	dir := filepath.Join(dataDir, "chunks")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create chunk dir: %w", err)
+	}
+	quarantine := filepath.Join(dataDir, "quarantine")
+	if err := os.MkdirAll(quarantine, 0o755); err != nil {
+		return nil, fmt.Errorf("create quarantine dir: %w", err)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -52,7 +62,23 @@ func New(dataDir string) (*Store, error) {
 			}
 		}
 	}
-	return &Store{dir: dir}, nil
+	return &Store{dir: dir, quarantine: quarantine}, nil
+}
+
+// lock serialises the final rename of a Write with Quarantine for the same chunk; ids are hex so the first byte spreads evenly.
+func (s *Store) lock(chunkID string) *sync.Mutex {
+	return &s.locks[hexByte(chunkID)]
+}
+
+func hexByte(id string) int {
+	return hexVal(id[0])<<4 | hexVal(id[1])
+}
+
+func hexVal(c byte) int {
+	if c <= '9' {
+		return int(c - '0')
+	}
+	return int(c-'a') + 10
 }
 
 func (s *Store) path(chunkID string) string {

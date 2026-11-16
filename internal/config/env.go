@@ -48,6 +48,17 @@ func PositiveInt(getenv Getenv, key string, def int) (int, error) {
 	return n, nil
 }
 
+func NonNegativeInt(getenv Getenv, key string, def int) (int, error) {
+	n, err := Int(getenv, key, def)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s=%d must be >= 0", key, n)
+	}
+	return n, nil
+}
+
 func Port(getenv Getenv, key string, def int) (int, error) {
 	n, err := Int(getenv, key, def)
 	if err != nil {
