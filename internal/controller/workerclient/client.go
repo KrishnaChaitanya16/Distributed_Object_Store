@@ -114,7 +114,7 @@ func (c *workerClient) ReplicatePeer(ctx context.Context, chunkID string, target
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("replicate chunk %s: worker returned %d", chunkID, resp.StatusCode)
 	}
 	return nil
