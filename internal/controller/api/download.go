@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
@@ -157,6 +158,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("X-Object-ID", objectID)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+manifest.Name+`"`)
+	w.Header().Set("Content-Length", strconv.FormatInt(manifest.SizeBytes, 10))
 	w.WriteHeader(http.StatusOK)
 
 	if len(refs) == 0 {

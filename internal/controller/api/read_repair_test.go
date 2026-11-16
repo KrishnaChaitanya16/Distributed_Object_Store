@@ -331,6 +331,39 @@ func TestReadRepair_BothLaterChunkCorrupt_ConnectionCut(t *testing.T) {
 	assert.Equal(t, chunk0, rec.Body.Bytes(), "chunk 0 must be intact and correct")
 }
 
+func TestReadRepair_BothLaterChunkCorrupt_ContentLengthSignalsShortWrite(t *testing.T) {
+	// 6-chunk object; both copies of chunk index 3 are corrupt.
+	// Content-Length lets the client detect the short write even though status is 200.
+	h, pool := newRepairHarness(t)
+
+	chunks := make([][]byte, 6)
+	for i := range chunks {
+		chunks[i] = bytes.Repeat([]byte{byte('A' + i)}, chunkSize)
+	}
+	content := bytes.Join(chunks, nil)
+
+	resp := uploadViaPool(t, h.srv, pool, "big6.bin", string(content))
+	require.Equal(t, 6, resp.Chunks)
+
+	refs, _ := h.store.GetChunkRefs(context.Background(), resp.ObjectID)
+	target := refs[3]
+	primaryAddr := fmt.Sprintf("localhost:%d", 9000+workerNum(target.PrimaryID))
+	secondaryAddr := fmt.Sprintf("localhost:%d", 9000+workerNum(target.SecondaryID))
+	pool.setCorrupt(primaryAddr, target.ChunkID, target.Size)
+	pool.setCorrupt(secondaryAddr, target.ChunkID, target.Size)
+
+	rec := downloadViaPool(h.srv, resp.ObjectID)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	cl := rec.Header().Get("Content-Length")
+	require.NotEmpty(t, cl, "Content-Length header must be present")
+	assert.Equal(t, fmt.Sprintf("%d", len(content)), cl, "Content-Length must reflect full object size")
+
+	// Only chunks 0-2 written before the connection is cut
+	assert.Equal(t, 3*chunkSize, rec.Body.Len(), "only 3 chunks written before cut")
+	assert.Equal(t, bytes.Join(chunks[:3], nil), rec.Body.Bytes(), "first 3 chunks must be intact")
+}
+
 // ── metadata chunk locations tests ───────────────────────────────────────────
 
 func TestMetadata_IncludesChunkLocations_3Chunks(t *testing.T) {
