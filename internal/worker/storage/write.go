@@ -65,7 +65,11 @@ func (s *Store) Write(ctx context.Context, chunkID string, data io.Reader, size 
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if err = os.Rename(tmp.Name(), s.path(chunkID)); err != nil {
+	mu := s.lock(chunkID)
+	mu.Lock()
+	err = os.Rename(tmp.Name(), s.path(chunkID))
+	mu.Unlock()
+	if err != nil {
 		return fmt.Errorf("rename into place: %w", err)
 	}
 	if err := syncDir(s.dir); err != nil {

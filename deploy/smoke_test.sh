@@ -54,10 +54,14 @@ check "missing WORKER_ID exit code" "$code" "1"
 check "missing WORKER_ID message" "$(echo "$out" | grep -c 'WORKER_ID is required')" "1"
 docker run --rm -e WORKER_ID=w -e WORKER_PORT=99999 "$img" >/dev/null 2>&1; check "bad WORKER_PORT exit code" "$?" "1"
 docker run --rm -e WORKER_ID=w -e CONTROLLER_ADDRESS=controller "$img" >/dev/null 2>&1; check "bad CONTROLLER_ADDRESS exit code" "$?" "1"
+docker run --rm -e WORKER_ID=w -e SCRUB_INTERVAL_S=0 "$img" >/dev/null 2>&1; check "zero SCRUB_INTERVAL_S exit code" "$?" "1"
+docker run --rm -e WORKER_ID=w -e SCRUB_PAUSE_MS=-1 "$img" >/dev/null 2>&1; check "negative SCRUB_PAUSE_MS exit code" "$?" "1"
 
 echo "== controller"
 check "controller answers list objects" "$(curl -s -o /dev/null -w '%{http_code}' "localhost:$CONTROLLER_HOST_PORT/api/v1/objects")" "200"
 check "controller db is on the persistent volume" "$(docker exec controller test -f /data/meta.db && echo yes || echo no)" "yes"
+
+code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 echo "== end to end through the controller"
 C="http://localhost:$CONTROLLER_HOST_PORT"
@@ -82,13 +86,75 @@ check "delete object" "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$C/ap
 check "deleted object is gone" "$(curl -s -o /dev/null -w '%{http_code}' "$C/api/v1/objects/$oid")" "404"
 rm -rf "$tmpe"
 
+echo "== data integrity: scrubber detects corruption, reads fall back, copy is restored"
+wport() { eval echo "\$WORKER${1#worker}_HOST_PORT"; }
+jsonnum() { grep -o "\"$1\":[0-9]*" | head -1 | cut -d: -f2; }
+scrub() {
+	before=$(curl -s "localhost:$(wport "$1")/internal/scrubber/status" | jsonnum passes)
+	curl -s -o /dev/null -X POST "localhost:$(wport "$1")/internal/scrubber/run"
+	for _ in $(seq 1 50); do
+		st=$(curl -s "localhost:$(wport "$1")/internal/scrubber/status")
+		[ "$(echo "$st" | jsonnum passes)" -gt "$before" ] && echo "$st" | grep -q '"running":false' && break
+		sleep 0.2
+	done
+	echo "$st"
+}
+st=$(curl -s "localhost:$WORKER1_HOST_PORT/internal/scrubber/status")
+check "scrubber status endpoint answers" "$(echo "$st" | grep -c '"interval_seconds":30')" "1"
+tmpi=$(mktemp -d)
+head -c 2621440 /dev/urandom > "$tmpi/obj"
+want=$(sha256sum < "$tmpi/obj" | cut -d' ' -f1)
+up=$(curl -s -w '\n%{http_code}' -F "file=@$tmpi/obj" "$C/api/v1/objects")
+check "upload object for integrity test" "$(echo "$up" | tail -1)" "201"
+ioid=$(echo "$up" | head -1 | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+cid=""
+for w in worker1 worker2 worker3 worker4; do
+	curl -s "localhost:$(wport $w)/internal/workers/$w/chunks" | grep -o '[0-9a-f]\{64\}' | sed "s/$/ $w/"
+done | sort > "$tmpi/placement"
+cid=$(head -1 "$tmpi/placement" | cut -d' ' -f1)
+holders=$(grep "^$cid " "$tmpi/placement" | cut -d' ' -f2 | tr '\n' ' ')
+check "chunk under test has 2 holders" "$(echo $holders | wc -w | tr -d ' ')" "2"
+for bad in $holders; do
+	good=$(echo $holders | tr ' ' '\n' | grep -v "^$bad$")
+	docker exec "$bad" sh -c "dd if=/dev/urandom of=/data/chunks/$cid.bin bs=16 count=1 seek=10 conv=notrunc 2>/dev/null"
+	check "$bad: corruption injected (bytes no longer match id)" "$([ "$(curl -s "localhost:$(wport $bad)/internal/chunks/$cid" | sha256sum | cut -d' ' -f1)" != "$cid" ] && echo yes || echo no)" "yes"
+	check "$good: other copy still intact" "$(curl -s "localhost:$(wport $good)/internal/chunks/$cid" | sha256sum | cut -d' ' -f1)" "$cid"
+	st=$(scrub "$bad")
+	check "$bad: scrubber quarantined 1 chunk this pass" "$(echo "$st" | jsonnum last_pass_corrupt)" "1"
+	check "$bad: status names the chunk" "$(echo "$st" | grep -c "$cid")" "1"
+	check "$bad: corrupt copy no longer served" "$(code "localhost:$(wport $bad)/internal/chunks/$cid")" "404"
+	check "$bad: inventory drops it" "$(curl -s "localhost:$(wport $bad)/internal/workers/$bad/chunks" | grep -c "$cid")" "0"
+	check "$bad: evidence kept in quarantine" "$(docker exec "$bad" sh -c "ls /data/quarantine | grep -c ^$cid")" "1"
+	check "$bad: controller download still byte-identical" "$(curl -s "$C/api/v1/objects/$ioid" | sha256sum | cut -d' ' -f1)" "$want"
+	st=$(scrub "$good")
+	check "$good: healthy copy not quarantined" "$(echo "$st" | jsonnum last_pass_corrupt)" "0"
+	check "$bad: restore via replicate-peer from $good" "$(code -X POST -d "{\"chunk_id\":\"$cid\",\"target_addr\":\"$bad:8001\"}" "localhost:$(wport $good)/internal/workers/replicate-peer")" "200"
+	check "$bad: restored copy identical" "$(curl -s "localhost:$(wport $bad)/internal/chunks/$cid" | sha256sum | cut -d' ' -f1)" "$cid"
+	st=$(scrub "$bad")
+	check "$bad: restored copy passes next scrub" "$(echo "$st" | jsonnum last_pass_corrupt)" "0"
+done
+check "controller fell back to the other copy at least once" "$([ "$(docker logs controller 2>&1 | grep 'primary chunk fetch failed' | grep -c "$cid")" -ge 1 ] && echo yes || echo no)" "yes"
+before=$(curl -s "localhost:$(wport "$bad")/internal/scrubber/status" | jsonnum corrupt_quarantined)
+docker exec "$bad" sh -c "dd if=/dev/urandom of=/data/chunks/$cid.bin bs=16 count=1 seek=3 conv=notrunc 2>/dev/null"
+found=no
+for _ in $(seq 1 45); do
+	[ "$(curl -s "localhost:$(wport "$bad")/internal/scrubber/status" | jsonnum corrupt_quarantined)" -gt "$before" ] && found=yes && break
+	sleep 1
+done
+check "periodic scrub (30s timer, no trigger) finds corruption" "$found" "yes"
+code -X POST -d "{\"chunk_id\":\"$cid\",\"target_addr\":\"$bad:8001\"}" "localhost:$(wport $good)/internal/workers/replicate-peer" >/dev/null
+docker restart "$bad" >/dev/null 2>&1; sleep 3
+check "quarantine survives worker restart" "$(docker exec "$bad" sh -c "ls /data/quarantine | grep -c ^$cid")" "2"
+check "restored chunk still served after restart" "$(curl -s "localhost:$(wport $bad)/internal/chunks/$cid" | sha256sum | cut -d' ' -f1)" "$cid"
+curl -s -o /dev/null -X DELETE "$C/api/v1/objects/$ioid"
+rm -rf "$tmpi"
+
 echo "== worker data plane over real HTTP"
 W1="http://localhost:$WORKER1_HOST_PORT"
 W2="http://localhost:$WORKER2_HOST_PORT"
 tmp=$(mktemp -d); trap 'cleanup; rm -rf "$tmp"' EXIT
 head -c 1048576 /dev/urandom > "$tmp/chunk"
 id=$(sha256sum "$tmp/chunk" | cut -d' ' -f1)
-code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 check "PUT 1 MiB chunk to worker1" "$(code -X PUT --data-binary @"$tmp/chunk" "$W1/internal/chunks/$id")" "201"
 curl -s "$W1/internal/chunks/$id" -o "$tmp/back"
 check "GET returns identical bytes" "$(sha256sum < "$tmp/back" | cut -d' ' -f1)" "$id"

@@ -16,6 +16,7 @@ import (
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/config"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/api"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/registration"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/scrubber"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/storage"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -27,6 +28,8 @@ type workerConfig struct {
 	dataDir           string
 	controllerAddr    string
 	heartbeatInterval time.Duration
+	scrubInterval     time.Duration
+	scrubPause        time.Duration
 }
 
 func main() {
@@ -34,15 +37,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("worker config: %v", err)
 	}
-	log.Printf("worker %s starting on :%d data=%s controller=%s", cfg.workerID, cfg.port, cfg.dataDir, cfg.controllerAddr)
+	log.Printf("worker %s starting on :%d data=%s controller=%s scrub=%s", cfg.workerID, cfg.port, cfg.dataDir, cfg.controllerAddr, cfg.scrubInterval)
 
 	store, err := storage.New(cfg.dataDir)
 	if err != nil {
 		log.Fatalf("open chunk store: %v", err)
 	}
+	scrub, err := scrubber.New(store, scrubber.Config{Interval: cfg.scrubInterval, Pause: cfg.scrubPause})
+	if err != nil {
+		log.Fatalf("scrubber: %v", err)
+	}
 	selfAddr := net.JoinHostPort(cfg.address, strconv.Itoa(cfg.port))
 	peer := &http.Client{Timeout: 30 * time.Second}
-	srv := newHTTPServer(cfg.port, api.New(store, cfg.workerID, selfAddr, peer).Handler())
+	srv := newHTTPServer(cfg.port, api.New(store, cfg.workerID, selfAddr, peer).WithScrubber(scrub).Handler())
 	// Listen before registering so the controller can reach us as soon as it knows about us.
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
@@ -56,6 +63,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	scrubDone := make(chan struct{})
+	go func() {
+		defer close(scrubDone)
+		scrub.Run(ctx)
+	}()
 
 	reg := registration.New(cfg.controllerAddr, models.RegisterRequest{
 		WorkerID:      cfg.workerID,
@@ -76,6 +89,11 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
+	select {
+	case <-scrubDone:
+	case <-shutdownCtx.Done():
+		log.Printf("shutdown: scrubber did not stop in time")
+	}
 }
 
 func loadConfig(getenv config.Getenv) (workerConfig, error) {
@@ -95,6 +113,14 @@ func loadConfig(getenv config.Getenv) (workerConfig, error) {
 	if err != nil {
 		return workerConfig{}, err
 	}
+	scrub, err := config.PositiveInt(getenv, "SCRUB_INTERVAL_S", 30)
+	if err != nil {
+		return workerConfig{}, err
+	}
+	pause, err := config.NonNegativeInt(getenv, "SCRUB_PAUSE_MS", 10)
+	if err != nil {
+		return workerConfig{}, err
+	}
 	return workerConfig{
 		workerID:          id,
 		address:           config.Str(getenv, "WORKER_ADDRESS", id),
@@ -102,6 +128,8 @@ func loadConfig(getenv config.Getenv) (workerConfig, error) {
 		dataDir:           config.Str(getenv, "DATA_DIR", "/data"),
 		controllerAddr:    ctrl,
 		heartbeatInterval: time.Duration(hb) * time.Second,
+		scrubInterval:     time.Duration(scrub) * time.Second,
+		scrubPause:        time.Duration(pause) * time.Millisecond,
 	}, nil
 }
 

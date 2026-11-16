@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/scrubber"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/storage"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -23,11 +24,24 @@ type Server struct {
 	workerID string
 	selfAddr string
 	peer     *http.Client
+	scrub    ScrubberControl
+}
+
+// ScrubberControl is the part of the scrubber the HTTP API exposes; *scrubber.Scrubber satisfies it.
+type ScrubberControl interface {
+	Trigger() bool
+	Status() scrubber.Status
 }
 
 // New builds a Server; selfAddr is this worker's advertised host:port, peer is used for replicate-peer pushes.
 func New(store models.ChunkStore, workerID, selfAddr string, peer *http.Client) *Server {
 	return &Server{store: store, workerID: workerID, selfAddr: selfAddr, peer: peer}
+}
+
+// WithScrubber exposes the scrubber's status and manual trigger; without it those routes answer 404.
+func (s *Server) WithScrubber(sc ScrubberControl) *Server {
+	s.scrub = sc
+	return s
 }
 
 func (s *Server) Handler() http.Handler {
@@ -37,6 +51,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /internal/chunks/{id}", s.deleteChunk)
 	mux.HandleFunc("GET /internal/workers/{id}/chunks", s.inventory)
 	mux.HandleFunc("POST /internal/workers/replicate-peer", s.replicatePeer)
+	if s.scrub != nil {
+		mux.HandleFunc("GET /internal/scrubber/status", s.scrubStatus)
+		mux.HandleFunc("POST /internal/scrubber/run", s.scrubRun)
+	}
 	return mux
 }
 
@@ -161,6 +179,15 @@ func (s *Server) replicatePeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) scrubStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.scrub.Status())
+}
+
+// scrubRun queues a pass and returns at once; queued is false when a pass was already waiting to start.
+func (s *Server) scrubRun(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusAccepted, map[string]bool{"queued": s.scrub.Trigger()})
 }
 
 // openChunk reads a chunk or writes the matching error response and returns ok=false.

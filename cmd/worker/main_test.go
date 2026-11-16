@@ -13,7 +13,7 @@ import (
 
 func TestLoadConfig(t *testing.T) {
 	def := func(id string) workerConfig {
-		return workerConfig{workerID: id, address: id, port: 8001, dataDir: "/data", controllerAddr: "controller:8080", heartbeatInterval: 2 * time.Second}
+		return workerConfig{workerID: id, address: id, port: 8001, dataDir: "/data", controllerAddr: "controller:8080", heartbeatInterval: 2 * time.Second, scrubInterval: 30 * time.Second, scrubPause: 10 * time.Millisecond}
 	}
 	cases := []struct {
 		name    string
@@ -27,9 +27,17 @@ func TestLoadConfig(t *testing.T) {
 			env: map[string]string{
 				"WORKER_ID": "worker3", "WORKER_ADDRESS": "10.0.0.3", "WORKER_PORT": "8003",
 				"DATA_DIR": "/mnt/chunks", "CONTROLLER_ADDRESS": "10.0.0.5:9090", "HEARTBEAT_INTERVAL_S": "5",
+				"SCRUB_INTERVAL_S": "120", "SCRUB_PAUSE_MS": "25",
 			},
-			want: workerConfig{workerID: "worker3", address: "10.0.0.3", port: 8003, dataDir: "/mnt/chunks", controllerAddr: "10.0.0.5:9090", heartbeatInterval: 5 * time.Second},
+			want: workerConfig{workerID: "worker3", address: "10.0.0.3", port: 8003, dataDir: "/mnt/chunks", controllerAddr: "10.0.0.5:9090", heartbeatInterval: 5 * time.Second, scrubInterval: 120 * time.Second, scrubPause: 25 * time.Millisecond},
 		},
+		{name: "scrub pause zero means unthrottled", env: map[string]string{"WORKER_ID": "w", "SCRUB_PAUSE_MS": "0"}, want: func() workerConfig { c := def("w"); c.scrubPause = 0; return c }()},
+		{name: "scrub interval one second", env: map[string]string{"WORKER_ID": "w", "SCRUB_INTERVAL_S": "1"}, want: func() workerConfig { c := def("w"); c.scrubInterval = time.Second; return c }()},
+		{name: "zero scrub interval", env: map[string]string{"WORKER_ID": "w", "SCRUB_INTERVAL_S": "0"}, wantErr: true},
+		{name: "negative scrub interval", env: map[string]string{"WORKER_ID": "w", "SCRUB_INTERVAL_S": "-30"}, wantErr: true},
+		{name: "scrub interval with unit", env: map[string]string{"WORKER_ID": "w", "SCRUB_INTERVAL_S": "30s"}, wantErr: true},
+		{name: "negative scrub pause", env: map[string]string{"WORKER_ID": "w", "SCRUB_PAUSE_MS": "-1"}, wantErr: true},
+		{name: "non-numeric scrub pause", env: map[string]string{"WORKER_ID": "w", "SCRUB_PAUSE_MS": "fast"}, wantErr: true},
 		{name: "id is trimmed and used as address", env: map[string]string{"WORKER_ID": "  worker2 "}, want: def("worker2")},
 		{name: "missing id", env: nil, wantErr: true},
 		{name: "blank id", env: map[string]string{"WORKER_ID": "   "}, wantErr: true},
