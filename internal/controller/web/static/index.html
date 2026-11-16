@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniDFS Live</title>
+<meta name="description" content="Live view of the MiniDFS distributed object store: uploads, chunking, hash ring, workers, replication and self-healing.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%232a78d6' stroke-width='3'/%3E%3Ccircle cx='16' cy='3' r='3' fill='%23eb6834'/%3E%3Ccircle cx='27' cy='22' r='3' fill='%231baf7a'/%3E%3Ccircle cx='5' cy='22' r='3' fill='%23eda100'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/theme.css">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="12" fill="none" stroke="var(--s1)" stroke-width="2.5"/><circle cx="16" cy="4" r="3" fill="var(--s2)"/><circle cx="26.4" cy="22" r="3" fill="var(--s3)"/><circle cx="5.6" cy="22" r="3" fill="var(--s4)"/></svg>
+    <div>
+      <h1>MiniDFS <span class="live-word">Live</span></h1>
+      <p>Distributed object store &middot; 1 controller &middot; 4 workers &middot; 1&nbsp;MiB chunks &middot; 2 copies of each</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span id="conn" class="conn" role="status" data-state="connecting"><span class="conn-dot" aria-hidden="true"></span><span class="conn-text">Connecting</span></span>
+    <span id="demo-badge" class="badge-demo" hidden>Demo controls on</span>
+    <button id="theme-toggle" class="btn ghost" type="button" aria-label="Switch between light and dark theme"><span aria-hidden="true">&#9680;</span> Theme</button>
+  </div>
+</header>
+
+<section id="kpis" class="kpis" aria-label="Cluster summary"></section>
+
+<div class="layout">
+  <div class="stage">
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button role="tab" id="t-flow" aria-controls="tab-flow" data-tab="flow" aria-selected="true"><b>1</b> Upload &amp; flow</button>
+      <button role="tab" id="t-ring" aria-controls="tab-ring" data-tab="ring" aria-selected="false"><b>2</b> Hash ring</button>
+      <button role="tab" id="t-cluster" aria-controls="tab-cluster" data-tab="cluster" aria-selected="false"><b>3</b> Workers</button>
+      <button role="tab" id="t-objects" aria-controls="tab-objects" data-tab="objects" aria-selected="false"><b>4</b> Objects &amp; chunks</button>
+      <button role="tab" id="t-bloom" aria-controls="tab-bloom" data-tab="bloom" aria-selected="false"><b>5</b> Bloom filter</button>
+      <button role="tab" id="t-healing" aria-controls="tab-healing" data-tab="healing" aria-selected="false"><b>6</b> Failure &amp; healing</button>
+    </nav>
+    <main id="main" tabindex="-1">
+      <section id="tab-flow" role="tabpanel" aria-labelledby="t-flow"></section>
+      <section id="tab-ring" role="tabpanel" aria-labelledby="t-ring" hidden></section>
+      <section id="tab-cluster" role="tabpanel" aria-labelledby="t-cluster" hidden></section>
+      <section id="tab-objects" role="tabpanel" aria-labelledby="t-objects" hidden></section>
+      <section id="tab-bloom" role="tabpanel" aria-labelledby="t-bloom" hidden></section>
+      <section id="tab-healing" role="tabpanel" aria-labelledby="t-healing" hidden></section>
+    </main>
+  </div>
+  <aside id="rail" class="rail" aria-label="Live event log"></aside>
+</div>
+
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+<noscript><p class="noscript">This dashboard needs JavaScript.</p></noscript>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

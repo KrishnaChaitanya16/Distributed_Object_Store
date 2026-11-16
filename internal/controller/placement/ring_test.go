@@ -144,3 +144,113 @@ func TestWorkers_ReturnsAll(t *testing.T) {
 	workers := r.Workers()
 	assert.Len(t, workers, 4)
 }
+
+// --- introspection used by the web UI ---
+
+func TestSnapshotListsEveryVnodeSortedWithItsIndex(t *testing.T) {
+	r := NewRing()
+	for _, id := range []string{"w1", "w2", "w3"} {
+		r.AddWorker(id, id+":1")
+	}
+	pts := r.Snapshot()
+	require.Len(t, pts, 3*vnodesPerWorker)
+	for i := 1; i < len(pts); i++ {
+		assert.LessOrEqual(t, pts[i-1].Hash, pts[i].Hash)
+	}
+	per := map[string]map[int]bool{}
+	for _, p := range pts {
+		if per[p.WorkerID] == nil {
+			per[p.WorkerID] = map[int]bool{}
+		}
+		per[p.WorkerID][p.Index] = true
+		assert.Equal(t, vnodeHash(p.WorkerID, p.Index), p.Hash, "the index identifies the hash")
+	}
+	for _, id := range []string{"w1", "w2", "w3"} {
+		assert.Len(t, per[id], vnodesPerWorker)
+	}
+}
+
+func TestSnapshotIsACopyAndEmptyRingGivesEmpty(t *testing.T) {
+	r := NewRing()
+	assert.Empty(t, r.Snapshot())
+	r.AddWorker("w1", "x")
+	pts := r.Snapshot()
+	pts[0].WorkerID = "mutated"
+	assert.NotEqual(t, "mutated", r.Snapshot()[0].WorkerID)
+	r.RemoveWorker("w1")
+	assert.Empty(t, r.Snapshot())
+}
+
+func TestVnodePointsWorkWithoutMembership(t *testing.T) {
+	pts := VnodePoints("ghost")
+	require.Len(t, pts, vnodesPerWorker)
+	for i := 1; i < len(pts); i++ {
+		assert.LessOrEqual(t, pts[i-1].Hash, pts[i].Hash)
+	}
+	r := NewRing()
+	r.AddWorker("ghost", "x")
+	assert.Equal(t, pts, r.Snapshot(), "the same points the ring would hold")
+	assert.Equal(t, vnodesPerWorker, VnodesPerWorker())
+}
+
+func TestKeyHashMatchesPlacementInput(t *testing.T) {
+	assert.Equal(t, keyHash("abc"), KeyHash("abc"))
+	assert.NotEqual(t, KeyHash("abc"), KeyHash("abd"))
+}
+
+func TestLocateAgreesWithPrimaryAndSecondary(t *testing.T) {
+	r := NewRing()
+	for _, id := range []string{"w1", "w2", "w3", "w4"} {
+		r.AddWorker(id, id+":1")
+	}
+	for i := 0; i < 300; i++ {
+		key := fmt.Sprintf("chunk-%d", i)
+		w := r.Locate(key)
+		p, err := r.Primary(key)
+		require.NoError(t, err)
+		s, err := r.Secondary(key, p)
+		require.NoError(t, err)
+		assert.Equal(t, p, w.Primary, key)
+		assert.Equal(t, s, w.Secondary, key)
+		assert.Equal(t, KeyHash(key), w.KeyHash)
+		require.NotEmpty(t, w.Steps)
+		assert.Equal(t, p, w.Steps[0].WorkerID)
+		assert.Equal(t, s, w.Steps[len(w.Steps)-1].WorkerID, "the walk ends on the secondary")
+		for _, st := range w.Steps[1 : len(w.Steps)-1] {
+			assert.Equal(t, p, st.WorkerID, "every vnode passed on the way belongs to the primary")
+		}
+	}
+}
+
+func TestLocateWrapsAroundTheRing(t *testing.T) {
+	r := NewRing()
+	r.AddWorker("w1", "x")
+	r.AddWorker("w2", "x")
+	pts := r.Snapshot()
+	last := pts[len(pts)-1]
+	var key string
+	for i := 0; i < 100000; i++ {
+		k := fmt.Sprintf("wrap-%d", i)
+		if KeyHash(k) > last.Hash {
+			key = k
+			break
+		}
+	}
+	require.NotEmpty(t, key, "need a key hashing past the last vnode")
+	w := r.Locate(key)
+	assert.Equal(t, pts[0].Hash, w.Steps[0].Hash, "past the last vnode the walk wraps to the first")
+}
+
+func TestLocateEdgeCases(t *testing.T) {
+	r := NewRing()
+	w := r.Locate("k")
+	assert.Empty(t, w.Steps)
+	assert.Equal(t, "", w.Primary)
+	assert.Equal(t, KeyHash("k"), w.KeyHash)
+
+	r.AddWorker("only", "x")
+	w = r.Locate("k")
+	assert.Equal(t, "only", w.Primary)
+	assert.Equal(t, "", w.Secondary, "one worker cannot hold a second copy")
+	assert.Len(t, w.Steps, vnodesPerWorker, "the walk went all the way round looking for a second worker")
+}

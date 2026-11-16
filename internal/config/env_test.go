@@ -222,3 +222,49 @@ func TestErrorMentionsKey(t *testing.T) {
 		t.Fatalf("error should name the env var, got %v", err)
 	}
 }
+
+func TestBool(t *testing.T) {
+	get := func(v string) Getenv { return func(string) string { return v } }
+	for _, v := range []string{"true", "TRUE", "True", "1", "yes", "YES", "on", " true "} {
+		if got, err := Bool(get(v), "K", false); err != nil || !got {
+			t.Errorf("%q: got %v, %v", v, got, err)
+		}
+	}
+	for _, v := range []string{"false", "False", "0", "no", "off", " OFF "} {
+		if got, err := Bool(get(v), "K", true); err != nil || got {
+			t.Errorf("%q: got %v, %v", v, got, err)
+		}
+	}
+	for _, def := range []bool{true, false} {
+		for _, v := range []string{"", "   "} {
+			if got, err := Bool(get(v), "K", def); err != nil || got != def {
+				t.Errorf("%q with default %v: got %v, %v", v, def, got, err)
+			}
+		}
+	}
+	for _, v := range []string{"maybe", "2", "tru", "truee", "enabled"} {
+		_, err := Bool(get(v), "DEMO_MODE", false)
+		if err == nil {
+			t.Errorf("%q: expected an error", v)
+		} else if !strings.Contains(err.Error(), "DEMO_MODE") {
+			t.Errorf("%q: error %q does not name the variable", v, err)
+		}
+	}
+}
+
+func TestOptionalPort(t *testing.T) {
+	get := func(v string) Getenv { return func(string) string { return v } }
+	for v, want := range map[string]int{"": 8081, "0": 0, "1": 1, "8081": 8081, "65535": 65535} {
+		if got, err := OptionalPort(get(v), "K", 8081); err != nil || got != want {
+			t.Errorf("%q: got %d, %v want %d", v, got, err, want)
+		}
+	}
+	for _, v := range []string{"-1", "65536", "abc", "80.5", "8081x"} {
+		_, err := OptionalPort(get(v), "WEBUI_PORT", 8081)
+		if err == nil {
+			t.Errorf("%q: expected an error", v)
+		} else if !strings.Contains(err.Error(), "WEBUI_PORT") {
+			t.Errorf("%q: error %q does not name the variable", v, err)
+		}
+	}
+}

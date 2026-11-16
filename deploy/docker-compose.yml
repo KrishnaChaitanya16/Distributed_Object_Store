@@ -27,6 +27,7 @@ services:
       - controller-data:/data
     environment:
       CONTROLLER_PORT: "8080"
+      WEBUI_PORT: "8081"
       DB_PATH: /data/meta.db
       LOG_LEVEL: "${LOG_LEVEL:-info}"
       VNODE_COUNT: "50"

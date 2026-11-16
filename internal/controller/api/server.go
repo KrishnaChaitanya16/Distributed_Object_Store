@@ -19,6 +19,9 @@ import (
 
 const chunkSize = 1 * 1024 * 1024 // 1 MiB — per spec §4
 
+// ChunkSize is the size objects are cut into, for display.
+const ChunkSize = chunkSize
+
 // gcWaitTimeout bounds how long an upload waits for a garbage collection of the same chunk to finish; tests shorten it.
 var gcWaitTimeout = 10 * time.Second
 
@@ -149,6 +152,12 @@ func (s *Server) handleGCRun(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]bool{"queued": s.recon.Trigger()}) //nolint:errcheck
 }
+
+// HedgeMs is the hedged-read threshold in milliseconds; 0 means hedging is off.
+func (s *Server) HedgeMs() int { return s.hedgeMs }
+
+// Bloom exposes the dedup filter so the web UI can show what it has seen.
+func (s *Server) Bloom() *dedup.Filter { return s.bloom }
 
 // Handler returns the HTTP mux. Used in tests to wrap the server in httptest.NewServer.
 func (s *Server) Handler() http.Handler { return s.mux }

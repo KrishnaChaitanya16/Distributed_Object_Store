@@ -24,7 +24,25 @@ func (e *hashMismatchError) Error() string { return "hash mismatch: got " + e.go
 // fetchVerified GETs a chunk from addr, checks its byte count and SHA-256.
 // Returns *hashMismatchError on integrity failure so callers can distinguish
 // corruption from plain network/HTTP errors.
-func (s *Server) fetchVerified(ctx context.Context, addr, chunkID string, size int) ([]byte, error) {
+func (s *Server) fetchVerified(ctx context.Context, workerID, role, addr, chunkID string, size int) ([]byte, error) {
+	started := time.Now()
+	buf, err := s.fetchChunk(ctx, addr, chunkID, size)
+	ms := time.Since(started).Milliseconds()
+	var hme *hashMismatchError
+	switch {
+	case err == nil:
+		emit(ctx, "download.fetch", "chunk fetched and SHA-256 verified", "chunk_id", chunkID, "worker", workerID, "role", role, "ok", true, "ms", ms)
+	case errors.As(err, &hme):
+		emit(ctx, "download.corrupt", "fetched bytes do not hash to the chunk id", "chunk_id", chunkID, "worker", workerID, "role", role, "got", hme.got, "ms", ms)
+	case errors.Is(err, context.Canceled):
+		emit(ctx, "download.fetch", "fetch cancelled, the other replica answered first", "chunk_id", chunkID, "worker", workerID, "role", role, "ok", false, "cancelled", true, "ms", ms)
+	default:
+		emit(ctx, "download.fetch", "fetch from a worker failed", "chunk_id", chunkID, "worker", workerID, "role", role, "ok", false, "error", err.Error(), "ms", ms)
+	}
+	return buf, err
+}
+
+func (s *Server) fetchChunk(ctx context.Context, addr, chunkID string, size int) ([]byte, error) {
 	rc, err := s.workers.GetChunk(ctx, addr, chunkID)
 	if err != nil {
 		return nil, err
@@ -72,7 +90,7 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 	secondaryCh := make(chan fetchResult, 1)
 
 	go func() {
-		b, e := s.fetchVerified(pCtx, primaryAddr, ref.ChunkID, ref.Size)
+		b, e := s.fetchVerified(pCtx, ref.PrimaryID, "primary", primaryAddr, ref.ChunkID, ref.Size)
 		primaryCh <- fetchResult{b, e}
 	}()
 
@@ -96,10 +114,11 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 	case <-timerC:
 		// Primary is slow — start secondary hedge
 		metrics.HedgedReadsTotal.Inc()
+		emit(ctx, "download.hedge", "primary is slow, asking the secondary too", "chunk_id", ref.ChunkID, "primary", ref.PrimaryID, "secondary", ref.SecondaryID, "threshold_ms", s.hedgeMs)
 		log.Debug("hedging chunk fetch to secondary", "chunk_id", ref.ChunkID,
 			"threshold_ms", s.hedgeMs, "worker_id", ref.SecondaryID)
 		go func() {
-			b, e := s.fetchVerified(sCtx, secondaryAddr, ref.ChunkID, ref.Size)
+			b, e := s.fetchVerified(sCtx, ref.SecondaryID, "hedge", secondaryAddr, ref.ChunkID, ref.Size)
 			secondaryCh <- fetchResult{b, e}
 		}()
 
@@ -148,7 +167,7 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 
 	// Launch secondary now (or it may already be running from the hedge timer path above)
 	go func() {
-		b, e := s.fetchVerified(sCtx, secondaryAddr, ref.ChunkID, ref.Size)
+		b, e := s.fetchVerified(sCtx, ref.SecondaryID, "secondary", secondaryAddr, ref.ChunkID, ref.Size)
 		secondaryCh <- fetchResult{b, e}
 	}()
 
@@ -171,8 +190,10 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 				if rErr := s.workers.ReplicatePeer(rCtx, sAddr, chunkID, pAddr); rErr != nil {
 					log.Warn("read-repair failed", "chunk_id", chunkID,
 						"secondary", sID, "primary", pID, "err", rErr)
+					emit(ctx, "download.repair", "read-repair failed", "chunk_id", chunkID, "from", sID, "to", pID, "ok", false, "error", rErr.Error())
 				} else {
 					log.Info("read-repair succeeded", "chunk_id", chunkID, "primary", pID)
+					emit(ctx, "download.repair", "corrupt copy overwritten with the good one", "chunk_id", chunkID, "from", sID, "to", pID, "ok", true)
 				}
 			}
 		}
@@ -194,6 +215,8 @@ func logFetchErr(log *slog.Logger, chunkID, workerID string, err error) {
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	objectID := r.PathValue("id")
 	log := slog.With("handler", "download", "object_id", objectID)
+	ctx := withTrace(r.Context(), r.Header.Get(traceHeader))
+	r = r.WithContext(ctx)
 
 	manifest, err := s.meta.GetObject(r.Context(), objectID)
 	if err != nil {
@@ -219,6 +242,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	for i := range refs {
 		refs[i] = s.locate(r.Context(), refs[i])
 	}
+
+	emit(ctx, "download.start", "download requested", "object_id", objectID, "name", manifest.Name, "chunks", len(refs), "bytes", manifest.SizeBytes)
 
 	// Verify chunk 0 before writing the status header so a fully corrupt first
 	// chunk returns 502 instead of a 200 with a truncated body.
@@ -274,6 +299,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	metrics.DownloadBytesTotal.Add(float64(manifest.SizeBytes))
 	log.Info("download complete", "chunks", len(refs), "bytes", manifest.SizeBytes)
+	emit(ctx, "download.done", "object streamed to the client, every chunk verified", "object_id", objectID, "chunks", len(refs), "bytes", manifest.SizeBytes)
 }
 
 // locations lists the workers bbolt says hold the chunk, online ones first; refs from before a rebalance fall back to their original pair.

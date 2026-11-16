@@ -364,6 +364,40 @@ kid=$(echo "$k1" | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
 check "keyed object downloads identical" "$(curl -s "$C/api/v1/objects/$kid" | sha256sum | cut -d' ' -f1)" "$kwant"
 rm -rf "$tmpk"
 
+echo "== web UI"
+UI="http://localhost:$WEBUI_HOST_PORT"
+check "UI index is served" "$(curl -s -o /dev/null -w '%{http_code}' "$UI/")" "200"
+check "UI index is the dashboard" "$(curl -s "$UI/" | grep -q 'MiniDFS Live' && echo yes || echo no)" "yes"
+check "UI scripts have a JavaScript content type" "$(curl -s -o /dev/null -w '%{content_type}' "$UI/js/main.js" | grep -c 'javascript')" "1"
+check "UI styles are served" "$(curl -s -o /dev/null -w '%{http_code}' "$UI/css/app.css")" "200"
+check "unknown UI endpoint is a JSON 404" "$(curl -s "$UI/ui/api/nope" | grep -c error)" "1"
+check "UI state lists 4 online workers" "$(curl -s "$UI/ui/api/state" | grep -o '"workers_online":[0-9]*' | head -1 | cut -d: -f2)" "4"
+check "UI state exposes 50 virtual nodes per worker" "$(curl -s "$UI/ui/api/state" | grep -o '"vnodes_per_worker":[0-9]*' | cut -d: -f2)" "50"
+check "demo controls are locked by default" "$(curl -s "$UI/ui/api/state" | grep -o '"demo":{"enabled":[a-z]*' | cut -d: -f3)" "false"
+check "demo endpoints refuse requests when locked" "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'X-Requested-With: minidfs-ui' "$UI/ui/api/demo/reconcile")" "403"
+tmpu=$(mktemp -d)
+head -c 1500000 /dev/urandom > "$tmpu/f"
+useq=$(curl -s "$UI/ui/api/events?limit=1" | grep -o '"last_seq":[0-9]*' | cut -d: -f2)
+ubefore=$(curl -s "$UI/ui/api/objects" | grep -o '"physical":true' | wc -l | tr -d ' ')
+uup=$(curl -s -w '\n%{http_code}' -H 'X-Trace-Id: smoke-ui' -F "file=@$tmpu/f" "$UI/api/v1/objects")
+check "upload through the UI port works" "$(echo "$uup" | tail -1)" "201"
+uoid=$(echo "$uup" | head -1 | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+ev=$(curl -s "$UI/ui/api/events?since=$useq&limit=500")
+kinds=$(echo "$ev" | grep -o '"kind":"upload\.[a-z]*"' | cut -d'"' -f4 | tr '\n' ' ')
+check "upload emitted its pipeline events in order" "$kinds" "upload.start upload.chunk upload.place upload.bloom upload.push upload.push upload.durable upload.chunk upload.place upload.bloom upload.push upload.push upload.durable upload.commit "
+check "events carry the client's trace id" "$(echo "$ev" | grep -c '"trace":"smoke-ui"')" "1"
+uobj=$(curl -s "$UI/ui/api/objects")
+check "UI objects lists the upload with 2 chunks" "$(echo "$uobj" | grep -o "\"object_id\":\"$uoid\"" | wc -l | tr -d ' ')" "1"
+check "UI confirms the 4 new copies on disk" "$(( $(echo "$uobj" | grep -o '"physical":true' | wc -l | tr -d ' ') - ubefore ))" "4"
+check "UI reports no missing copy" "$(echo "$uobj" | grep -o '"physical":false' | wc -l | tr -d ' ')" "0"
+check "ring locate gives distinct primary and secondary" "$(curl -s "$UI/ui/api/ring/locate?text=hello" | grep -o '"primary":"[^"]*","secondary":"[^"]*"' | awk -F'"' '$4!=$8 && $4!="" && $8!=""' | wc -l | tr -d ' ')" "1"
+check "bloom probe reports a stored chunk as possibly stored" "$(curl -s "$UI/ui/api/bloom/probe?chunk=$(echo "$uobj" | grep -o '"chunk_id":"[0-9a-f]*"' | head -1 | cut -d'"' -f4)" | grep -c '"might_exist":true')" "1"
+sse=$(timeout 3 curl -s -N "$UI/ui/api/events/stream?since=$useq" || true)
+check "live stream replays missed events" "$(echo "$sse" | grep -c 'upload.commit')" "1"
+check "live stream is Server-Sent Events" "$(curl -s -m 2 -D - -o /dev/null "$UI/ui/api/events/stream" | tr -d '\r' | grep -ci '^content-type: text/event-stream')" "1"
+curl -s -o /dev/null -X DELETE "$UI/api/v1/objects/$uoid"
+rm -rf "$tmpu"
+
 echo "== rebalancer: RF=2 restored after worker failure"
 # Upload a small object and find which two workers hold its chunk.
 tmprb=$(mktemp -d)

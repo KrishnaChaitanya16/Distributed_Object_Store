@@ -1,0 +1,6 @@
+{
+  "name": "minidfs-web-ui",
+  "private": true,
+  "type": "module",
+  "description": "Marks the UI scripts as ES modules for the Node-based unit tests; not part of the served files."
+}

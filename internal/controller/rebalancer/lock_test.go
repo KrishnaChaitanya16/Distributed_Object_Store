@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/chunklock"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/events"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
@@ -65,4 +66,39 @@ func TestRebalancer_SkipsChunkAlreadyRepairedWhileWaitingForLock(t *testing.T) {
 	assert.Empty(t, workers.getCalls(), "someone else already replaced the dead replica")
 	got, _ := store.GetChunk(context.Background(), "chunk1")
 	assert.Len(t, got.Replicas, 2, "no third replica")
+}
+
+func TestRebalancerEmitsAnEventWhenItReplacesADeadReplica(t *testing.T) {
+	store := newTestStore(t)
+	saveWorkers(t, store, "w1", "w2", "w3")
+	saveChunk(t, store, "ui-chunk", "w1", "w2")
+	health := &fakeHealth{}
+	health.setOnline("w1", "w3")
+	seq := events.Default.LastSeq()
+	newRebalancer(store, &fakeWorkers{}, health).tick(context.Background())
+
+	var got []events.Event
+	for _, ev := range events.Default.Since(seq, 0) {
+		if ev.Kind == "rebalance.copy" {
+			got = append(got, ev)
+		}
+	}
+	require.Len(t, got, 1)
+	assert.Equal(t, "ui-chunk", got[0].Fields["chunk_id"])
+	assert.Equal(t, "w1", got[0].Fields["from"])
+	assert.Equal(t, "w3", got[0].Fields["to"])
+	assert.Equal(t, "w2", got[0].Fields["replaced"])
+}
+
+func TestRebalancerEmitsNothingWhenNothingIsDead(t *testing.T) {
+	store := newTestStore(t)
+	saveWorkers(t, store, "w1", "w2", "w3")
+	saveChunk(t, store, "healthy-ui", "w1", "w2")
+	health := &fakeHealth{}
+	health.setOnline("w1", "w2", "w3")
+	seq := events.Default.LastSeq()
+	newRebalancer(store, &fakeWorkers{}, health).tick(context.Background())
+	for _, ev := range events.Default.Since(seq, 0) {
+		assert.NotEqual(t, "rebalance.copy", ev.Kind)
+	}
 }

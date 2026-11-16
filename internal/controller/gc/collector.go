@@ -8,6 +8,7 @@ import (
 	"log/slog"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/chunklock"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/events"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -66,6 +67,7 @@ func (c *Collector) sweep(ctx context.Context, rec *models.ChunkRecord) error {
 	if err := c.meta.RemoveDeletedChunk(ctx, rec.ChunkID); err != nil {
 		return fmt.Errorf("remove chunk record %s: %w", rec.ChunkID, err)
 	}
+	events.Emit("gc.chunk_deleted", "no object references this chunk any more, removed from every worker", "chunk_id", rec.ChunkID, "copies", len(rec.Replicas)-skipped)
 	slog.Info("gc: chunk deleted", "chunk_id", rec.ChunkID, "copies", len(rec.Replicas)-skipped, "offline_skipped", skipped)
 	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/chunklock"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/events"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -29,12 +30,18 @@ type Config struct {
 	JoinPoll time.Duration
 	// OrphanGrace is how long a file unknown to bbolt must keep being seen before it is deleted.
 	OrphanGrace time.Duration
+	// RetryAfter is how soon to try again after a pass that could not scan every online worker; zero means 5s, and it is never longer than Interval.
+	RetryAfter time.Duration
 }
+
+// maxQuickRetries bounds how many times in a row a pass that could not scan everyone is retried before waiting for the normal interval.
+const maxQuickRetries = 6
 
 // Report describes one pass.
 type Report struct {
 	StartedAt          time.Time `json:"started_at"`
 	DurationMs         int64     `json:"duration_ms"`
+	WorkersOnline      int       `json:"workers_online"`
 	WorkersScanned     int       `json:"workers_scanned"`
 	StaleUploadsFailed int       `json:"stale_uploads_failed"`
 	ChunksDeleted      int       `json:"chunks_deleted"`
@@ -90,6 +97,15 @@ func NewReconciler(meta models.MetadataRepository, workers models.WorkerClientPo
 	if cfg.JoinPoll <= 0 {
 		cfg.JoinPoll = 2 * time.Second
 	}
+	if cfg.RetryAfter < 0 {
+		return nil, fmt.Errorf("retry delay must not be negative, got %s", cfg.RetryAfter)
+	}
+	if cfg.RetryAfter == 0 {
+		cfg.RetryAfter = 5 * time.Second
+	}
+	if cfg.RetryAfter > cfg.Interval {
+		cfg.RetryAfter = cfg.Interval
+	}
 	return &Reconciler{
 		meta: meta, workers: workers, health: health, col: col, cfg: cfg,
 		trigger:     make(chan struct{}, 1),
@@ -108,6 +124,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	poll := time.NewTicker(r.cfg.JoinPoll)
 	defer poll.Stop()
 	known := toSet(r.health.ListOnlineWorkers())
+	quick := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -130,11 +147,19 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			}
 			timer.Stop()
 		}
-		r.Pass(ctx)
+		rep := r.Pass(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
-		timer.Reset(r.cfg.Interval)
+		next := r.cfg.Interval
+		if rep.Errors > 0 && rep.WorkersScanned < rep.WorkersOnline && quick < maxQuickRetries {
+			quick++
+			next = r.cfg.RetryAfter
+			slog.Info("gc: pass could not scan every online worker, retrying soon", "scanned", rep.WorkersScanned, "online", rep.WorkersOnline, "retry_in", next)
+		} else {
+			quick = 0
+		}
+		timer.Reset(next)
 	}
 }
 
@@ -173,6 +198,8 @@ func (r *Reconciler) Pass(ctx context.Context) Report {
 		st.Passes++
 		st.LastPass = &rep
 	})
+	events.Emit("gc.pass", "reconciler pass finished", "workers_scanned", rep.WorkersScanned, "chunks_deleted", rep.ChunksDeleted, "excess_deleted", rep.ExcessDeleted,
+		"replicas_restored", rep.ReplicasRestored, "chunks_adopted", rep.ChunksAdopted, "stale_uploads", rep.StaleUploadsFailed, "objects_purged", rep.ObjectsPurged, "lost_chunks", rep.LostChunks, "errors", rep.Errors, "ms", rep.DurationMs)
 	if rep.ChunksDeleted+rep.ExcessDeleted+rep.ReplicasRestored+rep.ChunksAdopted+rep.StaleUploadsFailed+rep.ObjectsPurged+rep.KeysPurged+rep.LostChunks+rep.Errors > 0 {
 		slog.Info("gc: pass complete", "chunks_deleted", rep.ChunksDeleted, "excess_deleted", rep.ExcessDeleted,
 			"replicas_restored", rep.ReplicasRestored, "chunks_adopted", rep.ChunksAdopted, "stale_uploads_failed", rep.StaleUploadsFailed,
@@ -212,6 +239,7 @@ func (p *pass) run() {
 		p.rep.StaleUploadsFailed = len(ids)
 		metrics.GCStaleUploadsTotal.Add(float64(len(ids)))
 		slog.Warn("gc: stale uploads marked FAILED", "object_ids", ids)
+		events.Emit("gc.stale_upload", "upload idle past the timeout, marked FAILED", "object_ids", ids)
 	}
 
 	p.scanWorkers()
@@ -222,6 +250,7 @@ func (p *pass) run() {
 		p.rep.ChunksAdopted = len(adopted)
 		metrics.ReconcileChunksAdoptedTotal.Add(float64(len(adopted)))
 		slog.Warn("gc: rebuilt missing chunk records from worker inventories", "chunk_ids", adopted)
+		events.Emit("gc.adopt", "chunk records rebuilt from what the workers hold", "chunk_ids", adopted)
 	}
 
 	records, err := m.ListAllChunks(p.ctx)
@@ -302,6 +331,7 @@ func (p *pass) run() {
 // scanWorkers lists every online worker's chunks; a worker whose list fails is treated as unknown, never as empty.
 func (p *pass) scanWorkers() {
 	p.online = toSet(p.r.health.ListOnlineWorkers())
+	p.rep.WorkersOnline = len(p.online)
 	p.addrs = make(map[string]string)
 	p.inv = make(map[string]map[string]bool)
 	p.holders = make(map[string][]models.Replica)
@@ -400,6 +430,7 @@ func (p *pass) restore(chunkID string, src models.Replica, target string) {
 	p.rep.ReplicasRestored++
 	metrics.ReconcileReplicasRestoredTotal.Inc()
 	slog.Info("gc: missing replica restored", "chunk_id", chunkID, "source", src.WorkerID, "target", target)
+	events.Emit("gc.restore", "a listed replica was missing, copied back", "chunk_id", chunkID, "from", src.WorkerID, "to", target)
 }
 
 // topUp brings a record listing fewer than replicationFactor workers back up, adopting an existing copy before copying to a new worker.
@@ -427,6 +458,7 @@ func (p *pass) topUp(rec *models.ChunkRecord, sources []models.Replica) {
 		p.rep.ReplicasRestored++
 		metrics.ReconcileReplicasRestoredTotal.Inc()
 		slog.Info("gc: existing copy listed as replica", "chunk_id", rec.ChunkID, "worker_id", s.WorkerID)
+		events.Emit("gc.restore", "an existing copy was recorded as a replica", "chunk_id", rec.ChunkID, "to", s.WorkerID)
 	}
 	ids := make([]string, 0, len(p.inv))
 	for id := range p.inv {
@@ -455,6 +487,7 @@ func (p *pass) topUp(rec *models.ChunkRecord, sources []models.Replica) {
 		p.rep.ReplicasRestored++
 		metrics.ReconcileReplicasRestoredTotal.Inc()
 		slog.Info("gc: under-replicated chunk copied to new worker", "chunk_id", rec.ChunkID, "target", target)
+		events.Emit("gc.restore", "under-replicated chunk copied to a new worker", "chunk_id", rec.ChunkID, "from", sources[0].WorkerID, "to", target)
 	}
 }
 
@@ -483,6 +516,7 @@ func (p *pass) removeExcess(chunkID, workerID string) {
 	p.rep.ExcessDeleted++
 	metrics.ReconcileExcessDeletedTotal.Inc()
 	slog.Info("gc: excess copy deleted", "chunk_id", chunkID, "worker_id", workerID, "listed_replicas", len(rec.Replicas))
+	events.Emit("gc.excess", "extra copy not in the replica list deleted", "chunk_id", chunkID, "worker", workerID)
 }
 
 func listedIn(rec *models.ChunkRecord, workerID string) bool {

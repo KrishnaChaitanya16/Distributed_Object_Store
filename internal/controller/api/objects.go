@@ -202,5 +202,6 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Info("delete complete", "chunks", len(refs), "chunks_deleted", deleted)
+	emit(withTrace(r.Context(), r.Header.Get(traceHeader)), "object.delete", "object deleted, chunks with no remaining reference removed from the workers", "object_id", objectID, "name", manifest.Name, "chunks", len(refs), "chunks_deleted", deleted)
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -186,4 +187,22 @@ func TestMonitor_DoesNotReFireOfflineForAlreadyOfflineWorker(t *testing.T) {
 	default:
 		// correct — no second event
 	}
+}
+
+func TestSnapshotReportsStatusAndLastSeen(t *testing.T) {
+	lt := NewLeaseTable()
+	assert.Empty(t, lt.Snapshot())
+	before := time.Now()
+	lt.RecordHeartbeat("w1")
+	lt.RecordHeartbeat("w2")
+	lt.mu.Lock()
+	lt.markOffline("w2")
+	lt.mu.Unlock()
+	snap := lt.Snapshot()
+	require.Len(t, snap, 2)
+	assert.Equal(t, models.WorkerOnline, snap["w1"].Status)
+	assert.Equal(t, models.WorkerOffline, snap["w2"].Status)
+	assert.False(t, snap["w1"].LastSeen.Before(before))
+	snap["w1"] = WorkerLease{}
+	assert.Equal(t, models.WorkerOnline, lt.Snapshot()["w1"].Status, "Snapshot returns a copy")
 }

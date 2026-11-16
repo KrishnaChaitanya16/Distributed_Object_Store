@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/placement"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
@@ -24,6 +25,9 @@ type uploadResponse struct {
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	log := slog.With("handler", "upload")
+	started := time.Now()
+	ctx := withTrace(r.Context(), r.Header.Get(traceHeader))
+	r = r.WithContext(ctx)
 
 	// --- idempotency check (optional header) ---
 	// If the client sends Idempotency-Key, we guarantee at-most-once semantics:
@@ -109,6 +113,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	emit(ctx, "upload.start", "upload received, manifest staged", "object_id", objectID, "name", header.Filename, "size", header.Size, "content_type", manifest.ContentType)
 
 	// --- chunk, hash, place, push ---
 	var (
@@ -131,6 +136,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		chunkID := hex.EncodeToString(sum[:])
 
 		log.Debug("chunk hashed", "index", index, "chunk_id", chunkID, "size_bytes", n, "offset", totalSize-int64(n))
+		emit(ctx, "upload.chunk", "chunk cut and hashed", "object_id", objectID, "index", index, "chunk_id", chunkID, "size", n, "offset", totalSize-int64(n))
 
 		// placement
 		primaryID, err := s.placement.Primary(chunkID)
@@ -147,6 +153,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Debug("chunk placed", "index", index, "chunk_id", chunkID, "primary", primaryID, "secondary", secondaryID)
+		emit(ctx, "upload.place", "ring picked primary and secondary", "object_id", objectID, "index", index, "chunk_id", chunkID, "ring_pos", placement.KeyHash(chunkID), "primary", primaryID, "secondary", secondaryID)
 
 		ref := models.ChunkRef{
 			ChunkID:     chunkID,
@@ -160,6 +167,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		status, msg, err := s.storeChunk(r.Context(), objectID, ref, chunk, log)
 		if err != nil {
 			log.Error("store chunk", "chunk_id", chunkID, "index", index, "err", err)
+			emit(ctx, "upload.error", "storing a chunk failed", "object_id", objectID, "index", index, "chunk_id", chunkID, "error", err.Error())
 			s.rollback(r.Context(), objectID, log)
 			http.Error(w, msg, status)
 			return
@@ -197,6 +205,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	metrics.UploadBytesTotal.Add(float64(totalSize))
 	log.Info("upload complete", "object_id", objectID, "chunks", len(refs), "bytes", totalSize)
+	emit(ctx, "upload.commit", "object committed", "object_id", objectID, "chunks", len(refs), "bytes", totalSize, "ms", time.Since(started).Milliseconds())
 
 	resp := uploadResponse{ObjectID: objectID, Chunks: len(refs), Bytes: totalSize}
 	respBody, _ := json.Marshal(resp)
@@ -219,7 +228,19 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 // storeChunk makes one chunk durable for this upload and returns the HTTP status and message to use on failure.
 func (s *Server) storeChunk(ctx context.Context, objectID string, ref models.ChunkRef, data []byte, log *slog.Logger) (int, string, error) {
+	maybe := s.bloom.Observe(ref.ChunkID)
 	rec, err := s.meta.AddChunkRef(ctx, objectID, ref)
+	if err == nil {
+		s.bloom.RecordOutcome(maybe, rec != nil)
+		verdict := "definitely_new"
+		if maybe {
+			verdict = "true_positive"
+			if rec == nil {
+				verdict = "false_positive"
+			}
+		}
+		emit(ctx, "upload.bloom", "bloom filter consulted", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID, "maybe", maybe, "in_store", rec != nil, "verdict", verdict)
+	}
 	if errors.Is(err, models.ErrNotStaged) {
 		return http.StatusServiceUnavailable, "upload expired, retry", err
 	}
@@ -234,6 +255,7 @@ func (s *Server) storeChunk(ctx context.Context, objectID string, ref models.Chu
 	if rec != nil && rec.State == models.ChunkDurable {
 		log.Debug("chunk already exists (dedup) — skipping worker push", "chunk_id", ref.ChunkID)
 		metrics.ChunksDedupTotal.Inc()
+		emit(ctx, "upload.dedup", "identical chunk already stored, nothing sent to workers", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID)
 		return 0, "", nil
 	}
 
@@ -264,15 +286,19 @@ func (s *Server) storeChunk(ctx context.Context, objectID string, ref models.Chu
 			role = "primary"
 		}
 		log.Debug("pushing chunk to "+role+" worker", "chunk_id", ref.ChunkID, "worker_id", rep.WorkerID, "addr", s.workerAddr(rep.WorkerID))
+		pushStart := time.Now()
 		if err := s.workers.PutChunk(ctx, s.workerAddr(rep.WorkerID), ref.ChunkID, newBytesReader(data), int64(len(data))); err != nil {
+			emit(ctx, "upload.push", "pushing the chunk to a worker failed", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID, "worker", rep.WorkerID, "role", role, "ok", false, "error", err.Error())
 			return http.StatusBadGateway, "worker error", fmt.Errorf("put chunk on %s %s: %w", role, rep.WorkerID, err)
 		}
+		emit(ctx, "upload.push", "chunk stored on a worker", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID, "worker", rep.WorkerID, "role", role, "ok", true, "ms", time.Since(pushStart).Milliseconds())
 		log.Debug("chunk stored on "+role, "chunk_id", ref.ChunkID, "worker_id", rep.WorkerID)
 	}
 	if err := s.meta.MarkChunkDurable(ctx, ref.ChunkID); err != nil {
 		return http.StatusInternalServerError, "internal error", err
 	}
 	log.Debug("chunk state updated in bbolt", "chunk_id", ref.ChunkID, "state", "DURABLE")
+	emit(ctx, "upload.durable", "chunk is on both workers and marked DURABLE", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID)
 	s.bloom.Add(ref.ChunkID)
 	metrics.ChunksNewTotal.Inc()
 	return 0, "", nil
@@ -314,6 +340,9 @@ func (s *Server) allOnline(reps []models.Replica) bool {
 
 // rollback marks the object FAILED so it can be GC'd later.
 func (s *Server) rollback(ctx interface{ Done() <-chan struct{} }, objectID string, log *slog.Logger) {
+	if c, ok := ctx.(context.Context); ok {
+		emit(c, "upload.fail", "upload rolled back, object marked FAILED", "object_id", objectID)
+	}
 	// use a background context since the request context may already be cancelled
 	bgCtx := noCancel(ctx)
 	if err := s.meta.UpdateObjectStatus(bgCtx, objectID, models.StatusFailed); err != nil {

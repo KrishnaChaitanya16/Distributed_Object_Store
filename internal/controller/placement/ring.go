@@ -13,6 +13,7 @@ const vnodesPerWorker = 50
 type vnode struct {
 	hash     uint32
 	workerID string
+	index    int
 }
 
 // Ring is a consistent hash ring with virtual nodes.
@@ -42,7 +43,7 @@ func (r *Ring) AddWorker(workerID, address string) {
 
 	for i := 0; i < vnodesPerWorker; i++ {
 		h := vnodeHash(workerID, i)
-		r.vnodes = append(r.vnodes, vnode{hash: h, workerID: workerID})
+		r.vnodes = append(r.vnodes, vnode{hash: h, workerID: workerID, index: i})
 	}
 	sort.Slice(r.vnodes, func(i, j int) bool {
 		return r.vnodes[i].hash < r.vnodes[j].hash
@@ -111,4 +112,71 @@ func vnodeHash(workerID string, i int) uint32 {
 func keyHash(key string) uint32 {
 	h := sha256.Sum256([]byte(key))
 	return binary.BigEndian.Uint32(h[:4])
+}
+
+// Point is one virtual node's position on the ring.
+type Point struct {
+	Hash     uint32 `json:"hash"`
+	WorkerID string `json:"worker"`
+	Index    int    `json:"index"`
+}
+
+// Walk is the clockwise search that places one key: the hash it starts from and every virtual node passed until two distinct workers were found.
+type Walk struct {
+	KeyHash   uint32  `json:"key_hash"`
+	Steps     []Point `json:"steps"`
+	Primary   string  `json:"primary"`
+	Secondary string  `json:"secondary"`
+}
+
+// VnodesPerWorker is how many virtual nodes each worker places on the ring.
+func VnodesPerWorker() int { return vnodesPerWorker }
+
+// KeyHash is the ring position a key (a chunk ID) hashes to.
+func KeyHash(key string) uint32 { return keyHash(key) }
+
+// VnodePoints returns the virtual nodes a worker places, or would place, on the ring, sorted by position; it works for workers that are not currently members.
+func VnodePoints(workerID string) []Point {
+	pts := make([]Point, vnodesPerWorker)
+	for i := range pts {
+		pts[i] = Point{Hash: vnodeHash(workerID, i), WorkerID: workerID, Index: i}
+	}
+	sort.Slice(pts, func(i, j int) bool { return pts[i].Hash < pts[j].Hash })
+	return pts
+}
+
+// Snapshot returns every virtual node currently on the ring, sorted by position.
+func (r *Ring) Snapshot() []Point {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	pts := make([]Point, len(r.vnodes))
+	for i, v := range r.vnodes {
+		pts[i] = Point{Hash: v.hash, WorkerID: v.workerID, Index: v.index}
+	}
+	return pts
+}
+
+// Locate replays how key is placed: from its hash clockwise, the first virtual node is the primary and the next one on a different worker is the secondary.
+func (r *Ring) Locate(key string) Walk {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	w := Walk{KeyHash: keyHash(key), Steps: []Point{}}
+	n := len(r.vnodes)
+	if n == 0 {
+		return w
+	}
+	idx := sort.Search(n, func(i int) bool { return r.vnodes[i].hash >= w.KeyHash })
+	for i := 0; i < n; i++ {
+		v := r.vnodes[(idx+i)%n]
+		w.Steps = append(w.Steps, Point{Hash: v.hash, WorkerID: v.workerID, Index: v.index})
+		if w.Primary == "" {
+			w.Primary = v.workerID
+			continue
+		}
+		if v.workerID != w.Primary {
+			w.Secondary = v.workerID
+			break
+		}
+	}
+	return w
 }

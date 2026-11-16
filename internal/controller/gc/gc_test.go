@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/events"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metadata"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -327,7 +328,7 @@ func TestPassOnHealthyClusterDoesNothing(t *testing.T) {
 	e.chunk("a", models.ChunkDurable, "w1", "w2")
 	e.chunk("b", models.ChunkDurable, "w2", "w3")
 	rep := e.rec.Pass(e.ctx)
-	assert.Equal(t, Report{StartedAt: rep.StartedAt, DurationMs: rep.DurationMs, WorkersScanned: 3}, rep)
+	assert.Equal(t, Report{StartedAt: rep.StartedAt, DurationMs: rep.DurationMs, WorkersOnline: 3, WorkersScanned: 3}, rep)
 	assert.Empty(t, e.c.callsWith("DEL"))
 	assert.Empty(t, e.c.callsWith("COPY"))
 }
@@ -780,4 +781,128 @@ func TestPassPurgesStaleIdempotencyLocksButKeepsCommittedKeys(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, existing)
 	assert.Equal(t, "COMMITTED", existing.Status)
+}
+
+// --- events shown in the web UI ---
+
+func eventsSince(seq uint64, kind string) []events.Event {
+	var out []events.Event
+	for _, ev := range events.Default.Since(seq, 0) {
+		if ev.Kind == kind {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func TestPassEmitsAnEventForEveryRepairAction(t *testing.T) {
+	e := newEnv(t, "w1", "w2", "w3")
+	e.object("o", models.StatusCommitted, "lost", "extra")
+	e.chunk("lost", models.ChunkDurable, "w1", "w2")
+	require.NoError(t, e.c.DeleteChunk(e.ctx, "w1:1", "lost"))
+	e.chunk("extra", models.ChunkDurable, "w1", "w2")
+	e.c.put("w3", "extra")
+	e.c.put("w3", "garbage")
+	seq := events.Default.LastSeq()
+
+	rep := e.rec.Pass(e.ctx)
+	require.Equal(t, 1, rep.ReplicasRestored)
+	require.Equal(t, 1, rep.ExcessDeleted)
+	require.Equal(t, 1, rep.ChunksDeleted)
+
+	restore := eventsSince(seq, "gc.restore")
+	require.Len(t, restore, 1)
+	assert.Equal(t, "lost", restore[0].Fields["chunk_id"])
+	assert.Equal(t, "w2", restore[0].Fields["from"])
+	assert.Equal(t, "w1", restore[0].Fields["to"])
+	excess := eventsSince(seq, "gc.excess")
+	require.Len(t, excess, 1)
+	assert.Equal(t, "w3", excess[0].Fields["worker"])
+	assert.Equal(t, "extra", excess[0].Fields["chunk_id"])
+	deleted := eventsSince(seq, "gc.chunk_deleted")
+	require.Len(t, deleted, 1)
+	assert.Equal(t, "garbage", deleted[0].Fields["chunk_id"])
+
+	pass := eventsSince(seq, "gc.pass")
+	require.Len(t, pass, 1, "one summary per pass, even when it did work")
+	assert.EqualValues(t, 1, pass[0].Fields["replicas_restored"])
+	assert.EqualValues(t, 1, pass[0].Fields["excess_deleted"])
+	assert.EqualValues(t, 3, pass[0].Fields["workers_scanned"])
+}
+
+func TestPassOnACleanClusterStillEmitsASummary(t *testing.T) {
+	e := newEnv(t, "w1", "w2")
+	seq := events.Default.LastSeq()
+	e.rec.Pass(e.ctx)
+	pass := eventsSince(seq, "gc.pass")
+	require.Len(t, pass, 1)
+	assert.EqualValues(t, 0, pass[0].Fields["errors"])
+	assert.Empty(t, eventsSince(seq, "gc.restore"))
+	assert.Empty(t, eventsSince(seq, "gc.excess"))
+}
+
+func TestStaleUploadEmitsAnEvent(t *testing.T) {
+	e := newEnv(t, "w1", "w2")
+	require.NoError(t, e.store.SaveObject(e.ctx, &models.ObjectManifest{ID: "stuck-ui", Status: models.StatusStaged, ModifiedAt: time.Now().Add(-time.Hour).UTC()}))
+	seq := events.Default.LastSeq()
+	e.rec.Pass(e.ctx)
+	stale := eventsSince(seq, "gc.stale_upload")
+	require.Len(t, stale, 1)
+	assert.Equal(t, []string{"stuck-ui"}, stale[0].Fields["object_ids"])
+}
+
+// --- quick retry after a pass that could not scan everyone ---
+
+func TestPassReportsHowManyWorkersWereOnlineAndHowManyWereScanned(t *testing.T) {
+	e := newEnv(t, "w1", "w2", "w3")
+	e.c.listErr["w2"] = errors.New("circuit breaker open")
+	rep := e.rec.Pass(e.ctx)
+	assert.Equal(t, 3, rep.WorkersOnline)
+	assert.Equal(t, 2, rep.WorkersScanned)
+	assert.Equal(t, 1, rep.Errors)
+}
+
+func TestRunRetriesSoonWhenAWorkerCouldNotBeScanned(t *testing.T) {
+	e := newEnv(t, "w1", "w2")
+	e.c.listErr["w2"] = errors.New("circuit breaker open")
+	e.rec.cfg.Interval = time.Hour
+	e.rec.cfg.RetryAfter = 30 * time.Millisecond
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+	go e.rec.Run(ctx) //nolint:errcheck
+	require.True(t, e.rec.Trigger())
+	require.Eventually(t, func() bool { return e.rec.Status().Passes >= 3 }, 3*time.Second, 10*time.Millisecond, "failed passes are retried long before the hour is up")
+	delete(e.c.listErr, "w2")
+	e.c.put("w2", "stale")
+	e.object("o", models.StatusCommitted, "stale")
+	require.Eventually(t, func() bool { r := e.rec.Status().LastPass; return r != nil && r.WorkersScanned == 2 && r.Errors == 0 }, 3*time.Second, 10*time.Millisecond)
+	passes := e.rec.Status().Passes
+	time.Sleep(200 * time.Millisecond)
+	assert.Equal(t, passes, e.rec.Status().Passes, "once everyone was scanned it goes back to the normal interval")
+}
+
+func TestQuickRetriesAreBounded(t *testing.T) {
+	e := newEnv(t, "w1", "w2")
+	e.c.listErr["w2"] = errors.New("down for good")
+	e.rec.cfg.Interval = time.Hour
+	e.rec.cfg.RetryAfter = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+	go e.rec.Run(ctx) //nolint:errcheck
+	require.True(t, e.rec.Trigger())
+	require.Eventually(t, func() bool { return e.rec.Status().Passes >= int64(maxQuickRetries)+1 }, 3*time.Second, 5*time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
+	assert.EqualValues(t, maxQuickRetries+1, e.rec.Status().Passes, "after the bounded retries it waits for the normal interval instead of hammering a dead worker")
+}
+
+func TestARetryDelayLongerThanTheIntervalIsClamped(t *testing.T) {
+	e := newEnv(t, "w1")
+	r, err := NewReconciler(e.store, e.c, e.c, e.col, Config{Interval: time.Second, StagedTimeout: time.Second, RetryAfter: time.Minute})
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, r.cfg.RetryAfter)
+	r, err = NewReconciler(e.store, e.c, e.c, e.col, Config{Interval: time.Hour, StagedTimeout: time.Second})
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Second, r.cfg.RetryAfter, "the default")
+	_, err = NewReconciler(e.store, e.c, e.c, e.col, Config{Interval: time.Hour, StagedTimeout: time.Second, RetryAfter: -time.Second})
+	assert.Error(t, err)
 }
