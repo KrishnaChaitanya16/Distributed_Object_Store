@@ -13,6 +13,7 @@ import (
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/api"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/health"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metadata"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/placement"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/workerclient"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/logger"
@@ -68,6 +69,7 @@ func main() {
 			table.RecordHeartbeat(w.WorkerID)
 			slog.Info("ring pre-populated from bbolt", "worker_id", w.WorkerID, "addr", addr)
 		}
+		metrics.WorkersOnline.Set(float64(len(knownWorkers)))
 	}
 
 	// --- background goroutines ---
@@ -113,7 +115,7 @@ func main() {
 	slog.Info("controller stopped")
 }
 
-// watchOffline listens for OFFLINE events and removes the worker from the ring.
+// watchOffline listens for OFFLINE events, removes the worker from the ring and updates the gauge.
 func watchOffline(ctx context.Context, table *health.LeaseTable, ring *placement.Ring) {
 	ch := table.Subscribe()
 	for {
@@ -123,6 +125,7 @@ func watchOffline(ctx context.Context, table *health.LeaseTable, ring *placement
 		case event := <-ch:
 			slog.Warn("removing offline worker from ring", "worker_id", event.WorkerID)
 			ring.RemoveWorker(event.WorkerID)
+			metrics.WorkersOnline.Set(float64(len(ring.Workers())))
 		}
 	}
 }

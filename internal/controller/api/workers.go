@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
@@ -40,6 +41,7 @@ func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 	workerAddr := addrOf(record)
 	s.placement.AddWorker(req.WorkerID, workerAddr)
 	s.health.RecordHeartbeat(req.WorkerID)
+	metrics.WorkersOnline.Set(float64(len(s.placement.Workers())))
 
 	slog.Info("worker registered", "worker_id", req.WorkerID, "addr", workerAddr)
 	w.Header().Set("Content-Type", "application/json")

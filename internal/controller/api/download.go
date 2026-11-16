@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
@@ -94,6 +95,7 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 		primaryRes = &r
 	case <-timerC:
 		// Primary is slow — start secondary hedge
+		metrics.HedgedReadsTotal.Inc()
 		log.Debug("hedging chunk fetch to secondary", "chunk_id", ref.ChunkID,
 			"threshold_ms", s.hedgeMs, "worker_id", ref.SecondaryID)
 		go func() {
@@ -160,6 +162,7 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 		// Trigger repair only on primary hash mismatch
 		var hme *hashMismatchError
 		if errors.As(primaryRes.err, &hme) {
+			metrics.ReadRepairsTotal.Inc()
 			chunkID := ref.ChunkID
 			pAddr, sAddr, pID, sID := primaryAddr, secondaryAddr, ref.PrimaryID, ref.SecondaryID
 			repairFunc = func() {
@@ -266,5 +269,6 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		log.Debug("chunk streamed to client", "chunk_id", ref.ChunkID, "bytes", len(buf))
 	}
 
+	metrics.DownloadBytesTotal.Add(float64(manifest.SizeBytes))
 	log.Info("download complete", "chunks", len(refs), "bytes", manifest.SizeBytes)
 }

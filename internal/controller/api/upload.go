@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
@@ -153,8 +154,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Debug("chunk state updated in bbolt", "chunk_id", chunkID, "state", "DURABLE")
 			s.bloom.Add(chunkID)
+			metrics.ChunksNewTotal.Inc()
 		} else {
 			log.Debug("chunk already exists (dedup) — skipping worker push", "chunk_id", chunkID)
+			metrics.ChunksDedupTotal.Inc()
 		}
 
 		if err := s.meta.IncrementChunkRefCount(r.Context(), chunkID); err != nil {
@@ -202,6 +205,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	metrics.UploadBytesTotal.Add(float64(totalSize))
 	log.Info("upload complete", "object_id", objectID, "chunks", len(refs), "bytes", totalSize)
 
 	w.Header().Set("Content-Type", "application/json")
