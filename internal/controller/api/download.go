@@ -20,9 +20,9 @@ type hashMismatchError struct{ got string }
 
 func (e *hashMismatchError) Error() string { return "hash mismatch: got " + e.got }
 
-// fetchVerified GETs a chunk from addr, checks its byte count and SHA-256, and
-// returns the verified bytes.  Returns *hashMismatchError on integrity failure so
-// callers can distinguish corruption from plain network/HTTP errors.
+// fetchVerified GETs a chunk from addr, checks its byte count and SHA-256.
+// Returns *hashMismatchError on integrity failure so callers can distinguish
+// corruption from plain network/HTTP errors.
 func (s *Server) fetchVerified(ctx context.Context, addr, chunkID string, size int) ([]byte, error) {
 	rc, err := s.workers.GetChunk(ctx, addr, chunkID)
 	if err != nil {
@@ -30,7 +30,6 @@ func (s *Server) fetchVerified(ctx context.Context, addr, chunkID string, size i
 	}
 	defer rc.Close()
 
-	// Read at most size+1 bytes so an oversized body is detected.
 	buf, err := io.ReadAll(io.LimitReader(rc, int64(size)+1))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
@@ -46,10 +45,11 @@ func (s *Server) fetchVerified(ctx context.Context, addr, chunkID string, size i
 	return buf, nil
 }
 
-// fetchWithFallback tries the primary then the secondary.
-// On a primary hash mismatch (and secondary OK) it returns a non-nil repairFunc
-// that the caller should run in a background goroutine.
-// Plain network errors and 404s do NOT trigger repair — the scrubber handles those.
+// fetchWithFallback tries the primary then the secondary, with hedged reads:
+// if the primary has not responded within s.hedgeMs the secondary is also
+// started in parallel and the first success wins.
+// On a primary hash mismatch (and secondary OK) it returns a non-nil repairFunc.
+// Plain network errors and 404s do NOT trigger repair.
 func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log *slog.Logger) (buf []byte, repairFunc func(), err error) {
 	primaryAddr := s.workerAddr(ref.PrimaryID)
 	secondaryAddr := s.workerAddr(ref.SecondaryID)
@@ -57,57 +57,128 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 	log.Debug("fetching chunk from primary", "chunk_id", ref.ChunkID, "index", ref.Index,
 		"worker_id", ref.PrimaryID, "addr", primaryAddr)
 
-	buf, primaryErr := s.fetchVerified(ctx, primaryAddr, ref.ChunkID, ref.Size)
-	if primaryErr == nil {
-		log.Debug("chunk fetched from primary", "chunk_id", ref.ChunkID, "worker_id", ref.PrimaryID)
-		return buf, nil, nil
+	type fetchResult struct {
+		buf []byte
+		err error
 	}
 
-	// Log with "got" as a separate field so smoke-test greps can find it.
-	var hme *hashMismatchError
-	if errors.As(primaryErr, &hme) {
-		log.Warn("chunk integrity check failed", "chunk_id", ref.ChunkID,
-			"worker_id", ref.PrimaryID, "got", hme.got)
-	} else {
-		log.Warn("chunk fetch failed — trying secondary", "chunk_id", ref.ChunkID,
-			"worker_id", ref.PrimaryID, "err", primaryErr)
-	}
+	pCtx, pCancel := context.WithCancel(ctx)
+	defer pCancel()
+	sCtx, sCancel := context.WithCancel(ctx)
+	defer sCancel()
 
-	log.Debug("fetching chunk from secondary", "chunk_id", ref.ChunkID,
-		"worker_id", ref.SecondaryID, "addr", secondaryAddr)
+	primaryCh := make(chan fetchResult, 1)
+	secondaryCh := make(chan fetchResult, 1)
 
-	buf, secondaryErr := s.fetchVerified(ctx, secondaryAddr, ref.ChunkID, ref.Size)
-	if secondaryErr != nil {
-		var hme2 *hashMismatchError
-		if errors.As(secondaryErr, &hme2) {
-			log.Warn("chunk integrity check failed", "chunk_id", ref.ChunkID,
-				"worker_id", ref.SecondaryID, "got", hme2.got)
-		} else {
-			log.Warn("secondary chunk fetch failed", "chunk_id", ref.ChunkID,
-				"worker_id", ref.SecondaryID, "err", secondaryErr)
+	go func() {
+		b, e := s.fetchVerified(pCtx, primaryAddr, ref.ChunkID, ref.Size)
+		primaryCh <- fetchResult{b, e}
+	}()
+
+	threshold := time.Duration(s.hedgeMs) * time.Millisecond
+	timer := time.NewTimer(threshold)
+	defer timer.Stop()
+
+	// Wait for primary result or hedge threshold
+	var primaryRes *fetchResult
+	select {
+	case r := <-primaryCh:
+		timer.Stop()
+		primaryRes = &r
+	case <-timer.C:
+		// Primary is slow — start secondary hedge
+		log.Debug("hedging chunk fetch to secondary", "chunk_id", ref.ChunkID,
+			"threshold_ms", s.hedgeMs, "worker_id", ref.SecondaryID)
+		go func() {
+			b, e := s.fetchVerified(sCtx, secondaryAddr, ref.ChunkID, ref.Size)
+			secondaryCh <- fetchResult{b, e}
+		}()
+
+		// Now wait for primary or secondary, whichever comes first
+		select {
+		case r := <-primaryCh:
+			if r.err == nil {
+				sCancel()
+				log.Debug("chunk fetched from primary", "chunk_id", ref.ChunkID, "worker_id", ref.PrimaryID)
+				return r.buf, nil, nil
+			}
+			primaryRes = &r
+			// Primary failed — wait for secondary
+		case r := <-secondaryCh:
+			if r.err == nil {
+				pCancel()
+				log.Debug("chunk fetched from secondary (hedge)", "chunk_id", ref.ChunkID, "worker_id", ref.SecondaryID)
+				return r.buf, nil, nil
+			}
+			// Secondary failed — wait for primary
+			secErr := r.err
+			select {
+			case pr := <-primaryCh:
+				if pr.err == nil {
+					log.Debug("chunk fetched from primary (hedge)", "chunk_id", ref.ChunkID, "worker_id", ref.PrimaryID)
+					return pr.buf, nil, nil
+				}
+				logFetchErr(log, ref.ChunkID, ref.PrimaryID, pr.err)
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+			logFetchErr(log, ref.ChunkID, ref.SecondaryID, secErr)
+			return nil, nil, fmt.Errorf("chunk %s: both replicas failed", ref.ChunkID)
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
 		}
-		return nil, nil, fmt.Errorf("chunk %s: both replicas failed", ref.ChunkID)
 	}
 
-	log.Debug("chunk fetched from secondary", "chunk_id", ref.ChunkID, "worker_id", ref.SecondaryID)
+	// Non-hedge path: primary result is known, launch secondary if primary failed
+	if primaryRes.err == nil {
+		log.Debug("chunk fetched from primary", "chunk_id", ref.ChunkID, "worker_id", ref.PrimaryID)
+		return primaryRes.buf, nil, nil
+	}
 
-	// Schedule read-repair only for hash mismatch, not network/404 errors.
-	if errors.As(primaryErr, &hme) {
-		chunkID := ref.ChunkID
-		pAddr, sAddr, pID, sID := primaryAddr, secondaryAddr, ref.PrimaryID, ref.SecondaryID
-		repairFunc = func() {
-			repairCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if repairErr := s.workers.ReplicatePeer(repairCtx, sAddr, chunkID, pAddr); repairErr != nil {
-				log.Warn("read-repair failed", "chunk_id", chunkID,
-					"secondary", sID, "primary", pID, "err", repairErr)
-			} else {
-				log.Info("read-repair succeeded", "chunk_id", chunkID, "primary", pID)
+	logFetchErr(log, ref.ChunkID, ref.PrimaryID, primaryRes.err)
+
+	// Launch secondary now (or it may already be running from the hedge timer path above)
+	go func() {
+		b, e := s.fetchVerified(sCtx, secondaryAddr, ref.ChunkID, ref.Size)
+		secondaryCh <- fetchResult{b, e}
+	}()
+
+	select {
+	case sr := <-secondaryCh:
+		if sr.err != nil {
+			logFetchErr(log, ref.ChunkID, ref.SecondaryID, sr.err)
+			return nil, nil, fmt.Errorf("chunk %s: both replicas failed", ref.ChunkID)
+		}
+		log.Debug("chunk fetched from secondary", "chunk_id", ref.ChunkID, "worker_id", ref.SecondaryID)
+		// Trigger repair only on primary hash mismatch
+		var hme *hashMismatchError
+		if errors.As(primaryRes.err, &hme) {
+			chunkID := ref.ChunkID
+			pAddr, sAddr, pID, sID := primaryAddr, secondaryAddr, ref.PrimaryID, ref.SecondaryID
+			repairFunc = func() {
+				rCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if rErr := s.workers.ReplicatePeer(rCtx, sAddr, chunkID, pAddr); rErr != nil {
+					log.Warn("read-repair failed", "chunk_id", chunkID,
+						"secondary", sID, "primary", pID, "err", rErr)
+				} else {
+					log.Info("read-repair succeeded", "chunk_id", chunkID, "primary", pID)
+				}
 			}
 		}
+		return sr.buf, repairFunc, nil
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
 	}
+}
 
-	return buf, repairFunc, nil
+func logFetchErr(log *slog.Logger, chunkID, workerID string, err error) {
+	var hme *hashMismatchError
+	if errors.As(err, &hme) {
+		log.Warn("chunk integrity check failed", "chunk_id", chunkID, "worker_id", workerID, "got", hme.got)
+	} else {
+		log.Warn("chunk fetch failed", "chunk_id", chunkID, "worker_id", workerID, "err", err)
+	}
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -136,8 +207,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify chunk 0 before writing the status header so a fully corrupt first chunk
-	// returns 502 instead of a 200 with no body.
+	// Verify chunk 0 before writing the status header so a fully corrupt first
+	// chunk returns 502 instead of a 200 with a truncated body.
 	var firstBuf []byte
 	var firstRepair func()
 	if len(refs) > 0 {
@@ -150,7 +221,6 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Status header committed — no error status changes possible from this point.
 	if manifest.ContentType != "" {
 		w.Header().Set("Content-Type", manifest.ContentType)
 	} else {
@@ -177,7 +247,6 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	for _, ref := range refs[1:] {
 		buf, repair, fetchErr := s.fetchWithFallback(r.Context(), ref, log)
 		if fetchErr != nil {
-			// Headers already sent — cut the connection; corrupt bytes are never written.
 			log.Error("chunk unrecoverable — cutting connection", "chunk_id", ref.ChunkID, "err", fetchErr)
 			return
 		}

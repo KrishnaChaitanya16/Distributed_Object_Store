@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
@@ -18,6 +20,7 @@ type Server struct {
 	health    models.HealthMonitor
 	mux       *http.ServeMux
 	http      *http.Server
+	hedgeMs   int // milliseconds before hedging to the secondary; 0 disables hedging
 }
 
 func New(
@@ -27,11 +30,19 @@ func New(
 	workers models.WorkerClientPool,
 	health models.HealthMonitor,
 ) *Server {
+	hedgeMs := 25 // default: hedge after 25 ms
+	if v := os.Getenv("HEDGE_THRESHOLD_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			hedgeMs = n
+		}
+	}
+
 	s := &Server{
 		meta:      meta,
 		placement: placement,
 		workers:   workers,
 		health:    health,
+		hedgeMs:   hedgeMs,
 	}
 
 	mux := http.NewServeMux()
