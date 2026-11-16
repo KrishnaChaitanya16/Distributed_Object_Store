@@ -246,5 +246,74 @@ check "worker2 chunk survived restart" "$(sha256sum < "$tmp/after" | cut -d' ' -
 check "worker2 delete" "$(code -X DELETE "$W2/internal/chunks/$id")" "204"
 check "worker2 repeat delete is idempotent" "$(code -X DELETE "$W2/internal/chunks/$id")" "204"
 
+echo "== rebalancer: RF=2 restored after worker failure"
+# Upload a small object and find which two workers hold its chunk.
+tmprb=$(mktemp -d)
+head -c 524288 /dev/urandom > "$tmprb/obj"
+rbup=$(curl -s -w '\n%{http_code}' -F "file=@$tmprb/obj" "$C/api/v1/objects")
+check "rebalancer: upload object" "$(echo "$rbup" | tail -1)" "201"
+rboid=$(echo "$rbup" | head -1 | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+rbmd=$(curl -s "$C/api/v1/objects/$rboid/metadata")
+rbcid=$(echo "$rbmd" | grep -o '"chunk_id":"[0-9a-f]*"' | head -1 | cut -d'"' -f4)
+# Find the two workers that hold this chunk
+rbholders=""
+for w in worker1 worker2 worker3 worker4; do
+	if curl -s "localhost:$(wport $w)/internal/workers/$w/chunks" | grep -q "$rbcid"; then
+		rbholders="$rbholders $w"
+	fi
+done
+rbholders=$(echo $rbholders | xargs)
+check "rebalancer: chunk has 2 initial holders" "$(echo $rbholders | wc -w | tr -d ' ')" "2"
+
+# Stop one holder to simulate failure
+rbvictim=$(echo $rbholders | cut -d' ' -f1)
+rbsurvivors=$(echo $rbholders | cut -d' ' -f2-)
+docker stop -t 2 "$rbvictim" >/dev/null 2>&1
+check "rebalancer: victim stopped" "$(state $rbvictim)" "exited"
+
+# Wait up to 20 s for the rebalancer to restore RF=2 on a new worker
+rbrestored=no
+for _ in $(seq 1 40); do
+	rbcount=0
+	for w in worker1 worker2 worker3 worker4; do
+		[ "$(state $w)" = "running" ] || continue
+		curl -s "localhost:$(wport $w)/internal/workers/$w/chunks" | grep -q "$rbcid" && rbcount=$((rbcount+1))
+	done
+	[ "$rbcount" -ge 2 ] && rbrestored=yes && break
+	sleep 0.5
+done
+check "rebalancer: RF=2 restored on surviving workers within 20s" "$rbrestored" "yes"
+
+# Download must still work with victim down
+rbwant=$(sha256sum < "$tmprb/obj" | cut -d' ' -f1)
+check "rebalancer: download still byte-identical with victim down" \
+	"$(curl -s "$C/api/v1/objects/$rboid" | sha256sum | cut -d' ' -f1)" "$rbwant"
+
+# Bring victim back — it should NOT affect the now-restored RF=2
+docker start "$rbvictim" >/dev/null 2>&1; sleep 3
+check "rebalancer: victim restarted" "$(state $rbvictim)" "running"
+
+# bbolt should show exactly 2 replica entries (no 3-replica accumulation)
+rbreplicas=$(echo "$rbmd" | grep -o '"locations":\["worker[0-9]","worker[0-9]"\]' | head -1 | grep -o 'worker[0-9]' | wc -l | tr -d ' ')
+# Re-fetch metadata to get current replica state after rebalancer ran
+rbmd2=$(curl -s "$C/api/v1/objects/$rboid/metadata")
+rbreplicas2=$(echo "$rbmd2" | grep -o '"chunk_id":"'"$rbcid"'"' | wc -l | tr -d ' ')
+# Count distinct workers holding this chunk now
+rblive=0
+for w in worker1 worker2 worker3 worker4; do
+	[ "$(state $w)" = "running" ] || continue
+	curl -s "localhost:$(wport $w)/internal/workers/$w/chunks" | grep -q "$rbcid" && rblive=$((rblive+1))
+done
+check "rebalancer: no 3-replica accumulation (exactly 2 live holders)" "$rblive" "2"
+check "rebalancer: download still works after victim rejoins" \
+	"$(curl -s "$C/api/v1/objects/$rboid" | sha256sum | cut -d' ' -f1)" "$rbwant"
+
+# Verify Prometheus counter was incremented
+rbmetric=$(curl -s "localhost:$CONTROLLER_HOST_PORT/metrics" | grep '^minidfs_rebalancer_repairs_total' | awk '{print $2}')
+check "rebalancer: prometheus counter > 0" "$([ "${rbmetric:-0}" -gt 0 ] 2>/dev/null && echo yes || echo no)" "yes"
+
+curl -s -o /dev/null -X DELETE "$C/api/v1/objects/$rboid"
+rm -rf "$tmprb"
+
 echo "== result: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
