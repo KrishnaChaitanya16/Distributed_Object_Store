@@ -5,12 +5,15 @@ import (
 	"os"
 )
 
-// Init sets up the default structured JSON logger for the process.
-// Call once from main() in both controller and worker binaries.
-// Output goes to stdout — Docker and docker-compose capture it automatically.
+// Init sets up the default structured JSON logger.
+// Set LOG_LEVEL=debug to see per-chunk trace logs.
 func Init() {
+	level := slog.LevelInfo
+	if os.Getenv("LOG_LEVEL") == "debug" {
+		level = slog.LevelDebug
+	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: level,
 	})))
 }
 

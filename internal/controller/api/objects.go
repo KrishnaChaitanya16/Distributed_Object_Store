@@ -21,7 +21,22 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(objects) //nolint:errcheck
 }
 
-// GET /api/v1/objects/{id}/metadata — returns metadata without downloading data.
+// chunkLocation is the per-chunk entry in the metadata response (PDF §3).
+type chunkLocation struct {
+	ChunkID   string   `json:"chunk_id"`
+	Index     int      `json:"index"`
+	Offset    int64    `json:"offset"`
+	Size      int      `json:"size"`
+	Locations []string `json:"locations"` // [primaryWorkerID, secondaryWorkerID]
+}
+
+// metadataResponse embeds the full manifest and adds chunk storage locations.
+type metadataResponse struct {
+	*models.ObjectManifest
+	Chunks []chunkLocation `json:"chunks"`
+}
+
+// GET /api/v1/objects/{id}/metadata — returns metadata and chunk locations (PDF §3).
 func (s *Server) handleGetMetadata(w http.ResponseWriter, r *http.Request) {
 	objectID := r.PathValue("id")
 	manifest, err := s.meta.GetObject(r.Context(), objectID)
@@ -37,8 +52,31 @@ func (s *Server) handleGetMetadata(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
 		return
 	}
+
+	refs, err := s.meta.GetChunkRefs(r.Context(), objectID)
+	if err != nil {
+		slog.Error("get chunk refs for metadata", "object_id", objectID, "err", err)
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	chunks := make([]chunkLocation, len(refs))
+	for i, ref := range refs {
+		chunks[i] = chunkLocation{
+			ChunkID:   ref.ChunkID,
+			Index:     ref.Index,
+			Offset:    ref.Offset,
+			Size:      ref.Size,
+			Locations: []string{ref.PrimaryID, ref.SecondaryID},
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(manifest) //nolint:errcheck
+	json.NewEncoder(w).Encode(metadataResponse{ //nolint:errcheck
+		ObjectManifest: manifest,
+		Chunks:         chunks,
+	})
 }
 
 // PATCH /api/v1/objects/{id}/metadata — updates custom metadata key-value pairs.

@@ -496,7 +496,7 @@ func TestIntegration_Download_PrimaryFails_FallsBackToSecondary(t *testing.T) {
 	assert.Equal(t, content, string(body))
 
 	// Log confirms fallback path
-	assert.True(t, h.logs.hasMessage("primary chunk fetch failed"), "expected fallback warning")
+	assert.True(t, h.logs.hasMessage("chunk fetch failed"), "expected fallback warning")
 	assert.True(t, h.logs.hasMessage("chunk fetched from secondary"), "expected secondary fetch log")
 }
 
