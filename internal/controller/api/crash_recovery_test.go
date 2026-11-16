@@ -79,8 +79,8 @@ func (p *partitionPool) GetChunk(_ context.Context, addr, chunkID string) (io.Re
 	}
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
-func (p *partitionPool) DeleteChunk(_ context.Context, _, _ string) error       { return nil }
-func (p *partitionPool) ReplicatePeer(_ context.Context, _, _, _ string) error  { return nil }
+func (p *partitionPool) DeleteChunk(_ context.Context, _, _ string) error      { return nil }
+func (p *partitionPool) ReplicatePeer(_ context.Context, _, _, _ string) error { return nil }
 func (p *partitionPool) ListChunks(_ context.Context, _, _ string) ([]string, error) {
 	return nil, nil
 }
@@ -331,8 +331,8 @@ func (p *blockPool) PutChunk(ctx context.Context, addr, id string, data io.Reade
 func (p *blockPool) GetChunk(ctx context.Context, a, id string) (io.ReadCloser, error) {
 	return p.inner.GetChunk(ctx, a, id)
 }
-func (p *blockPool) DeleteChunk(ctx context.Context, a, id string) error { return nil }
-func (p *blockPool) ReplicatePeer(_ context.Context, _, _, _ string) error { return nil }
+func (p *blockPool) DeleteChunk(ctx context.Context, a, id string) error         { return nil }
+func (p *blockPool) ReplicatePeer(_ context.Context, _, _, _ string) error       { return nil }
 func (p *blockPool) ListChunks(_ context.Context, _, _ string) ([]string, error) { return nil, nil }
 
 // ── NP6: failed upload leaves no committed object in bbolt ────────────────────

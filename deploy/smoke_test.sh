@@ -23,6 +23,8 @@ check "default worker2 host port is 8002" "$($COMPOSE config 2>/dev/null | grep 
 # Shifted host ports so the test never collides with services already running on this machine.
 export CONTROLLER_HOST_PORT=18080 WEBUI_HOST_PORT=18081 PROMETHEUS_HOST_PORT=19090 GRAFANA_HOST_PORT=13000
 export WORKER1_HOST_PORT=18001 WORKER2_HOST_PORT=18002 WORKER3_HOST_PORT=18003 WORKER4_HOST_PORT=18004
+# GC passes run only on worker joins and explicit triggers, so every check below sees a predictable cluster.
+export GC_INTERVAL_S=3600 ORPHAN_GRACE_S=30
 check "host port override applies" "$($COMPOSE config 2>/dev/null | grep -c 'published: "18080"')" "1"
 
 echo "== images build"
@@ -84,6 +86,15 @@ check "3 distinct chunks stored" "$(wc -l < "$tmpe/replicas" | tr -d ' ')" "3"
 check "every chunk on exactly 2 workers" "$(awk '$1 != 2' "$tmpe/replicas" | wc -l | tr -d ' ')" "0"
 check "delete object" "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$C/api/v1/objects/$oid")" "204"
 check "deleted object is gone" "$(curl -s -o /dev/null -w '%{http_code}' "$C/api/v1/objects/$oid")" "404"
+left=0
+for c in $(awk '{print $2}' "$tmpe/replicas"); do
+	for w in 1 2 3 4; do
+		p=$(eval echo "\$WORKER${w}_HOST_PORT")
+		curl -s "localhost:$p/internal/workers/worker$w/chunks" | grep -q "$c" && left=$((left+1))
+	done
+done
+check "delete removed every copy of its chunks from the workers" "$left" "0"
+check "second delete of the same object is 404" "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$C/api/v1/objects/$oid")" "404"
 rm -rf "$tmpe"
 
 echo "== data integrity: scrubber detects corruption, reads fall back, copy is restored"
@@ -198,6 +209,8 @@ check "both copies of a later chunk corrupt -> client sees a failed transfer" "$
 n=$(stat -c %s "$tmpr/partial")
 check "client got only the 3 verified chunks before it" "$n" "3145728"
 check "and those bytes are an exact prefix of the object" "$(head -c "$n" "$tmpr/obj" | sha256sum | cut -d' ' -f1)" "$(sha256sum < "$tmpr/partial" | cut -d' ' -f1)"
+curl -s -o /dev/null -X DELETE "$C/api/v1/objects/$roid"
+curl -s -o /dev/null -X DELETE "$C/api/v1/objects/$suoid"
 rm -rf "$tmpr"
 before=$(curl -s "localhost:$(wport "$bad")/internal/scrubber/status" | jsonnum corrupt_quarantined)
 docker exec "$bad" sh -c "dd if=/dev/urandom of=/data/chunks/$cid.bin bs=16 count=1 seek=3 conv=notrunc 2>/dev/null"
@@ -245,6 +258,111 @@ curl -s "$W2/internal/chunks/$id" -o "$tmp/after"
 check "worker2 chunk survived restart" "$(sha256sum < "$tmp/after" | cut -d' ' -f1)" "$id"
 check "worker2 delete" "$(code -X DELETE "$W2/internal/chunks/$id")" "204"
 check "worker2 repeat delete is idempotent" "$(code -X DELETE "$W2/internal/chunks/$id")" "204"
+code -X DELETE "$W1/internal/chunks/$id" >/dev/null
+
+echo "== garbage collection and replica reconciliation"
+gcstatus() { curl -s "$C/internal/gc/status"; }
+gcrun() {
+	gbefore=$(gcstatus | jsonnum passes)
+	curl -s -o /dev/null -X POST "$C/internal/gc/run"
+	for _ in $(seq 1 50); do
+		gst=$(gcstatus)
+		[ "$(echo "$gst" | jsonnum passes)" -gt "$gbefore" ] && echo "$gst" | grep -q '"running":false' && break
+		sleep 0.2
+	done
+	echo "$gst"
+}
+holders() { for w in worker1 worker2 worker3 worker4; do curl -s "localhost:$(wport $w)/internal/workers/$w/chunks" | grep -q "$1" && echo "$w"; done | tr '\n' ' '; }
+gst=$(gcstatus)
+check "gc status answers" "$(echo "$gst" | grep -c '"interval_seconds":3600')" "1"
+check "gc status shows the orphan grace" "$(echo "$gst" | grep -c '"orphan_grace_seconds":30')" "1"
+check "gc run is accepted" "$(code -X POST "$C/internal/gc/run")" "202"
+tmpg=$(mktemp -d)
+
+head -c 1048576 /dev/urandom > "$tmpg/orphan"
+orphan=$(sha256sum < "$tmpg/orphan" | cut -d' ' -f1)
+check "plant an orphan chunk directly on worker3" "$(code -X PUT --data-binary @"$tmpg/orphan" "localhost:$(wport worker3)/internal/chunks/$orphan")" "201"
+planted=$(date +%s)
+gcrun >/dev/null
+check "orphan survives a pass inside its grace period" "$(holders "$orphan")" "worker3 "
+
+head -c 700000 /dev/urandom > "$tmpg/shared"
+s1=$(curl -s -F "file=@$tmpg/shared" "$C/api/v1/objects" | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+s2=$(curl -s -F "file=@$tmpg/shared" "$C/api/v1/objects" | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+scid=$(sha256sum < "$tmpg/shared" | cut -d' ' -f1)
+check "identical uploads share one chunk on 2 workers" "$(holders "$scid" | wc -w | tr -d ' ')" "2"
+check "delete the first sharer" "$(code -X DELETE "$C/api/v1/objects/$s1")" "204"
+check "shared chunk kept while still referenced" "$(holders "$scid" | wc -w | tr -d ' ')" "2"
+check "second sharer still downloads identical" "$(curl -s "$C/api/v1/objects/$s2" | sha256sum | cut -d' ' -f1)" "$scid"
+check "delete the last sharer" "$(code -X DELETE "$C/api/v1/objects/$s2")" "204"
+check "chunk removed once nothing references it" "$(holders "$scid" | wc -w | tr -d ' ')" "0"
+s3=$(curl -s -F "file=@$tmpg/shared" "$C/api/v1/objects" | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+check "re-uploading deleted content stores it again" "$(holders "$scid" | wc -w | tr -d ' ')" "2"
+check "and it downloads identical" "$(curl -s "$C/api/v1/objects/$s3" | sha256sum | cut -d' ' -f1)" "$scid"
+
+hcid=$scid
+hbad=$(holders "$hcid" | cut -d' ' -f1)
+docker exec "$hbad" sh -c "dd if=/dev/urandom of=/data/chunks/$hcid.bin bs=16 count=1 seek=20 conv=notrunc 2>/dev/null"
+st=$(scrub "$hbad")
+check "scrubber quarantines the corrupt copy" "$(echo "$st" | jsonnum last_pass_corrupt)" "1"
+check "$hbad no longer has the chunk" "$(code "localhost:$(wport $hbad)/internal/chunks/$hcid")" "404"
+gst=$(gcrun)
+check "reconciler restored the quarantined replica by itself" "$(curl -s "localhost:$(wport $hbad)/internal/chunks/$hcid" | sha256sum | cut -d' ' -f1)" "$hcid"
+check "gc pass reports the restore" "$(echo "$gst" | jsonnum replicas_restored)" "1"
+st=$(scrub "$hbad")
+check "restored copy passes the scrubber" "$(echo "$st" | jsonnum last_pass_corrupt)" "0"
+
+xsrc=$(holders "$hcid" | cut -d' ' -f1)
+xtgt=""
+for w in worker1 worker2 worker3 worker4; do
+	echo " $(holders "$hcid") " | grep -q " $w " || { xtgt=$w; break; }
+done
+check "make an extra copy on $xtgt" "$(code -X POST -d "{\"chunk_id\":\"$hcid\",\"target_addr\":\"$xtgt:8001\"}" "localhost:$(wport $xsrc)/internal/workers/replicate-peer")" "200"
+check "chunk now has 3 copies" "$(holders "$hcid" | wc -w | tr -d ' ')" "3"
+gst=$(gcrun)
+check "reconciler removed the unlisted copy" "$(holders "$hcid" | wc -w | tr -d ' ')" "2"
+check "the removed copy was the extra one on $xtgt" "$(holders "$hcid" | grep -c "$xtgt")" "0"
+check "gc pass reports the excess delete" "$(echo "$gst" | jsonnum excess_deleted)" "1"
+locs=$(curl -s "$C/api/v1/objects/$s3/metadata" | grep -o '"locations":\[[^]]*\]' | grep -o 'worker[0-9]' | sort | tr '\n' ' ')
+check "remaining copies are exactly the listed replicas" "$locs" "$(holders "$hcid" | tr ' ' '\n' | grep . | sort | tr '\n' ' ')"
+check "download still identical" "$(curl -s "$C/api/v1/objects/$s3" | sha256sum | cut -d' ' -f1)" "$hcid"
+gst=$(gcrun)
+check "a clean cluster needs no work" "$(echo "$gst" | grep -o '"chunks_deleted":[0-9]*,"excess_deleted":[0-9]*,"replicas_restored":[0-9]*')" '"chunks_deleted":0,"excess_deleted":0,"replicas_restored":0'
+check "no chunk reported lost" "$(echo "$gst" | jsonnum lost_chunks)" "0"
+
+wait_s=$(( 31 - ($(date +%s) - planted) ))
+[ "$wait_s" -gt 0 ] && sleep "$wait_s"
+gst=$(gcrun)
+check "orphan deleted after its grace period" "$(holders "$orphan")" ""
+check "gc pass counted it" "$([ "$(echo "$gst" | jsonnum chunks_deleted)" -ge 1 ] && echo yes || echo no)" "yes"
+m=$(curl -s "$C/metrics")
+for k in minidfs_gc_chunks_deleted_total minidfs_reconcile_excess_deleted_total minidfs_reconcile_replicas_restored_total minidfs_chunks_lost; do
+	check "metric $k exported" "$(echo "$m" | grep -c "^$k ")" "1"
+done
+check "chunks_lost gauge is 0" "$(echo "$m" | grep '^minidfs_chunks_lost ' | awk '{print $2}')" "0"
+curl -s -o /dev/null -X DELETE "$C/api/v1/objects/$s3"
+rm -rf "$tmpg"
+
+echo "== idempotency keys"
+tmpk=$(mktemp -d)
+head -c 300000 /dev/urandom > "$tmpk/f"
+kwant=$(sha256sum < "$tmpk/f" | cut -d' ' -f1)
+kn() { curl -s "$C/api/v1/objects" | grep -o '"object_id"' | wc -l | tr -d ' '; }
+kbefore=$(kn)
+check "bad request with a key (no file) is rejected" "$(code -X POST -H 'Idempotency-Key: smoke-1' -F 'metadata={}' "$C/api/v1/objects")" "400"
+k1=$(curl -s -D "$tmpk/h1" -H 'Idempotency-Key: smoke-1' -F "file=@$tmpk/f" "$C/api/v1/objects")
+check "same key works right after the failed attempt (key was released)" "$(head -1 "$tmpk/h1" | cut -d' ' -f2)" "201"
+k2=$(curl -s -D "$tmpk/h2" -H 'Idempotency-Key: smoke-1' -F "file=@$tmpk/f" "$C/api/v1/objects")
+check "retry with the same key replays the first response" "$k2" "$k1"
+check "replay is flagged" "$(grep -ci '^x-idempotency-replayed: true' "$tmpk/h2")" "1"
+check "only one object was stored" "$(( $(kn) - kbefore ))" "1"
+for i in 1 2 3 4 5 6; do (code -H 'Idempotency-Key: smoke-par' -F "file=@$tmpk/f" "$C/api/v1/objects" > "$tmpk/p$i") & done; wait
+check "6 parallel uploads with one key: at least one created" "$([ "$(cat "$tmpk"/p* | grep -c 201)" -ge 1 ] && echo yes || echo no)" "yes"
+check "6 parallel uploads with one key: every other one is a conflict or a replay" "$(cat "$tmpk"/p* | grep -vc '201\|409')" "0"
+check "6 parallel uploads with one key stored exactly one more object" "$(( $(kn) - kbefore ))" "2"
+kid=$(echo "$k1" | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+check "keyed object downloads identical" "$(curl -s "$C/api/v1/objects/$kid" | sha256sum | cut -d' ' -f1)" "$kwant"
+rm -rf "$tmpk"
 
 echo "== rebalancer: RF=2 restored after worker failure"
 # Upload a small object and find which two workers hold its chunk.
@@ -298,13 +416,18 @@ rbreplicas=$(echo "$rbmd" | grep -o '"locations":\["worker[0-9]","worker[0-9]"\]
 # Re-fetch metadata to get current replica state after rebalancer ran
 rbmd2=$(curl -s "$C/api/v1/objects/$rboid/metadata")
 rbreplicas2=$(echo "$rbmd2" | grep -o '"chunk_id":"'"$rbcid"'"' | wc -l | tr -d ' ')
-# Count distinct workers holding this chunk now
-rblive=0
-for w in worker1 worker2 worker3 worker4; do
-	[ "$(state $w)" = "running" ] || continue
-	curl -s "localhost:$(wport $w)/internal/workers/$w/chunks" | grep -q "$rbcid" && rblive=$((rblive+1))
+# The rejoined victim still has its old copy; the reconciler runs on the join and removes it.
+for _ in $(seq 1 30); do
+	rblive=0
+	for w in worker1 worker2 worker3 worker4; do
+		[ "$(state $w)" = "running" ] || continue
+		curl -s "localhost:$(wport $w)/internal/workers/$w/chunks" | grep -q "$rbcid" && rblive=$((rblive+1))
+	done
+	[ "$rblive" -eq 2 ] && break
+	sleep 1
 done
 check "rebalancer: no 3-replica accumulation (exactly 2 live holders)" "$rblive" "2"
+check "rebalancer: the rejoined victim's stale copy is the one removed" "$(curl -s "localhost:$(wport $rbvictim)/internal/workers/$rbvictim/chunks" | grep -c "$rbcid")" "0"
 check "rebalancer: download still works after victim rejoins" \
 	"$(curl -s "$C/api/v1/objects/$rboid" | sha256sum | cut -d' ' -f1)" "$rbwant"
 

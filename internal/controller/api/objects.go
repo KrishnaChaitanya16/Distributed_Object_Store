@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,7 +71,7 @@ func (s *Server) handleGetMetadata(w http.ResponseWriter, r *http.Request) {
 			Index:     ref.Index,
 			Offset:    ref.Offset,
 			Size:      ref.Size,
-			Locations: []string{ref.PrimaryID, ref.SecondaryID},
+			Locations: s.locations(r.Context(), ref),
 		}
 	}
 
@@ -165,13 +166,6 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Mark object deleted first so concurrent downloads fail fast
-	if err := s.meta.UpdateObjectStatus(r.Context(), objectID, models.StatusDeleted); err != nil {
-		log.Error("mark deleted", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
 	refs, err := s.meta.GetChunkRefs(r.Context(), objectID)
 	if err != nil {
 		log.Error("get chunk refs", "err", err)
@@ -179,44 +173,34 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for _, ref := range refs {
-		newCount, err := s.meta.DecrementChunkRefCount(r.Context(), ref.ChunkID)
-		if err != nil {
-			log.Error("decrement ref count", "chunk_id", ref.ChunkID, "err", err)
-			continue
+	// The COMMITTED to DELETED flip is atomic, so of two concurrent deletes exactly one succeeds.
+	if err := s.meta.MarkObjectDeleted(r.Context(), objectID); err != nil {
+		if errors.Is(err, models.ErrNotFound) {
+			http.Error(w, "object not found", http.StatusNotFound)
+			return
 		}
-		if newCount > 0 {
-			// other objects still reference this chunk — leave it on workers
-			continue
-		}
-
-		// ref count hit zero — delete from workers and metadata
-		if err := s.meta.UpdateChunkState(r.Context(), ref.ChunkID, models.ChunkPendingDelete); err != nil {
-			log.Error("mark chunk pending delete", "chunk_id", ref.ChunkID, "err", err)
-		}
-
-		chunk, err := s.meta.GetChunk(r.Context(), ref.ChunkID)
-		if err == nil {
-			for _, replica := range chunk.Replicas {
-				if delErr := s.workers.DeleteChunk(r.Context(), replica.WorkerAddr, ref.ChunkID); delErr != nil {
-					log.Warn("delete chunk from worker", "chunk_id", ref.ChunkID,
-						"worker", replica.WorkerID, "err", delErr)
-				}
-			}
-		}
-
-		if err := s.meta.DeleteChunk(r.Context(), ref.ChunkID); err != nil {
-			log.Error("delete chunk metadata", "chunk_id", ref.ChunkID, "err", err)
-		}
+		log.Error("mark deleted", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
 
-	// Remove the manifest itself so bbolt doesn't accumulate DELETED tombstones.
-	// If this crashes, the GC's DELETED pass will clean it on the next tick.
-	if err := s.meta.DeleteObject(r.Context(), objectID); err != nil {
-		log.Warn("delete manifest", "object_id", objectID, "err", err)
-		// Non-fatal: the object is already marked DELETED; GC will finish the job.
+	// Chunks still used by other objects or in-flight uploads are skipped inside the claim transaction; anything left behind is retried by the reconciler.
+	ids := make([]string, len(refs))
+	for i, ref := range refs {
+		ids[i] = ref.ChunkID
+	}
+	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), deleteSweepTimeout)
+	defer cancel()
+	deleted, err := s.collector.Collect(sweepCtx, ids, nil)
+	if err != nil {
+		log.Warn("some chunks of the deleted object were not removed yet; the reconciler will retry", "err", err)
 	}
 
-	log.Info("delete complete", "chunks", len(refs))
+	// Drop the manifest and its chunk references now so DELETED tombstones never accumulate; the reconciler repeats this if the process dies first.
+	if _, err := s.meta.PurgeDeadObjects(context.WithoutCancel(r.Context())); err != nil {
+		log.Warn("purge deleted manifest", "object_id", objectID, "err", err)
+	}
+
+	log.Info("delete complete", "chunks", len(refs), "chunks_deleted", deleted)
 	w.WriteHeader(http.StatusNoContent)
 }

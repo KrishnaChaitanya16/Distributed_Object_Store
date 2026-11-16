@@ -424,6 +424,8 @@ Response 200:
 | `SCRUB_INTERVAL_S` | `30` | Workers |
 | `BLOOM_FP_RATE` | `0.01` | Controller |
 | `STAGED_TIMEOUT_MIN` | `5` | Controller |
+| `GC_INTERVAL_S` | `30` | Controller |
+| `ORPHAN_GRACE_S` | `900` | Controller |
 | `IDEMPOTENCY_TTL_H` | `24` | Controller |
 | `DATA_DIR` | `/data` | Workers |
 | `DB_PATH` | `/data/meta.db` | Controller |

@@ -23,10 +23,10 @@ type fakePlacement struct {
 	err       error  // returned instead of preferred when non-nil
 }
 
-func (f *fakePlacement) Primary(_ string) (string, error)              { return "", nil }
-func (f *fakePlacement) AddWorker(_, _ string)                         {}
-func (f *fakePlacement) RemoveWorker(_ string)                         {}
-func (f *fakePlacement) Workers() []string                             { return nil }
+func (f *fakePlacement) Primary(_ string) (string, error) { return "", nil }
+func (f *fakePlacement) AddWorker(_, _ string)            {}
+func (f *fakePlacement) RemoveWorker(_ string)            {}
+func (f *fakePlacement) Workers() []string                { return nil }
 func (f *fakePlacement) Secondary(_ string, _ string) (string, error) {
 	if f.err != nil {
 		return "", f.err
@@ -69,7 +69,7 @@ func (f *fakeWorkers) PutChunk(_ context.Context, _, _ string, _ io.Reader, _ in
 func (f *fakeWorkers) GetChunk(_ context.Context, _, _ string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (f *fakeWorkers) DeleteChunk(_ context.Context, _, _ string) error   { return nil }
+func (f *fakeWorkers) DeleteChunk(_ context.Context, _, _ string) error { return nil }
 func (f *fakeWorkers) ListChunks(_ context.Context, _, _ string) ([]string, error) {
 	return nil, nil
 }
@@ -403,7 +403,7 @@ func TestRebalancer_AllOnlineWorkersHoldChunk_NoAction(t *testing.T) {
 	saveChunk(t, store, "chunk1", "w1", "w2")
 
 	health := &fakeHealth{}
-	health.setOnline("w1", "w2")  // only 2 online; both already hold the chunk
+	health.setOnline("w1", "w2") // only 2 online; both already hold the chunk
 	workers := &fakeWorkers{}
 
 	rb := newRebalancer(store, workers, health)

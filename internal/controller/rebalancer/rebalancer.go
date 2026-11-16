@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/chunklock"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -28,19 +29,23 @@ type Rebalancer struct {
 	meta      models.MetadataRepository
 	workers   models.WorkerClientPool
 	health    models.HealthMonitor
+	placement models.PlacementStrategy
 	interval  time.Duration
 	rateLimit time.Duration
 }
 
+// New builds a Rebalancer; placement may be nil, in which case the first online worker without a copy is used.
 func New(
 	meta models.MetadataRepository,
 	workers models.WorkerClientPool,
 	health models.HealthMonitor,
+	placement models.PlacementStrategy,
 ) *Rebalancer {
 	return &Rebalancer{
 		meta:      meta,
 		workers:   workers,
 		health:    health,
+		placement: placement,
 		interval:  defaultInterval,
 		rateLimit: defaultRateLimit,
 	}
@@ -126,9 +131,21 @@ func (r *Rebalancer) fixChunk(ctx context.Context, chunk *models.ChunkRecord, on
 		return false
 	}
 
-	// Find a target: online and not already holding this chunk
+	// Prefer the ring's secondary for this chunk so repaired chunks land where fresh uploads would; it must be online and not already a holder.
 	var targetID string
+	if r.placement != nil {
+		if primary, err := r.placement.Primary(chunk.ChunkID); err == nil {
+			if id, err := r.placement.Secondary(chunk.ChunkID, primary); err == nil && onlineSet[id] && !existingWorkers[id] {
+				targetID = id
+			}
+		}
+	}
+
+	// Otherwise take the first online worker that does not hold this chunk.
 	for _, id := range onlineList {
+		if targetID != "" {
+			break
+		}
 		if !existingWorkers[id] {
 			targetID = id
 			break
@@ -145,6 +162,14 @@ func (r *Rebalancer) fixChunk(ctx context.Context, chunk *models.ChunkRecord, on
 		return false
 	}
 	targetAddr := fmt.Sprintf("%s:%d", targetWorker.Address, targetWorker.Port)
+
+	// Hold the chunk lock across copy and record update, and re-check the record, so garbage collection and reconciliation never see a half-finished move.
+	unlock := chunklock.Lock(chunk.ChunkID)
+	defer unlock()
+	cur, err := r.meta.GetChunk(ctx, chunk.ChunkID)
+	if err != nil || cur.State != models.ChunkDurable || !hasReplica(cur, deadWorkerID) || hasReplica(cur, targetID) {
+		return false
+	}
 
 	// Replicate with a generous timeout
 	rCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -180,4 +205,13 @@ func (r *Rebalancer) fixChunk(ctx context.Context, chunk *models.ChunkRecord, on
 		"target", targetID,
 		"replaced", deadWorkerID)
 	return true
+}
+
+func hasReplica(chunk *models.ChunkRecord, workerID string) bool {
+	for _, r := range chunk.Replicas {
+		if r.WorkerID == workerID {
+			return true
+		}
+	}
+	return false
 }

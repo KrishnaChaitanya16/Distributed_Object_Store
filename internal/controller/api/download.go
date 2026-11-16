@@ -216,6 +216,9 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	for i := range refs {
+		refs[i] = s.locate(r.Context(), refs[i])
+	}
 
 	// Verify chunk 0 before writing the status header so a fully corrupt first
 	// chunk returns 502 instead of a 200 with a truncated body.
@@ -271,4 +274,49 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	metrics.DownloadBytesTotal.Add(float64(manifest.SizeBytes))
 	log.Info("download complete", "chunks", len(refs), "bytes", manifest.SizeBytes)
+}
+
+// locations lists the workers bbolt says hold the chunk, online ones first; refs from before a rebalance fall back to their original pair.
+func (s *Server) locations(ctx context.Context, ref models.ChunkRef) []string {
+	var ids []string
+	add := func(id string) {
+		for _, x := range ids {
+			if x == id {
+				return
+			}
+		}
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if rec, err := s.meta.GetChunk(ctx, ref.ChunkID); err == nil {
+		for _, r := range rec.Replicas {
+			if s.health.GetWorkerStatus(r.WorkerID) == models.WorkerOnline {
+				add(r.WorkerID)
+			}
+		}
+		for _, r := range rec.Replicas {
+			add(r.WorkerID)
+		}
+	}
+	if len(ids) == 0 {
+		add(ref.PrimaryID)
+		add(ref.SecondaryID)
+	}
+	return ids
+}
+
+// locate points a ref at the replicas bbolt currently lists, so reads follow copies moved by the rebalancer or reconciler.
+func (s *Server) locate(ctx context.Context, ref models.ChunkRef) models.ChunkRef {
+	ids := s.locations(ctx, ref)
+	if len(ids) == 0 {
+		return ref
+	}
+	ref.PrimaryID = ids[0]
+	if len(ids) > 1 {
+		ref.SecondaryID = ids[1]
+	} else {
+		ref.SecondaryID = ids[0]
+	}
+	return ref
 }

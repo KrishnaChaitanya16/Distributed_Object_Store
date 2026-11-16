@@ -14,6 +14,9 @@ import (
 const (
 	statusProcessing = "PROCESSING"
 	statusCommitted  = "COMMITTED"
+
+	// idempotencyTTL is how long a key is remembered after it is first seen.
+	idempotencyTTL = 24 * time.Hour
 )
 
 // AcquireIdempotencyLock implements the first half of the 2PC idempotency pattern.
@@ -43,7 +46,7 @@ func (s *MetadataStore) AcquireIdempotencyLock(_ context.Context, key string) (*
 		rec := models.IdempotencyRecord{
 			Key:       key,
 			Status:    statusProcessing,
-			ExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+			ExpiresAt: time.Now().UTC().Add(idempotencyTTL),
 		}
 		encoded, err := json.Marshal(rec)
 		if err != nil {
@@ -110,4 +113,52 @@ func (s *MetadataStore) PurgeExpiredIdempotencyKeys(_ context.Context) error {
 		}
 		return nil
 	})
+}
+
+// ReleaseIdempotencyLock forgets a key that is still PROCESSING so the client can retry it at once; COMMITTED keys and unknown keys are left alone.
+func (s *MetadataStore) ReleaseIdempotencyLock(_ context.Context, key string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketIdempotency)
+		data := b.Get([]byte(key))
+		if data == nil {
+			return nil
+		}
+		var rec models.IdempotencyRecord
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return fmt.Errorf("unmarshal idempotency record: %w", err)
+		}
+		if rec.Status != statusProcessing {
+			return nil
+		}
+		return b.Delete([]byte(key))
+	})
+}
+
+// PurgeStaleIdempotencyLocks removes keys that have been PROCESSING since before idleBefore, which only a crashed request leaves behind, and returns how many went.
+func (s *MetadataStore) PurgeStaleIdempotencyLocks(_ context.Context, idleBefore time.Time) (int, error) {
+	n := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketIdempotency)
+		var stale [][]byte
+		if err := b.ForEach(func(k, v []byte) error {
+			var rec models.IdempotencyRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return fmt.Errorf("unmarshal idempotency record: %w", err)
+			}
+			if rec.Status == statusProcessing && rec.ExpiresAt.Add(-idempotencyTTL).Before(idleBefore) {
+				stale = append(stale, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range stale {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+			n++
+		}
+		return nil
+	})
+	return n, err
 }

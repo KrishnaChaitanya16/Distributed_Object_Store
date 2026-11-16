@@ -67,12 +67,18 @@ func (f *fakePlacement) AddWorker(_, _ string) {}
 func (f *fakePlacement) RemoveWorker(_ string) {}
 func (f *fakePlacement) Workers() []string     { return f.workers }
 
-type fakeHealth struct{}
+// fakeHealth reports four online workers unless online is set; an empty non-nil slice means none are online.
+type fakeHealth struct{ online []string }
 
 func (f *fakeHealth) RecordHeartbeat(_ string)                     {}
 func (f *fakeHealth) GetWorkerStatus(_ string) models.WorkerStatus { return models.WorkerOnline }
-func (f *fakeHealth) ListOnlineWorkers() []string                  { return nil }
-func (f *fakeHealth) Subscribe() <-chan models.WorkerOfflineEvent  { return nil }
+func (f *fakeHealth) ListOnlineWorkers() []string {
+	if f.online == nil {
+		return []string{"w1", "w2", "w3", "w4"}
+	}
+	return f.online
+}
+func (f *fakeHealth) Subscribe() <-chan models.WorkerOfflineEvent { return nil }
 
 // --- helpers ---
 

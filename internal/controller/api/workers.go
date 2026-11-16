@@ -44,6 +44,10 @@ func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 	metrics.WorkersOnline.Set(float64(len(s.placement.Workers())))
 
 	slog.Info("worker registered", "worker_id", req.WorkerID, "addr", workerAddr)
+	// A (re)registering worker may bring back copies that were replaced while it was away, so reconcile now.
+	if s.recon != nil {
+		s.recon.Trigger()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(models.RegisterResponse{ //nolint:errcheck
