@@ -75,17 +75,24 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 		primaryCh <- fetchResult{b, e}
 	}()
 
-	threshold := time.Duration(s.hedgeMs) * time.Millisecond
-	timer := time.NewTimer(threshold)
-	defer timer.Stop()
+	// hedgeMs == 0 means hedging is disabled; a nil channel blocks forever in select.
+	var timerC <-chan time.Time
+	var timer *time.Timer
+	if s.hedgeMs > 0 {
+		timer = time.NewTimer(time.Duration(s.hedgeMs) * time.Millisecond)
+		timerC = timer.C
+		defer timer.Stop()
+	}
 
 	// Wait for primary result or hedge threshold
 	var primaryRes *fetchResult
 	select {
 	case r := <-primaryCh:
-		timer.Stop()
+		if timer != nil {
+			timer.Stop()
+		}
 		primaryRes = &r
-	case <-timer.C:
+	case <-timerC:
 		// Primary is slow — start secondary hedge
 		log.Debug("hedging chunk fetch to secondary", "chunk_id", ref.ChunkID,
 			"threshold_ms", s.hedgeMs, "worker_id", ref.SecondaryID)

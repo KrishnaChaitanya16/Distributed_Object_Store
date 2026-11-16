@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/dedup"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
 const chunkSize = 1 * 1024 * 1024 // 1 MiB — per spec §4

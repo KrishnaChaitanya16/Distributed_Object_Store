@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 
@@ -85,6 +86,45 @@ func (s *MetadataStore) ListObjectsByStatus(_ context.Context, status models.Obj
 		})
 	})
 	return objects, err
+}
+
+// PatchCustomMetadata atomically reads, version-checks, merges, and bumps the manifest
+// inside a single bbolt Update transaction — preventing concurrent PATCH races.
+func (s *MetadataStore) PatchCustomMetadata(_ context.Context, id string, ifMatch int64, patch map[string]string) (*models.ObjectManifest, error) {
+	var out models.ObjectManifest
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketObjects)
+		data := b.Get([]byte(id))
+		if data == nil {
+			return models.ErrNotFound
+		}
+		if err := json.Unmarshal(data, &out); err != nil {
+			return fmt.Errorf("unmarshal object: %w", err)
+		}
+		if out.Status != models.StatusCommitted {
+			return models.ErrNotFound
+		}
+		if ifMatch >= 0 && out.Version != ifMatch {
+			return models.ErrVersionConflict
+		}
+		if out.CustomMetadata == nil {
+			out.CustomMetadata = map[string]string{}
+		}
+		for k, v := range patch {
+			out.CustomMetadata[k] = v
+		}
+		out.Version++
+		out.ModifiedAt = time.Now().UTC()
+		updated, err := json.Marshal(&out)
+		if err != nil {
+			return fmt.Errorf("marshal object: %w", err)
+		}
+		return b.Put([]byte(id), updated)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func (s *MetadataStore) DeleteObject(_ context.Context, objectID string) error {

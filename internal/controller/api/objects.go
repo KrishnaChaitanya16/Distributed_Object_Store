@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"time"
+	"strconv"
+	"strings"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -82,55 +83,38 @@ func (s *Server) handleGetMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 // PATCH /api/v1/objects/{id}/metadata — updates custom metadata key-value pairs.
-// Supports optimistic concurrency: If-Match header must match current ETag.
+// Supports optimistic concurrency via If-Match header (RFC 7232).
+// The read-check-merge-bump happens in one atomic bbolt transaction.
 // Returns 409 on version conflict; new ETag on success.
 func (s *Server) handlePatchMetadata(w http.ResponseWriter, r *http.Request) {
 	objectID := r.PathValue("id")
 	log := slog.With("handler", "patch-metadata", "object_id", objectID)
 
-	manifest, err := s.meta.GetObject(r.Context(), objectID)
-	if err != nil {
-		if errors.Is(err, models.ErrNotFound) {
-			http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
-			return
-		}
-		log.Error("get object", "err", err)
-		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
-		return
-	}
-	if manifest.Status != models.StatusCommitted {
-		http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
-		return
-	}
-
-	// Optimistic concurrency: reject if client's version is stale.
-	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" {
-		if ifMatch != etagFor(manifest.Version) {
-			log.Warn("version conflict on patch", "object_id", objectID,
-				"current_version", manifest.Version, "client_etag", ifMatch)
-			http.Error(w, `{"error":"version conflict — re-read and retry"}`, http.StatusConflict)
-			return
-		}
-	}
-
+	// Parse body first so bad JSON gives 400 before we touch the store.
 	var patch map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 		return
 	}
 
-	if manifest.CustomMetadata == nil {
-		manifest.CustomMetadata = make(map[string]string)
+	ifMatch, err := parseIfMatch(r.Header.Get("If-Match"))
+	if err != nil {
+		http.Error(w, `{"error":"invalid If-Match"}`, http.StatusBadRequest)
+		return
 	}
-	for k, v := range patch {
-		manifest.CustomMetadata[k] = v
-	}
-	manifest.Version++
-	manifest.ModifiedAt = time.Now().UTC()
 
-	if err := s.meta.SaveObject(r.Context(), manifest); err != nil {
-		log.Error("save object", "err", err)
-		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+	manifest, err := s.meta.PatchCustomMetadata(r.Context(), objectID, ifMatch, patch)
+	if err != nil {
+		switch {
+		case errors.Is(err, models.ErrNotFound):
+			http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
+		case errors.Is(err, models.ErrVersionConflict):
+			log.Warn("version conflict on patch", "object_id", objectID)
+			http.Error(w, `{"error":"version conflict — re-read and retry"}`, http.StatusConflict)
+		default:
+			log.Error("patch metadata", "err", err)
+			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		}
 		return
 	}
 
@@ -138,6 +122,23 @@ func (s *Server) handlePatchMetadata(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("ETag", etagFor(manifest.Version))
 	json.NewEncoder(w).Encode(manifest) //nolint:errcheck
+}
+
+// parseIfMatch parses an If-Match header value per RFC 7232.
+// Returns -1 (no version check) for empty string or "*".
+// Accepts quoted integers ("2") and weak tags (W/"2").
+// Returns an error for any other format.
+func parseIfMatch(h string) (int64, error) {
+	if h == "" || h == "*" {
+		return -1, nil
+	}
+	s := strings.TrimPrefix(h, "W/")
+	s = strings.Trim(s, `"`)
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, errors.New("invalid If-Match")
+	}
+	return n, nil
 }
 
 // etagFor returns a quoted ETag string for the given version number.
@@ -158,7 +159,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if manifest.Status == models.StatusDeleted {
-		w.WriteHeader(http.StatusNoContent)
+		http.Error(w, "object not found", http.StatusNotFound)
 		return
 	}
 

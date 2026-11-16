@@ -34,15 +34,25 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	// --- parse optional custom metadata before touching the store ---
+	var custom map[string]string
+	if raw := r.FormValue("metadata"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &custom); err != nil {
+			http.Error(w, `{"error":"metadata must be a JSON object of string values"}`, http.StatusBadRequest)
+			return
+		}
+	}
+
 	// --- build STAGED manifest ---
 	objectID := newID()
 	manifest := &models.ObjectManifest{
-		ID:          objectID,
-		Name:        header.Filename,
-		ContentType: header.Header.Get("Content-Type"),
-		Status:      models.StatusStaged,
-		CreatedAt:   time.Now().UTC(),
-		ModifiedAt:  time.Now().UTC(),
+		ID:             objectID,
+		Name:           header.Filename,
+		ContentType:    header.Header.Get("Content-Type"),
+		Status:         models.StatusStaged,
+		CustomMetadata: custom,
+		CreatedAt:      time.Now().UTC(),
+		ModifiedAt:     time.Now().UTC(),
 	}
 	if err := s.meta.SaveObject(r.Context(), manifest); err != nil {
 		log.Error("save staged manifest", "err", err)

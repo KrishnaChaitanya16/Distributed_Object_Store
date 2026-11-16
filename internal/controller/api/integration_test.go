@@ -420,12 +420,12 @@ func TestIntegration_Delete_RemovesObjectAndChunks(t *testing.T) {
 	assert.Equal(t, models.StatusDeleted, manifest.Status)
 }
 
-func TestIntegration_Delete_IsIdempotent(t *testing.T) {
+func TestIntegration_Delete_AlreadyDeleted_Returns404(t *testing.T) {
 	h := newHarness(t)
 	resp := h.upload(t, "idem.txt", "content")
 
 	assert.Equal(t, http.StatusNoContent, h.deleteObject(t, resp.ObjectID))
-	assert.Equal(t, http.StatusNoContent, h.deleteObject(t, resp.ObjectID)) // second delete is fine
+	assert.Equal(t, http.StatusNotFound, h.deleteObject(t, resp.ObjectID)) // PDF §5.5: 404 on second delete
 }
 
 // ── edge case / error path tests ──────────────────────────────────────────────

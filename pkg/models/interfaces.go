@@ -9,10 +9,11 @@ import (
 // --- Sentinel errors ---
 
 var (
-	ErrNotFound      = errors.New("not found")
-	ErrAlreadyExists = errors.New("already exists")
-	ErrNoWorkers     = errors.New("no healthy workers available")
-	ErrLockHeld      = errors.New("idempotency key already processing")
+	ErrNotFound        = errors.New("not found")
+	ErrAlreadyExists   = errors.New("already exists")
+	ErrNoWorkers       = errors.New("no healthy workers available")
+	ErrLockHeld        = errors.New("idempotency key already processing")
+	ErrVersionConflict = errors.New("version conflict")
 )
 
 // MetadataRepository is implemented by internal/controller/metadata.
@@ -25,6 +26,10 @@ type MetadataRepository interface {
 	ListObjects(ctx context.Context) ([]*ObjectManifest, error)
 	ListObjectsByStatus(ctx context.Context, status ObjectStatus) ([]*ObjectManifest, error)
 	DeleteObject(ctx context.Context, objectID string) error
+	// PatchCustomMetadata does the read-check-merge-bump atomically in one bbolt transaction.
+	// ifMatch < 0 means no version check. Returns ErrNotFound if the object is absent or not
+	// COMMITTED; returns ErrVersionConflict if ifMatch >= 0 and doesn't match the current version.
+	PatchCustomMetadata(ctx context.Context, id string, ifMatch int64, patch map[string]string) (*ObjectManifest, error)
 
 	// ChunkRefs — ordered per-object chunk list in a separate obj_chunks bucket.
 	// Implementation uses a bbolt cursor; callers get a plain slice.
