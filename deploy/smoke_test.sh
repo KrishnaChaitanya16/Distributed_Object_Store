@@ -133,7 +133,72 @@ for bad in $holders; do
 	st=$(scrub "$bad")
 	check "$bad: restored copy passes next scrub" "$(echo "$st" | jsonnum last_pass_corrupt)" "0"
 done
-check "controller fell back to the other copy at least once" "$([ "$(docker logs controller 2>&1 | grep 'primary chunk fetch failed' | grep -c "$cid")" -ge 1 ] && echo yes || echo no)" "yes"
+check "controller fell back to the other copy at least once" "$([ "$(docker logs controller 2>&1 | grep 'chunk fetch failed' | grep -c "$cid")" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== controller read path: SHA-256 check, read-repair, hedging, metadata locations"
+for w in worker1 worker2 worker3 worker4; do scrub "$w" >/dev/null; done
+tmpr=$(mktemp -d)
+head -c 4718592 /dev/urandom > "$tmpr/obj"
+rwant=$(sha256sum < "$tmpr/obj" | cut -d' ' -f1)
+up=$(curl -s -w '\n%{http_code}' -F "file=@$tmpr/obj" "$C/api/v1/objects")
+check "upload 4.5 MiB object for read-path test" "$(echo "$up" | tail -1)" "201"
+roid=$(echo "$up" | head -1 | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+md=$(curl -s "$C/api/v1/objects/$roid/metadata")
+locs=$(echo "$md" | grep -o '"locations":\["worker[0-9]","worker[0-9]"\]')
+check "metadata lists 5 chunks" "$(echo "$md" | grep -o '"chunk_id"' | wc -l | tr -d ' ')" "5"
+check "every chunk has 2 locations" "$(echo "$locs" | wc -l | tr -d ' ')" "5"
+check "locations are distinct workers" "$(echo "$locs" | awk -F'"' '$4==$6' | wc -l | tr -d ' ')" "0"
+check "offsets add up" "$(echo "$md" | grep -o '"offset":[0-9]*' | cut -d: -f2 | tr '\n' ' ')" "0 1048576 2097152 3145728 4194304 "
+check "metadata keeps system fields" "$(echo "$md" | grep -c '"object_id".*"size_bytes":4718592.*"chunk_count":5')" "1"
+check "download Content-Length is set" "$(curl -sI -X GET -D - -o /dev/null "$C/api/v1/objects/$roid" | tr -d '\r' | grep -i '^content-length:' | cut -d' ' -f2)" "4718592"
+et=$(curl -si "$C/api/v1/objects/$roid/metadata" | tr -d '\r' | grep -i '^etag:' | cut -d' ' -f2)
+check "metadata response carries an ETag" "$([ -n "$et" ] && echo yes || echo no)" "yes"
+check "PATCH with matching If-Match succeeds" "$(code -X PATCH -H "If-Match: $et" -d '{"k":"v"}' "$C/api/v1/objects/$roid/metadata")" "200"
+check "PATCH with stale If-Match is a 409" "$(code -X PATCH -H "If-Match: $et" -d '{"k":"w"}' "$C/api/v1/objects/$roid/metadata")" "409"
+check "custom metadata kept after rejected PATCH" "$(curl -s "$C/api/v1/objects/$roid/metadata" | grep -c '"k":"v"')" "1"
+
+rcid=$(echo "$md" | grep -o '"chunk_id":"[0-9a-f]*"' | sed -n 3p | cut -d'"' -f4)
+rpri=$(echo "$locs" | sed -n 3p | grep -o 'worker[0-9]' | sed -n 1p)
+docker exec "$rpri" sh -c "dd if=/dev/urandom of=/data/chunks/$rcid.bin bs=16 count=1 seek=7 conv=notrunc 2>/dev/null"
+check "$rpri copy is corrupt" "$([ "$(curl -s "localhost:$(wport $rpri)/internal/chunks/$rcid" | sha256sum | cut -d' ' -f1)" != "$rcid" ] && echo yes || echo no)" "yes"
+check "download byte-identical despite corrupt primary (no scrub yet)" "$(curl -s "$C/api/v1/objects/$roid" | sha256sum | cut -d' ' -f1)" "$rwant"
+for _ in $(seq 1 20); do docker logs controller 2>&1 | grep 'read-repair succeeded' | grep -q "$rcid" && break; sleep 0.5; done
+check "controller logged the integrity failure" "$([ "$(docker logs controller 2>&1 | grep 'chunk integrity check failed' | grep -c "$rcid")" -ge 1 ] && echo yes || echo no)" "yes"
+check "controller logged read-repair success" "$([ "$(docker logs controller 2>&1 | grep 'read-repair succeeded' | grep -c "$rcid")" -ge 1 ] && echo yes || echo no)" "yes"
+check "$rpri copy repaired in place" "$(curl -s "localhost:$(wport $rpri)/internal/chunks/$rcid" | sha256sum | cut -d' ' -f1)" "$rcid"
+st=$(scrub "$rpri")
+check "repaired copy passes the scrubber" "$(echo "$st" | jsonnum last_pass_corrupt)" "0"
+
+hp=$(echo "$locs" | sed -n 1p | grep -o 'worker[0-9]' | sed -n 1p)
+docker pause "$hp" >/dev/null
+t0=$(date +%s)
+hgot=$(curl -s -m 20 "$C/api/v1/objects/$roid" | sha256sum | cut -d' ' -f1)
+took=$(( $(date +%s) - t0 ))
+docker unpause "$hp" >/dev/null
+check "download identical while $hp is frozen (hedged read)" "$hgot" "$rwant"
+check "frozen worker did not stall the download (<4s)" "$([ "$took" -lt 4 ] && echo yes || echo no)" "yes"
+sleep 3
+
+head -c 300000 /dev/urandom > "$tmpr/small"
+suoid=$(curl -s -F "file=@$tmpr/small" "$C/api/v1/objects" | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+sm=$(curl -s "$C/api/v1/objects/$suoid/metadata")
+scid=$(echo "$sm" | grep -o '"chunk_id":"[0-9a-f]*"' | head -1 | cut -d'"' -f4)
+for w in $(echo "$sm" | grep -o '"locations":\["worker[0-9]","worker[0-9]"\]' | grep -o 'worker[0-9]'); do
+	docker exec "$w" sh -c "dd if=/dev/urandom of=/data/chunks/$scid.bin bs=16 count=1 seek=5 conv=notrunc 2>/dev/null"
+done
+check "both copies of chunk 0 corrupt -> 502" "$(curl -s -o "$tmpr/body" -w '%{http_code}' "$C/api/v1/objects/$suoid")" "502"
+check "502 body is the JSON error, no object bytes" "$(grep -c 'no valid replica' "$tmpr/body")" "1"
+
+lcid=$(echo "$md" | grep -o '"chunk_id":"[0-9a-f]*"' | sed -n 4p | cut -d'"' -f4)
+for w in $(echo "$locs" | sed -n 4p | grep -o 'worker[0-9]'); do
+	docker exec "$w" sh -c "dd if=/dev/urandom of=/data/chunks/$lcid.bin bs=16 count=1 seek=9 conv=notrunc 2>/dev/null"
+done
+curl -s -o "$tmpr/partial" "$C/api/v1/objects/$roid"; rc=$?
+check "both copies of a later chunk corrupt -> client sees a failed transfer" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+n=$(stat -c %s "$tmpr/partial")
+check "client got only the 3 verified chunks before it" "$n" "3145728"
+check "and those bytes are an exact prefix of the object" "$(head -c "$n" "$tmpr/obj" | sha256sum | cut -d' ' -f1)" "$(sha256sum < "$tmpr/partial" | cut -d' ' -f1)"
+rm -rf "$tmpr"
 before=$(curl -s "localhost:$(wport "$bad")/internal/scrubber/status" | jsonnum corrupt_quarantined)
 docker exec "$bad" sh -c "dd if=/dev/urandom of=/data/chunks/$cid.bin bs=16 count=1 seek=3 conv=notrunc 2>/dev/null"
 found=no
@@ -166,12 +231,13 @@ curl -s "$W2/internal/chunks/$id" -o "$tmp/peer"
 check "worker2 copy is identical" "$(sha256sum < "$tmp/peer" | cut -d' ' -f1)" "$id"
 
 echo "== graceful stop and restart keep data"
+shutdowns_before=$(docker logs worker2 2>&1 | grep -c 'worker worker2 shutting down')
 start=$(date +%s)
 docker stop -t 10 worker2 >/dev/null 2>&1
 took=$(( $(date +%s) - start ))
 check "worker2 exits 0 on SIGTERM" "$(docker inspect -f '{{.State.ExitCode}}' worker2)" "0"
 check "worker2 stops before kill timeout" "$([ "$took" -lt 5 ] && echo yes || echo no)" "yes"
-check "worker2 logged shutdown" "$(docker logs worker2 2>&1 | grep -c 'worker worker2 shutting down')" "1"
+check "worker2 logged shutdown" "$(( $(docker logs worker2 2>&1 | grep -c 'worker worker2 shutting down') - shutdowns_before ))" "1"
 check "worker2 unreachable while stopped" "$(code --max-time 2 "$W2/internal/chunks/$id")" "000"
 docker start worker2 >/dev/null 2>&1; sleep 2
 check "worker2 running after restart" "$(state worker2)" "running"
