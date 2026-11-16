@@ -694,3 +694,90 @@ func TestConcurrentPassesAndCollectsAreSafe(t *testing.T) {
 		}
 	}
 }
+
+// --- scenarios ported from the earlier GC implementation ---
+
+func TestPassStagedManifestWithNoChunksIsExpiredAndPurged(t *testing.T) {
+	e := newEnv(t, "w1", "w2")
+	require.NoError(t, e.store.SaveObject(e.ctx, &models.ObjectManifest{ID: "empty", Status: models.StatusStaged, ModifiedAt: time.Now().Add(-time.Hour).UTC()}))
+	rep := e.rec.Pass(e.ctx)
+	assert.Equal(t, 1, rep.StaleUploadsFailed)
+	assert.Equal(t, 1, rep.ObjectsPurged)
+	_, err := e.store.GetObject(e.ctx, "empty")
+	assert.ErrorIs(t, err, models.ErrNotFound)
+}
+
+func TestPassPendingChunksWithoutAnyReferenceAreDeleted(t *testing.T) {
+	e := newEnv(t, "w1", "w2", "w3")
+	for _, id := range []string{"p1", "p2", "p3"} {
+		e.chunk(id, models.ChunkPending, "w1", "w2")
+	}
+	rep := e.rec.Pass(e.ctx)
+	assert.Equal(t, 3, rep.ChunksDeleted)
+	for _, id := range []string{"p1", "p2", "p3"} {
+		assert.Empty(t, e.holders(id), id)
+		assert.Equal(t, models.ChunkState(""), e.state(id), id)
+	}
+}
+
+func TestPassDurableChunkNobodyReferencesIsDeletedEvenWithStaleRefCount(t *testing.T) {
+	e := newEnv(t, "w1", "w2")
+	require.NoError(t, e.store.SaveChunk(e.ctx, &models.ChunkRecord{ChunkID: "d", State: models.ChunkDurable, RefCount: 7, Replicas: reps("w1", "w2")}))
+	e.c.put("w1", "d")
+	e.c.put("w2", "d")
+	assert.Equal(t, 1, e.rec.Pass(e.ctx).ChunksDeleted, "ref_count is a cache; references decide")
+	assert.Empty(t, e.holders("d"))
+}
+
+func TestPassExpiredUploadWithDurableChunksIsFullyCleaned(t *testing.T) {
+	e := newEnv(t, "w1", "w2")
+	require.NoError(t, e.store.SaveObject(e.ctx, &models.ObjectManifest{ID: "stuck", Status: models.StatusStaged, ModifiedAt: time.Now().Add(-time.Hour).UTC()}))
+	require.NoError(t, e.store.SaveChunkRefs(e.ctx, "stuck", []models.ChunkRef{{ChunkID: "a", Index: 0}, {ChunkID: "b", Index: 1}, {ChunkID: "shared", Index: 2}}))
+	e.chunk("a", models.ChunkDurable, "w1", "w2")
+	e.chunk("b", models.ChunkDurable, "w1", "w2")
+	e.chunk("shared", models.ChunkDurable, "w1", "w2")
+	e.object("keeper", models.StatusCommitted, "shared")
+	rep := e.rec.Pass(e.ctx)
+	assert.Equal(t, 2, rep.ChunksDeleted)
+	assert.Empty(t, e.holders("a"))
+	assert.Empty(t, e.holders("b"))
+	assert.Equal(t, []string{"w1", "w2"}, e.holders("shared"), "a chunk shared with a live object stays")
+}
+
+func TestPassWithCancelledContextReturnsWithoutPanicking(t *testing.T) {
+	e := newEnv(t, "w1", "w2")
+	for i := 0; i < 20; i++ {
+		e.chunk(fmt.Sprintf("c%d", i), models.ChunkPending, "w1", "w2")
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	cancel()
+	assert.NotPanics(t, func() { e.rec.Pass(ctx) })
+	done := make(chan error, 1)
+	go func() { done <- e.rec.Run(ctx) }()
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run ignored the cancelled context")
+	}
+}
+
+func TestPassPurgesStaleIdempotencyLocksButKeepsCommittedKeys(t *testing.T) {
+	e := newEnv(t, "w1")
+	e.rec.cfg.StagedTimeout = time.Millisecond
+	_, err := e.store.AcquireIdempotencyLock(e.ctx, "crashed")
+	require.NoError(t, err)
+	_, err = e.store.AcquireIdempotencyLock(e.ctx, "done")
+	require.NoError(t, err)
+	require.NoError(t, e.store.CommitIdempotencyResult(e.ctx, "done", 201, []byte("{}")))
+	time.Sleep(20 * time.Millisecond)
+	rep := e.rec.Pass(e.ctx)
+	assert.Equal(t, 1, rep.KeysPurged)
+	existing, err := e.store.AcquireIdempotencyLock(e.ctx, "crashed")
+	require.NoError(t, err)
+	assert.Nil(t, existing, "the crashed request's key can be reused")
+	existing, err = e.store.AcquireIdempotencyLock(e.ctx, "done")
+	require.NoError(t, err)
+	require.NotNil(t, existing)
+	assert.Equal(t, "COMMITTED", existing.Status)
+}

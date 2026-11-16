@@ -42,6 +42,7 @@ type Report struct {
 	ReplicasRestored   int       `json:"replicas_restored"`
 	ChunksAdopted      int       `json:"chunks_adopted"`
 	ObjectsPurged      int       `json:"objects_purged"`
+	KeysPurged         int       `json:"idempotency_keys_purged"`
 	LostChunks         int       `json:"lost_chunks"`
 	Errors             int       `json:"errors"`
 	LastError          string    `json:"last_error,omitempty"`
@@ -172,10 +173,10 @@ func (r *Reconciler) Pass(ctx context.Context) Report {
 		st.Passes++
 		st.LastPass = &rep
 	})
-	if rep.ChunksDeleted+rep.ExcessDeleted+rep.ReplicasRestored+rep.ChunksAdopted+rep.StaleUploadsFailed+rep.ObjectsPurged+rep.LostChunks+rep.Errors > 0 {
+	if rep.ChunksDeleted+rep.ExcessDeleted+rep.ReplicasRestored+rep.ChunksAdopted+rep.StaleUploadsFailed+rep.ObjectsPurged+rep.KeysPurged+rep.LostChunks+rep.Errors > 0 {
 		slog.Info("gc: pass complete", "chunks_deleted", rep.ChunksDeleted, "excess_deleted", rep.ExcessDeleted,
 			"replicas_restored", rep.ReplicasRestored, "chunks_adopted", rep.ChunksAdopted, "stale_uploads_failed", rep.StaleUploadsFailed,
-			"objects_purged", rep.ObjectsPurged, "lost_chunks", rep.LostChunks, "errors", rep.Errors, "duration_ms", rep.DurationMs)
+			"objects_purged", rep.ObjectsPurged, "idempotency_keys_purged", rep.KeysPurged, "lost_chunks", rep.LostChunks, "errors", rep.Errors, "duration_ms", rep.DurationMs)
 	}
 	return rep
 }
@@ -287,6 +288,14 @@ func (p *pass) run() {
 	}
 	if err := m.SyncRefCounts(p.ctx); err != nil {
 		p.fail("sync ref counts", err)
+	}
+	if n, err := m.PurgeStaleIdempotencyLocks(p.ctx, time.Now().UTC().Add(-p.r.cfg.StagedTimeout)); err != nil {
+		p.fail("purge stale idempotency locks", err)
+	} else {
+		p.rep.KeysPurged += n
+	}
+	if err := m.PurgeExpiredIdempotencyKeys(p.ctx); err != nil {
+		p.fail("purge expired idempotency keys", err)
 	}
 }
 

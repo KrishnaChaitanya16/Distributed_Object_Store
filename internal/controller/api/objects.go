@@ -159,6 +159,8 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	// Only COMMITTED objects can be deleted. STAGED objects are mid-upload;
+	// FAILED objects belong to the GC; DELETED are already gone.
 	if manifest.Status != models.StatusCommitted {
 		http.Error(w, "object not found", http.StatusNotFound)
 		return
@@ -192,6 +194,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	deleted, err := s.collector.Collect(sweepCtx, ids, nil)
 	if err != nil {
 		log.Warn("some chunks of the deleted object were not removed yet; the reconciler will retry", "err", err)
+	}
+
+	// Drop the manifest and its chunk references now so DELETED tombstones never accumulate; the reconciler repeats this if the process dies first.
+	if _, err := s.meta.PurgeDeadObjects(context.WithoutCancel(r.Context())); err != nil {
+		log.Warn("purge deleted manifest", "object_id", objectID, "err", err)
 	}
 
 	log.Info("delete complete", "chunks", len(refs), "chunks_deleted", deleted)

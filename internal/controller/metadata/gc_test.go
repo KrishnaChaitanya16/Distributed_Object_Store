@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -378,6 +380,84 @@ func TestPurgeDeadObjects_RemovesOnlyDeadManifestsAndTheirRefs(t *testing.T) {
 	assert.Zero(t, n)
 }
 
+// --- inline ref counting ---
+
+func TestCommitAndDeleteMaintainRefCountsAtomically(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	chunkIn(t, s, "x", models.ChunkPending)
+	chunkIn(t, s, "y", models.ChunkPending)
+	for _, o := range []string{"o1", "o2"} {
+		stagedObject(t, s, o)
+		for i, c := range []string{"x", "y", "x"} {
+			_, err := s.AddChunkRef(ctx, o, ChunkRef{ChunkID: c, Index: i})
+			require.NoError(t, err)
+		}
+	}
+	count := func(id string) int {
+		c, err := s.GetChunk(ctx, id)
+		require.NoError(t, err)
+		return c.RefCount
+	}
+	assert.Equal(t, 0, count("x"), "an upload in progress is not yet counted")
+
+	o1, _ := s.GetObject(ctx, "o1")
+	require.NoError(t, s.CommitObject(ctx, o1))
+	assert.Equal(t, 2, count("x"), "one per reference, so a chunk used twice counts twice")
+	assert.Equal(t, 1, count("y"))
+	o2, _ := s.GetObject(ctx, "o2")
+	require.NoError(t, s.CommitObject(ctx, o2))
+	assert.Equal(t, 4, count("x"))
+
+	require.NoError(t, s.MarkObjectDeleted(ctx, "o1"))
+	assert.Equal(t, 2, count("x"))
+	assert.Equal(t, 1, count("y"))
+	assert.ErrorIs(t, s.MarkObjectDeleted(ctx, "o1"), models.ErrNotFound)
+	assert.Equal(t, 2, count("x"), "a rejected second delete changes nothing")
+	require.NoError(t, s.MarkObjectDeleted(ctx, "o2"))
+	assert.Equal(t, 0, count("x"))
+	assert.Equal(t, 0, count("y"))
+}
+
+func TestRefCountsNeverGoNegativeAndSkipMissingRecords(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	objectWithRefs(t, s, "o", models.StatusCommitted, "known", "norecord")
+	chunkIn(t, s, "known", models.ChunkDurable)
+	require.NoError(t, s.MarkObjectDeleted(ctx, "o"))
+	c, _ := s.GetChunk(ctx, "known")
+	assert.Equal(t, 0, c.RefCount, "floor at zero")
+
+	stagedObject(t, s, "s")
+	_, err := s.AddChunkRef(ctx, "s", ChunkRef{ChunkID: "ghost"})
+	require.NoError(t, err)
+	obj, _ := s.GetObject(ctx, "s")
+	require.NoError(t, s.CommitObject(ctx, obj), "a lost chunk record must not block a commit")
+}
+
+func TestConcurrentCommitsCountExactly(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	chunkIn(t, s, "shared", models.ChunkDurable)
+	const n = 25
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("o%d", i)
+		stagedObject(t, s, id)
+		_, err := s.AddChunkRef(ctx, id, ChunkRef{ChunkID: "shared"})
+		require.NoError(t, err)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			obj, _ := s.GetObject(ctx, id)
+			assert.NoError(t, s.CommitObject(ctx, obj))
+		}()
+	}
+	wg.Wait()
+	c, _ := s.GetChunk(ctx, "shared")
+	assert.Equal(t, n, c.RefCount)
+}
+
 // --- SyncRefCounts ---
 
 func TestSyncRefCounts(t *testing.T) {
@@ -392,8 +472,77 @@ func TestSyncRefCounts(t *testing.T) {
 	chunkIn(t, s, "pd", models.ChunkPendingDelete)
 	require.NoError(t, s.IncrementChunkRefCount(ctx, "c"))
 	require.NoError(t, s.SyncRefCounts(ctx))
-	for id, want := range map[string]int{"a": 2, "b": 1, "c": 0, "pd": 0} {
+	for id, want := range map[string]int{"a": 1, "b": 1, "c": 0, "pd": 0} {
 		c, _ := s.GetChunk(ctx, id)
 		assert.Equal(t, want, c.RefCount, id)
 	}
+}
+
+// --- idempotency key release and purge ---
+
+func putKey(t *testing.T, s *MetadataStore, key, status string, created time.Time) {
+	t.Helper()
+	rec := models.IdempotencyRecord{Key: key, Status: status, ExpiresAt: created.Add(idempotencyTTL)}
+	data, err := json.Marshal(rec)
+	require.NoError(t, err)
+	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(bucketIdempotency).Put([]byte(key), data) }))
+}
+
+func keyStatus(t *testing.T, s *MetadataStore, key string) string {
+	t.Helper()
+	var st string
+	require.NoError(t, s.db.View(func(tx *bolt.Tx) error {
+		if d := tx.Bucket(bucketIdempotency).Get([]byte(key)); d != nil {
+			var rec models.IdempotencyRecord
+			require.NoError(t, json.Unmarshal(d, &rec))
+			st = rec.Status
+		}
+		return nil
+	}))
+	return st
+}
+
+func TestReleaseIdempotencyLock(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	_, err := s.AcquireIdempotencyLock(ctx, "k")
+	require.NoError(t, err)
+	require.NoError(t, s.ReleaseIdempotencyLock(ctx, "k"))
+	assert.Equal(t, "", keyStatus(t, s, "k"))
+	existing, err := s.AcquireIdempotencyLock(ctx, "k")
+	require.NoError(t, err)
+	assert.Nil(t, existing, "a released key can be acquired again")
+
+	require.NoError(t, s.CommitIdempotencyResult(ctx, "k", 201, []byte(`{"object_id":"x"}`)))
+	require.NoError(t, s.ReleaseIdempotencyLock(ctx, "k"))
+	assert.Equal(t, "COMMITTED", keyStatus(t, s, "k"), "a committed key must never be released")
+	require.NoError(t, s.ReleaseIdempotencyLock(ctx, "never-seen"), "unknown key is not an error")
+}
+
+func TestPurgeStaleIdempotencyLocks(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	putKey(t, s, "old-processing", "PROCESSING", now.Add(-time.Hour))
+	putKey(t, s, "fresh-processing", "PROCESSING", now.Add(-time.Second))
+	putKey(t, s, "old-committed", "COMMITTED", now.Add(-time.Hour))
+	n, err := s.PurgeStaleIdempotencyLocks(ctx, now.Add(-time.Minute))
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.Equal(t, "", keyStatus(t, s, "old-processing"))
+	assert.Equal(t, "PROCESSING", keyStatus(t, s, "fresh-processing"), "a request that may still be running keeps its key")
+	assert.Equal(t, "COMMITTED", keyStatus(t, s, "old-committed"), "a committed key must keep replaying")
+	n, err = s.PurgeStaleIdempotencyLocks(ctx, now.Add(-time.Minute))
+	require.NoError(t, err)
+	assert.Zero(t, n)
+}
+
+func TestPurgeExpiredIdempotencyKeysDropsOnlyExpired(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	putKey(t, s, "expired", "COMMITTED", now.Add(-25*time.Hour))
+	putKey(t, s, "alive", "COMMITTED", now.Add(-time.Hour))
+	require.NoError(t, s.PurgeExpiredIdempotencyKeys(context.Background()))
+	assert.Equal(t, "", keyStatus(t, s, "expired"))
+	assert.Equal(t, "COMMITTED", keyStatus(t, s, "alive"))
 }

@@ -343,6 +343,27 @@ check "chunks_lost gauge is 0" "$(echo "$m" | grep '^minidfs_chunks_lost ' | awk
 curl -s -o /dev/null -X DELETE "$C/api/v1/objects/$s3"
 rm -rf "$tmpg"
 
+echo "== idempotency keys"
+tmpk=$(mktemp -d)
+head -c 300000 /dev/urandom > "$tmpk/f"
+kwant=$(sha256sum < "$tmpk/f" | cut -d' ' -f1)
+kn() { curl -s "$C/api/v1/objects" | grep -o '"object_id"' | wc -l | tr -d ' '; }
+kbefore=$(kn)
+check "bad request with a key (no file) is rejected" "$(code -X POST -H 'Idempotency-Key: smoke-1' -F 'metadata={}' "$C/api/v1/objects")" "400"
+k1=$(curl -s -D "$tmpk/h1" -H 'Idempotency-Key: smoke-1' -F "file=@$tmpk/f" "$C/api/v1/objects")
+check "same key works right after the failed attempt (key was released)" "$(head -1 "$tmpk/h1" | cut -d' ' -f2)" "201"
+k2=$(curl -s -D "$tmpk/h2" -H 'Idempotency-Key: smoke-1' -F "file=@$tmpk/f" "$C/api/v1/objects")
+check "retry with the same key replays the first response" "$k2" "$k1"
+check "replay is flagged" "$(grep -ci '^x-idempotency-replayed: true' "$tmpk/h2")" "1"
+check "only one object was stored" "$(( $(kn) - kbefore ))" "1"
+for i in 1 2 3 4 5 6; do (code -H 'Idempotency-Key: smoke-par' -F "file=@$tmpk/f" "$C/api/v1/objects" > "$tmpk/p$i") & done; wait
+check "6 parallel uploads with one key: at least one created" "$([ "$(cat "$tmpk"/p* | grep -c 201)" -ge 1 ] && echo yes || echo no)" "yes"
+check "6 parallel uploads with one key: every other one is a conflict or a replay" "$(cat "$tmpk"/p* | grep -vc '201\|409')" "0"
+check "6 parallel uploads with one key stored exactly one more object" "$(( $(kn) - kbefore ))" "2"
+kid=$(echo "$k1" | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+check "keyed object downloads identical" "$(curl -s "$C/api/v1/objects/$kid" | sha256sum | cut -d' ' -f1)" "$kwant"
+rm -rf "$tmpk"
+
 echo "== rebalancer: RF=2 restored after worker failure"
 # Upload a small object and find which two workers hold its chunk.
 tmprb=$(mktemp -d)

@@ -354,3 +354,101 @@ func TestRegistrationTriggersReconcile(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, h.do(bad).Code)
 	assert.Equal(t, int32(1), rc.triggers.Load(), "a rejected registration triggers nothing")
 }
+
+// --- idempotency keys survive failed attempts ---
+
+func uploadWithKey(t *testing.T, srv *Server, key, content string, withFile bool) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if withFile {
+		fw, err := mw.CreateFormFile("file", "f.bin")
+		require.NoError(t, err)
+		io.WriteString(fw, content)
+	}
+	mw.Close()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	rec := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestIdempotencyKeyIsReleasedWhenUploadFails(t *testing.T) {
+	h := newHarness(t)
+	failing := &failingPool{chunkStore: h.workers}
+	failing.n.Store(2)
+	bad := New(":0", h.store, h.ring, failing, &fakeHealth{})
+	assert.Equal(t, http.StatusBadGateway, uploadWithKey(t, bad, "k", "payload", true).Code)
+	rec := uploadWithKey(t, h.srv, "k", "payload", true)
+	assert.Equal(t, http.StatusCreated, rec.Code, "a failed attempt must not lock the key for 24 hours")
+	again := uploadWithKey(t, h.srv, "k", "payload", true)
+	assert.Equal(t, http.StatusCreated, again.Code)
+	assert.Equal(t, "true", again.Header().Get("X-Idempotency-Replayed"))
+	assert.Equal(t, rec.Body.String(), again.Body.String(), "the committed key replays the same object")
+}
+
+func TestIdempotencyKeyIsReleasedOnBadRequestAndOnTooFewWorkers(t *testing.T) {
+	h := newHarness(t)
+	assert.Equal(t, http.StatusBadRequest, uploadWithKey(t, h.srv, "k1", "", false).Code, "no file")
+	assert.Equal(t, http.StatusCreated, uploadWithKey(t, h.srv, "k1", "now valid", true).Code)
+
+	few := New(":0", h.store, h.ring, h.workers, &fakeHealth{online: []string{"w1"}})
+	assert.Equal(t, http.StatusServiceUnavailable, uploadWithKey(t, few, "k2", "x", true).Code)
+	assert.Equal(t, http.StatusCreated, uploadWithKey(t, h.srv, "k2", "x", true).Code)
+}
+
+func TestIdempotencyKeyOfRunningRequestIsNotReleasedByRejectedDuplicate(t *testing.T) {
+	h := newHarness(t)
+	_, err := h.store.AcquireIdempotencyLock(context.Background(), "busy")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusConflict, uploadWithKey(t, h.srv, "busy", "x", true).Code)
+	existing, err := h.store.AcquireIdempotencyLock(context.Background(), "busy")
+	require.NoError(t, err)
+	require.NotNil(t, existing, "the duplicate must not release a key it does not own")
+	assert.Equal(t, "PROCESSING", existing.Status)
+}
+
+func TestIdempotencyConcurrentSameKeyStoresOneObject(t *testing.T) {
+	h := newHarness(t)
+	var wg sync.WaitGroup
+	codes := make([]int, 12)
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			codes[i] = uploadWithKey(t, h.srv, "same", "only once", true).Code
+		}(i)
+	}
+	wg.Wait()
+	created := 0
+	for _, c := range codes {
+		if c == http.StatusCreated {
+			created++
+		} else {
+			assert.Equal(t, http.StatusConflict, c)
+		}
+	}
+	objs, _ := h.store.ListObjectsByStatus(context.Background(), models.StatusCommitted)
+	assert.Equal(t, 1, created)
+	assert.Len(t, objs, 1, "at-most-once")
+}
+
+// resultFailingMeta fails to record the idempotency result, as a bbolt error right after the commit would.
+type resultFailingMeta struct{ models.MetadataRepository }
+
+func (resultFailingMeta) CommitIdempotencyResult(context.Context, string, int, []byte) error {
+	return io.ErrClosedPipe
+}
+
+func TestIdempotencyKeyIsKeptWhenOnlyRecordingTheResultFailed(t *testing.T) {
+	h := newHarness(t)
+	srv := New(":0", resultFailingMeta{h.store}, h.ring, h.workers, &fakeHealth{})
+	assert.Equal(t, http.StatusCreated, uploadWithKey(t, srv, "k", "committed anyway", true).Code, "the object is stored, so the client is told so")
+	assert.Equal(t, http.StatusConflict, uploadWithKey(t, srv, "k", "committed anyway", true).Code, "releasing the key here would let a retry store a second copy")
+	objs, _ := h.store.ListObjectsByStatus(context.Background(), models.StatusCommitted)
+	assert.Len(t, objs, 1)
+}

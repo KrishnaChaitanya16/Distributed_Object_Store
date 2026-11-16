@@ -90,7 +90,7 @@ func (s *MetadataStore) MarkChunkDurable(_ context.Context, chunkID string) erro
 	})
 }
 
-// CommitObject flips a STAGED manifest to COMMITTED; it fails if GC already expired the upload.
+// CommitObject flips a STAGED manifest to COMMITTED and counts its chunk references, in one transaction; it fails if GC already expired the upload.
 func (s *MetadataStore) CommitObject(_ context.Context, obj *models.ObjectManifest) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketObjects)
@@ -100,11 +100,14 @@ func (s *MetadataStore) CommitObject(_ context.Context, obj *models.ObjectManife
 		}
 		committed := *obj
 		committed.Status = models.StatusCommitted
-		return putObjectInTx(b, &committed)
+		if err := putObjectInTx(b, &committed); err != nil {
+			return err
+		}
+		return adjustRefCountsInTx(tx, obj.ID, +1)
 	})
 }
 
-// MarkObjectDeleted flips COMMITTED to DELETED; any other state reads as not found, so two concurrent deletes cannot both succeed.
+// MarkObjectDeleted flips COMMITTED to DELETED and releases its chunk references, in one transaction; any other state reads as not found, so two concurrent deletes cannot both succeed.
 func (s *MetadataStore) MarkObjectDeleted(_ context.Context, objectID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketObjects)
@@ -114,7 +117,10 @@ func (s *MetadataStore) MarkObjectDeleted(_ context.Context, objectID string) er
 		}
 		obj.Status = models.StatusDeleted
 		obj.ModifiedAt = time.Now().UTC()
-		return putObjectInTx(b, obj)
+		if err := putObjectInTx(b, obj); err != nil {
+			return err
+		}
+		return adjustRefCountsInTx(tx, objectID, -1)
 	})
 }
 
@@ -240,6 +246,10 @@ func (s *MetadataStore) AdoptChunks(_ context.Context, holders map[string][]mode
 		if err != nil {
 			return err
 		}
+		committed, err := countRefsInTx(tx, models.StatusCommitted)
+		if err != nil {
+			return err
+		}
 		b := tx.Bucket(bucketChunks)
 		for _, id := range sortedKeys(holders) {
 			if live[id] == 0 || len(holders[id]) == 0 || b.Get([]byte(id)) != nil {
@@ -247,7 +257,7 @@ func (s *MetadataStore) AdoptChunks(_ context.Context, holders map[string][]mode
 			}
 			chunk := &models.ChunkRecord{
 				ChunkID:   id,
-				RefCount:  live[id],
+				RefCount:  committed[id],
 				State:     models.ChunkDurable,
 				Replicas:  mergeReplicas(nil, holders[id]),
 				CreatedAt: time.Now().UTC(),
@@ -304,10 +314,10 @@ func (s *MetadataStore) PurgeDeadObjects(_ context.Context) (int, error) {
 	return n, err
 }
 
-// SyncRefCounts rewrites each chunk's ref_count to the number of live references, so the field never drifts.
+// SyncRefCounts rewrites each chunk's ref_count to the number of references held by COMMITTED objects, so the field never drifts.
 func (s *MetadataStore) SyncRefCounts(_ context.Context) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		live, err := liveRefsInTx(tx)
+		live, err := countRefsInTx(tx, models.StatusCommitted)
 		if err != nil {
 			return err
 		}
@@ -338,34 +348,70 @@ func (s *MetadataStore) SyncRefCounts(_ context.Context) error {
 
 // liveRefsInTx counts chunk references from COMMITTED and STAGED objects within one consistent snapshot.
 func liveRefsInTx(tx *bolt.Tx) (map[string]int, error) {
-	liveObjs := make(map[string]bool)
+	return countRefsInTx(tx, models.StatusCommitted, models.StatusStaged)
+}
+
+// countRefsInTx counts chunk references held by objects in any of the given states.
+func countRefsInTx(tx *bolt.Tx, statuses ...models.ObjectStatus) (map[string]int, error) {
+	want := make(map[string]bool)
 	err := tx.Bucket(bucketObjects).ForEach(func(k, v []byte) error {
 		var obj models.ObjectManifest
 		if err := json.Unmarshal(v, &obj); err != nil {
 			return fmt.Errorf("unmarshal object: %w", err)
 		}
-		if obj.Status == models.StatusCommitted || obj.Status == models.StatusStaged {
-			liveObjs[string(k)] = true
+		for _, st := range statuses {
+			if obj.Status == st {
+				want[string(k)] = true
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	live := make(map[string]int)
+	counts := make(map[string]int)
 	err = tx.Bucket(bucketObjChunks).ForEach(func(k, v []byte) error {
 		i := bytes.LastIndexByte(k, '/')
-		if i < 0 || !liveObjs[string(k[:i])] {
+		if i < 0 || !want[string(k[:i])] {
 			return nil
 		}
 		var ref models.ChunkRef
 		if err := json.Unmarshal(v, &ref); err != nil {
 			return fmt.Errorf("unmarshal chunk ref: %w", err)
 		}
-		live[ref.ChunkID]++
+		counts[ref.ChunkID]++
 		return nil
 	})
-	return live, err
+	return counts, err
+}
+
+// adjustRefCountsInTx adds delta to the ref_count of every chunk the object references, once per reference and never below zero; chunks without a record are skipped.
+func adjustRefCountsInTx(tx *bolt.Tx, objectID string, delta int) error {
+	refs := tx.Bucket(bucketObjChunks)
+	chunks := tx.Bucket(bucketChunks)
+	prefix := chunkRefPrefix(objectID)
+	c := refs.Cursor()
+	for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+		var ref models.ChunkRef
+		if err := json.Unmarshal(v, &ref); err != nil {
+			return fmt.Errorf("unmarshal chunk ref: %w", err)
+		}
+		rec, err := getChunkInTx(chunks, ref.ChunkID)
+		if err == models.ErrNotFound {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		rec.RefCount += delta
+		if rec.RefCount < 0 {
+			rec.RefCount = 0
+		}
+		if err := putChunkInTx(chunks, rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // mergeReplicas appends holders not already listed, keeping the existing order.

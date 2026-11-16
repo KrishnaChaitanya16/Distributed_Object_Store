@@ -85,6 +85,10 @@ type MetadataRepository interface {
 	AcquireIdempotencyLock(ctx context.Context, key string) (existing *IdempotencyRecord, err error)
 	CommitIdempotencyResult(ctx context.Context, key string, statusCode int, body []byte) error
 	PurgeExpiredIdempotencyKeys(ctx context.Context) error
+	// ReleaseIdempotencyLock drops a PROCESSING key so a failed request can be retried at once; it never touches COMMITTED keys.
+	ReleaseIdempotencyLock(ctx context.Context, key string) error
+	// PurgeStaleIdempotencyLocks drops keys stuck in PROCESSING since before idleBefore (left by a crash) and returns how many.
+	PurgeStaleIdempotencyLocks(ctx context.Context, idleBefore time.Time) (int, error)
 }
 
 // PlacementStrategy is implemented by internal/controller/placement.

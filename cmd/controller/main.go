@@ -19,6 +19,7 @@ import (
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/rebalancer"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/workerclient"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/logger"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
 type controllerConfig struct {
@@ -84,12 +85,18 @@ func main() {
 		slog.Warn("could not pre-populate ring from bbolt", "err", err)
 	} else {
 		for _, w := range knownWorkers {
+			// Skip workers that were persisted as OFFLINE — they never sent a
+			// heartbeat before the last shutdown and should not pollute the ring.
+			if w.Status == models.WorkerOffline {
+				slog.Info("skipping offline worker during ring pre-population", "worker_id", w.WorkerID)
+				continue
+			}
 			addr := fmt.Sprintf("%s:%d", w.Address, w.Port)
 			ring.AddWorker(w.WorkerID, addr)
 			table.RecordHeartbeat(w.WorkerID)
 			slog.Info("ring pre-populated from bbolt", "worker_id", w.WorkerID, "addr", addr)
 		}
-		metrics.WorkersOnline.Set(float64(len(knownWorkers)))
+		metrics.WorkersOnline.Set(float64(len(ring.Workers())))
 	}
 
 	// --- background goroutines ---
@@ -101,13 +108,13 @@ func main() {
 	// Background rebalancer: every 30 s restore RF=2 for chunks whose replica
 	// is on an offline worker. Replaces the dead slot with a healthy worker so
 	// the replica count stays at exactly 2 (no 3-replica accumulation).
-	rb := rebalancer.New(store, pool, table)
+	rb := rebalancer.New(store, pool, table, ring)
 	go rb.Run(ctx)
 
 	// When the monitor declares a worker OFFLINE, remove it from the ring
 	// and immediately trigger a repair tick so RF=2 is restored in ~seconds
 	// rather than waiting up to 30 s for the next periodic tick.
-	go watchOffline(ctx, table, ring, rb)
+	go watchOffline(ctx, table, ring, rb, store)
 
 	// Garbage collection and replica reconciliation: periodic, on demand, and whenever a worker joins or rejoins.
 	recon, err := gc.NewReconciler(store, pool, table, gc.NewCollector(store, pool, table), gc.Config{
@@ -164,8 +171,9 @@ func main() {
 }
 
 // watchOffline listens for OFFLINE events, removes the worker from the ring,
-// updates the gauge, and triggers an immediate rebalancer tick.
-func watchOffline(ctx context.Context, table *health.LeaseTable, ring *placement.Ring, rb *rebalancer.Rebalancer) {
+// persists offline status to bbolt (so the worker isn't re-added on restart),
+// and triggers an immediate rebalancer tick.
+func watchOffline(ctx context.Context, table *health.LeaseTable, ring *placement.Ring, rb *rebalancer.Rebalancer, store *metadata.MetadataStore) {
 	ch := table.Subscribe()
 	for {
 		select {
@@ -175,6 +183,11 @@ func watchOffline(ctx context.Context, table *health.LeaseTable, ring *placement
 			slog.Warn("removing offline worker from ring", "worker_id", event.WorkerID)
 			ring.RemoveWorker(event.WorkerID)
 			metrics.WorkersOnline.Set(float64(len(ring.Workers())))
+			// Persist OFFLINE so the worker isn't re-added to the ring if the
+			// controller restarts while the worker is still down.
+			if err := store.UpdateWorkerStatus(ctx, event.WorkerID, models.WorkerOffline); err != nil {
+				slog.Warn("failed to persist worker offline status", "worker_id", event.WorkerID, "err", err)
+			}
 			rb.TriggerNow(ctx) // restore RF=2 immediately, don't wait for 30s tick
 		}
 	}

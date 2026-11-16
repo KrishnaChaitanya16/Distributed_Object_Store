@@ -25,6 +25,45 @@ type uploadResponse struct {
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	log := slog.With("handler", "upload")
 
+	// --- idempotency check (optional header) ---
+	// If the client sends Idempotency-Key, we guarantee at-most-once semantics:
+	//   PROCESSING record present → another request is in flight → 409
+	//   COMMITTED  record present → replay the cached 201 response
+	//   No record              → proceed; write PROCESSING sentinel atomically
+	idempKey := r.Header.Get("Idempotency-Key")
+	keepKey := false
+	if idempKey != "" {
+		existing, err := s.meta.AcquireIdempotencyLock(r.Context(), idempKey)
+		if err != nil {
+			log.Error("acquire idempotency lock", "key", idempKey, "err", err)
+			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+			return
+		}
+		if existing != nil {
+			switch existing.Status {
+			case "COMMITTED":
+				// Replay exact cached response — client gets same object_id.
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Idempotency-Replayed", "true")
+				w.WriteHeader(existing.StatusCode)
+				w.Write(existing.Body) //nolint:errcheck
+				log.Info("idempotency replay", "key", idempKey)
+				return
+			default: // PROCESSING
+				http.Error(w, `{"error":"request with this Idempotency-Key is already processing"}`, http.StatusConflict)
+				return
+			}
+		}
+		// This request owns the key. If it leaves without committing, the key is released so the client can retry at once instead of waiting out the TTL.
+		defer func() {
+			if !keepKey {
+				if err := s.meta.ReleaseIdempotencyLock(context.WithoutCancel(r.Context()), idempKey); err != nil {
+					log.Warn("release idempotency key", "key", idempKey, "err", err)
+				}
+			}
+		}()
+	}
+
 	// --- parse multipart (max 10 GB in memory buffer = 32 MB) ---
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		http.Error(w, "expected multipart/form-data with field 'file'", http.StatusBadRequest)
@@ -44,6 +83,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"metadata must be a JSON object of string values"}`, http.StatusBadRequest)
 			return
 		}
+	}
+
+	// Fail fast if fewer than 2 workers are online — placement needs at least
+	// a primary and a secondary, and a connection-refused error mid-upload is
+	// worse than an immediate 503.
+	if online := s.health.ListOnlineWorkers(); len(online) < 2 {
+		http.Error(w, `{"error":"insufficient healthy workers — try again shortly"}`, http.StatusServiceUnavailable)
+		return
 	}
 
 	// --- build STAGED manifest ---
@@ -151,13 +198,23 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	metrics.UploadBytesTotal.Add(float64(totalSize))
 	log.Info("upload complete", "object_id", objectID, "chunks", len(refs), "bytes", totalSize)
 
+	resp := uploadResponse{ObjectID: objectID, Chunks: len(refs), Bytes: totalSize}
+	respBody, _ := json.Marshal(resp)
+
+	// The object is committed: keep the key either way, because releasing it could let a retry store a second copy.
+	keepKey = true
+
+	// Commit idempotency result so retries replay this exact response.
+	if idempKey != "" {
+		if err := s.meta.CommitIdempotencyResult(r.Context(), idempKey, http.StatusCreated, respBody); err != nil {
+			log.Warn("commit idempotency result", "key", idempKey, "err", err)
+			// Non-fatal: upload succeeded, we just lose the idempotency guarantee for this key.
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(uploadResponse{ //nolint:errcheck
-		ObjectID: objectID,
-		Chunks:   len(refs),
-		Bytes:    totalSize,
-	})
+	w.Write(respBody) //nolint:errcheck
 }
 
 // storeChunk makes one chunk durable for this upload and returns the HTTP status and message to use on failure.

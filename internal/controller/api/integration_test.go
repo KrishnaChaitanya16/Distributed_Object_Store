@@ -414,10 +414,9 @@ func TestIntegration_Delete_RemovesObjectAndChunks(t *testing.T) {
 	// workers received DELETE calls
 	assert.NotEmpty(t, h.workers.callsFor("DEL", ""))
 
-	// bbolt: object is DELETED
-	manifest, err := h.store.GetObject(context.Background(), resp.ObjectID)
-	require.NoError(t, err)
-	assert.Equal(t, models.StatusDeleted, manifest.Status)
+	// bbolt: manifest fully removed (not just marked DELETED)
+	_, err := h.store.GetObject(context.Background(), resp.ObjectID)
+	assert.ErrorIs(t, err, models.ErrNotFound, "manifest must be purged from bbolt after delete")
 }
 
 func TestIntegration_Delete_AlreadyDeleted_Returns404(t *testing.T) {
