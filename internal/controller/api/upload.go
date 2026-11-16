@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -99,81 +101,24 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 		log.Debug("chunk placed", "index", index, "chunk_id", chunkID, "primary", primaryID, "secondary", secondaryID)
 
-		// Bloom filter O(1) pre-check — skips bbolt round-trip for definitely-new chunks.
-		// False positives fall through to the GetChunk bbolt lookup.
-		chunkIsNew := !s.bloom.MightExist(chunkID)
-		if !chunkIsNew {
-			existing, _ := s.meta.GetChunk(r.Context(), chunkID)
-			chunkIsNew = existing == nil
-		}
-		if chunkIsNew {
-			log.Debug("chunk is new — saving to bbolt and pushing to workers", "chunk_id", chunkID)
-			rec := &models.ChunkRecord{
-				ChunkID:   chunkID,
-				SizeBytes: n,
-				RefCount:  0,
-				State:     models.ChunkPending,
-				Replicas: []models.Replica{
-					{WorkerID: primaryID, WorkerAddr: s.workerAddr(primaryID)},
-					{WorkerID: secondaryID, WorkerAddr: s.workerAddr(secondaryID)},
-				},
-				CreatedAt: time.Now().UTC(),
-			}
-			if err := s.meta.SaveChunk(r.Context(), rec); err != nil {
-				s.rollback(r.Context(), objectID, log)
-				http.Error(w, "internal error", http.StatusInternalServerError)
-				return
-			}
-			log.Debug("chunk saved to bbolt", "chunk_id", chunkID, "state", "PENDING")
-
-			// push to both workers
-			log.Debug("pushing chunk to primary worker", "chunk_id", chunkID, "worker_id", primaryID, "addr", s.workerAddr(primaryID))
-			if err := s.workers.PutChunk(r.Context(), s.workerAddr(primaryID), chunkID,
-				newBytesReader(chunk), int64(n)); err != nil {
-				log.Error("put chunk primary", "chunk_id", chunkID, "worker", primaryID, "err", err)
-				s.rollback(r.Context(), objectID, log)
-				http.Error(w, "worker error", http.StatusBadGateway)
-				return
-			}
-			log.Debug("chunk stored on primary", "chunk_id", chunkID, "worker_id", primaryID)
-
-			log.Debug("pushing chunk to secondary worker", "chunk_id", chunkID, "worker_id", secondaryID, "addr", s.workerAddr(secondaryID))
-			if err := s.workers.PutChunk(r.Context(), s.workerAddr(secondaryID), chunkID,
-				newBytesReader(chunk), int64(n)); err != nil {
-				log.Error("put chunk secondary", "chunk_id", chunkID, "worker", secondaryID, "err", err)
-				s.rollback(r.Context(), objectID, log)
-				http.Error(w, "worker error", http.StatusBadGateway)
-				return
-			}
-			log.Debug("chunk stored on secondary", "chunk_id", chunkID, "worker_id", secondaryID)
-
-			if err := s.meta.UpdateChunkState(r.Context(), chunkID, models.ChunkDurable); err != nil {
-				s.rollback(r.Context(), objectID, log)
-				http.Error(w, "internal error", http.StatusInternalServerError)
-				return
-			}
-			log.Debug("chunk state updated in bbolt", "chunk_id", chunkID, "state", "DURABLE")
-			s.bloom.Add(chunkID)
-			metrics.ChunksNewTotal.Inc()
-		} else {
-			log.Debug("chunk already exists (dedup) — skipping worker push", "chunk_id", chunkID)
-			metrics.ChunksDedupTotal.Inc()
-		}
-
-		if err := s.meta.IncrementChunkRefCount(r.Context(), chunkID); err != nil {
-			s.rollback(r.Context(), objectID, log)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-
-		refs = append(refs, models.ChunkRef{
+		ref := models.ChunkRef{
 			ChunkID:     chunkID,
 			Index:       index,
 			Offset:      totalSize - int64(n),
 			Size:        n,
 			PrimaryID:   primaryID,
 			SecondaryID: secondaryID,
-		})
+		}
+		// Record the reference first: from here the garbage collector treats the chunk as live, so dedup below can never race a delete.
+		status, msg, err := s.storeChunk(r.Context(), objectID, ref, chunk, log)
+		if err != nil {
+			log.Error("store chunk", "chunk_id", chunkID, "index", index, "err", err)
+			s.rollback(r.Context(), objectID, log)
+			http.Error(w, msg, status)
+			return
+		}
+
+		refs = append(refs, ref)
 		index++
 
 		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
@@ -186,21 +131,19 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// --- save chunk refs ---
-	if err := s.meta.SaveChunkRefs(r.Context(), objectID, refs); err != nil {
-		s.rollback(r.Context(), objectID, log)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
 	// --- COMMIT: flip manifest ---
 	manifest.SizeBytes = totalSize
 	manifest.ChunkCount = len(refs)
 	manifest.Status = models.StatusCommitted
 	manifest.Checksum = objectChecksum(refs)
 	manifest.ModifiedAt = time.Now().UTC()
-	if err := s.meta.SaveObject(r.Context(), manifest); err != nil {
+	if err := s.meta.CommitObject(r.Context(), manifest); err != nil {
+		log.Error("commit object", "object_id", objectID, "err", err)
 		s.rollback(r.Context(), objectID, log)
+		if errors.Is(err, models.ErrNotStaged) {
+			http.Error(w, "upload expired before commit, retry", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -215,6 +158,101 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		Chunks:   len(refs),
 		Bytes:    totalSize,
 	})
+}
+
+// storeChunk makes one chunk durable for this upload and returns the HTTP status and message to use on failure.
+func (s *Server) storeChunk(ctx context.Context, objectID string, ref models.ChunkRef, data []byte, log *slog.Logger) (int, string, error) {
+	rec, err := s.meta.AddChunkRef(ctx, objectID, ref)
+	if errors.Is(err, models.ErrNotStaged) {
+		return http.StatusServiceUnavailable, "upload expired, retry", err
+	}
+	if err != nil {
+		return http.StatusInternalServerError, "internal error", err
+	}
+	if rec != nil && rec.State == models.ChunkPendingDelete {
+		if rec, err = s.waitChunkReleased(ctx, ref.ChunkID); err != nil {
+			return http.StatusServiceUnavailable, "chunk is being garbage collected, retry", err
+		}
+	}
+	if rec != nil && rec.State == models.ChunkDurable {
+		log.Debug("chunk already exists (dedup) — skipping worker push", "chunk_id", ref.ChunkID)
+		metrics.ChunksDedupTotal.Inc()
+		return 0, "", nil
+	}
+
+	// A PENDING record belongs to an upload that has not finished or never will, so its bytes may be missing and must be pushed again.
+	want := &models.ChunkRecord{
+		ChunkID:   ref.ChunkID,
+		SizeBytes: ref.Size,
+		State:     models.ChunkPending,
+		Replicas: []models.Replica{
+			{WorkerID: ref.PrimaryID, WorkerAddr: s.workerAddr(ref.PrimaryID)},
+			{WorkerID: ref.SecondaryID, WorkerAddr: s.workerAddr(ref.SecondaryID)},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	replace := rec != nil && !s.allOnline(rec.Replicas)
+	rec, err = s.meta.PrepareChunk(ctx, want, replace)
+	if err != nil {
+		return http.StatusInternalServerError, "internal error", err
+	}
+	if rec.State == models.ChunkDurable {
+		metrics.ChunksDedupTotal.Inc()
+		return 0, "", nil
+	}
+	log.Debug("chunk saved to bbolt", "chunk_id", ref.ChunkID, "state", "PENDING")
+	for i, rep := range rec.Replicas {
+		role := "secondary"
+		if i == 0 {
+			role = "primary"
+		}
+		log.Debug("pushing chunk to "+role+" worker", "chunk_id", ref.ChunkID, "worker_id", rep.WorkerID, "addr", s.workerAddr(rep.WorkerID))
+		if err := s.workers.PutChunk(ctx, s.workerAddr(rep.WorkerID), ref.ChunkID, newBytesReader(data), int64(len(data))); err != nil {
+			return http.StatusBadGateway, "worker error", fmt.Errorf("put chunk on %s %s: %w", role, rep.WorkerID, err)
+		}
+		log.Debug("chunk stored on "+role, "chunk_id", ref.ChunkID, "worker_id", rep.WorkerID)
+	}
+	if err := s.meta.MarkChunkDurable(ctx, ref.ChunkID); err != nil {
+		return http.StatusInternalServerError, "internal error", err
+	}
+	log.Debug("chunk state updated in bbolt", "chunk_id", ref.ChunkID, "state", "DURABLE")
+	s.bloom.Add(ref.ChunkID)
+	metrics.ChunksNewTotal.Inc()
+	return 0, "", nil
+}
+
+// waitChunkReleased waits for an in-progress garbage collection of the chunk to finish and returns its record afterwards (nil once removed).
+func (s *Server) waitChunkReleased(ctx context.Context, chunkID string) (*models.ChunkRecord, error) {
+	deadline := time.Now().Add(gcWaitTimeout)
+	for {
+		rec, err := s.meta.GetChunk(ctx, chunkID)
+		if errors.Is(err, models.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if rec.State != models.ChunkPendingDelete {
+			return rec, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, models.ErrChunkBusy
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Server) allOnline(reps []models.Replica) bool {
+	for _, r := range reps {
+		if s.health.GetWorkerStatus(r.WorkerID) != models.WorkerOnline {
+			return false
+		}
+	}
+	return len(reps) > 0
 }
 
 // rollback marks the object FAILED so it can be GC'd later.

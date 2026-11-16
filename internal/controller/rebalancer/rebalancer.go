@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/chunklock"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -146,6 +147,14 @@ func (r *Rebalancer) fixChunk(ctx context.Context, chunk *models.ChunkRecord, on
 	}
 	targetAddr := fmt.Sprintf("%s:%d", targetWorker.Address, targetWorker.Port)
 
+	// Hold the chunk lock across copy and record update, and re-check the record, so garbage collection and reconciliation never see a half-finished move.
+	unlock := chunklock.Lock(chunk.ChunkID)
+	defer unlock()
+	cur, err := r.meta.GetChunk(ctx, chunk.ChunkID)
+	if err != nil || cur.State != models.ChunkDurable || !hasReplica(cur, deadWorkerID) || hasReplica(cur, targetID) {
+		return false
+	}
+
 	// Replicate with a generous timeout
 	rCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -180,4 +189,13 @@ func (r *Rebalancer) fixChunk(ctx context.Context, chunk *models.ChunkRecord, on
 		"target", targetID,
 		"replaced", deadWorkerID)
 	return true
+}
+
+func hasReplica(chunk *models.ChunkRecord, workerID string) bool {
+	for _, r := range chunk.Replicas {
+		if r.WorkerID == workerID {
+			return true
+		}
+	}
+	return false
 }

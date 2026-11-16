@@ -52,7 +52,7 @@ func (f *fakeWorkers) PutChunk(_ context.Context, _, _ string, _ io.Reader, _ in
 func (f *fakeWorkers) GetChunk(_ context.Context, _, _ string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (f *fakeWorkers) DeleteChunk(_ context.Context, _, _ string) error   { return nil }
+func (f *fakeWorkers) DeleteChunk(_ context.Context, _, _ string) error { return nil }
 func (f *fakeWorkers) ListChunks(_ context.Context, _, _ string) ([]string, error) {
 	return nil, nil
 }

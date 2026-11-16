@@ -11,6 +11,7 @@ import (
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/config"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/api"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/gc"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/health"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metadata"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
@@ -21,8 +22,11 @@ import (
 )
 
 type controllerConfig struct {
-	addr   string
-	dbPath string
+	addr          string
+	dbPath        string
+	gcInterval    time.Duration
+	stagedTimeout time.Duration
+	orphanGrace   time.Duration
 }
 
 func loadConfig(getenv config.Getenv) (controllerConfig, error) {
@@ -31,9 +35,24 @@ func loadConfig(getenv config.Getenv) (controllerConfig, error) {
 		return controllerConfig{}, err
 	}
 	dbPath := config.Str(getenv, "DB_PATH", "data/meta.db")
+	gcInterval, err := config.PositiveInt(getenv, "GC_INTERVAL_S", 30)
+	if err != nil {
+		return controllerConfig{}, err
+	}
+	stagedTimeout, err := config.PositiveInt(getenv, "STAGED_TIMEOUT_MIN", 5)
+	if err != nil {
+		return controllerConfig{}, err
+	}
+	orphanGrace, err := config.NonNegativeInt(getenv, "ORPHAN_GRACE_S", 900)
+	if err != nil {
+		return controllerConfig{}, err
+	}
 	return controllerConfig{
-		addr:   fmt.Sprintf(":%d", port),
-		dbPath: dbPath,
+		addr:          fmt.Sprintf(":%d", port),
+		dbPath:        dbPath,
+		gcInterval:    time.Duration(gcInterval) * time.Second,
+		stagedTimeout: time.Duration(stagedTimeout) * time.Minute,
+		orphanGrace:   time.Duration(orphanGrace) * time.Second,
 	}, nil
 }
 
@@ -90,12 +109,28 @@ func main() {
 	// rather than waiting up to 30 s for the next periodic tick.
 	go watchOffline(ctx, table, ring, rb)
 
+	// Garbage collection and replica reconciliation: periodic, on demand, and whenever a worker joins or rejoins.
+	recon, err := gc.NewReconciler(store, pool, table, gc.NewCollector(store, pool, table), gc.Config{
+		Interval:      cfg.gcInterval,
+		StagedTimeout: cfg.stagedTimeout,
+		OrphanGrace:   cfg.orphanGrace,
+	})
+	if err != nil {
+		slog.Error("reconciler config", "err", err)
+		os.Exit(1)
+	}
+	reconDone := make(chan struct{})
+	go func() {
+		defer close(reconDone)
+		recon.Run(ctx) //nolint:errcheck
+	}()
+
 	// --- HTTP server ---
-	srv := api.New(cfg.addr, store, ring, pool, table)
+	srv := api.New(cfg.addr, store, ring, pool, table).WithReconciler(recon)
 	srv.PopulateBloom(context.Background())
 	slog.Info("bloom filter pre-populated from bbolt")
 
-	slog.Info("controller starting", "addr", cfg.addr, "db", cfg.dbPath)
+	slog.Info("controller starting", "addr", cfg.addr, "db", cfg.dbPath, "gc_interval", cfg.gcInterval, "staged_timeout", cfg.stagedTimeout, "orphan_grace", cfg.orphanGrace)
 
 	go func() {
 		if err := srv.Start(); err != nil {
@@ -119,6 +154,11 @@ func main() {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown error", "err", err)
+	}
+	cancel()
+	select {
+	case <-reconDone:
+	case <-shutdownCtx.Done():
 	}
 	slog.Info("controller stopped")
 }

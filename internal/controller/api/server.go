@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,11 +12,24 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/dedup"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/gc"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
 const chunkSize = 1 * 1024 * 1024 // 1 MiB — per spec §4
+
+// gcWaitTimeout bounds how long an upload waits for a garbage collection of the same chunk to finish; tests shorten it.
+var gcWaitTimeout = 10 * time.Second
+
+// deleteSweepTimeout bounds the synchronous removal of a deleted object's chunks.
+const deleteSweepTimeout = 30 * time.Second
+
+// ReconcilerControl is the part of the reconciler the HTTP API exposes; *gc.Reconciler satisfies it.
+type ReconcilerControl interface {
+	Trigger() bool
+	Status() gc.Status
+}
 
 // Server wires together all controller dependencies and serves the REST API.
 type Server struct {
@@ -27,6 +41,8 @@ type Server struct {
 	http      *http.Server
 	hedgeMs   int // milliseconds before hedging to the secondary; 0 disables hedging
 	bloom     *dedup.Filter
+	collector *gc.Collector
+	recon     ReconcilerControl
 }
 
 func New(
@@ -50,6 +66,7 @@ func New(
 		health:    health,
 		hedgeMs:   hedgeMs,
 		bloom:     dedup.New(1_000_000, 0.01), // 1 M chunks, 1 % false-positive rate
+		collector: gc.NewCollector(meta, workers, health),
 	}
 
 	mux := http.NewServeMux()
@@ -111,6 +128,26 @@ func (sw *statusWriter) Write(b []byte) (int, error) {
 		sw.written = true
 	}
 	return sw.ResponseWriter.Write(b)
+}
+
+// WithReconciler exposes the reconciler's status and manual trigger; call it at most once, before serving.
+func (s *Server) WithReconciler(rc ReconcilerControl) *Server {
+	s.recon = rc
+	s.mux.HandleFunc("GET /internal/gc/status", s.instrument("gc_status", s.handleGCStatus))
+	s.mux.HandleFunc("POST /internal/gc/run", s.instrument("gc_run", s.handleGCRun))
+	return s
+}
+
+func (s *Server) handleGCStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s.recon.Status()) //nolint:errcheck
+}
+
+// handleGCRun queues a pass and returns at once; queued is false when one was already waiting.
+func (s *Server) handleGCRun(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]bool{"queued": s.recon.Trigger()}) //nolint:errcheck
 }
 
 // Handler returns the HTTP mux. Used in tests to wrap the server in httptest.NewServer.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 )
 
 // --- Sentinel errors ---
@@ -14,6 +15,8 @@ var (
 	ErrNoWorkers       = errors.New("no healthy workers available")
 	ErrLockHeld        = errors.New("idempotency key already processing")
 	ErrVersionConflict = errors.New("version conflict")
+	ErrNotStaged       = errors.New("upload is no longer in progress")
+	ErrChunkBusy       = errors.New("chunk is being garbage collected")
 )
 
 // MetadataRepository is implemented by internal/controller/metadata.
@@ -49,6 +52,21 @@ type MetadataRepository interface {
 	DeleteChunk(ctx context.Context, chunkID string) error
 	ListChunksByState(ctx context.Context, state ChunkState) ([]*ChunkRecord, error)
 	ListUnderReplicatedChunks(ctx context.Context, minReplicas int) ([]*ChunkRecord, error)
+
+	// Crash-safe upload and garbage collection; each method is a single bbolt transaction.
+	AddChunkRef(ctx context.Context, objectID string, ref ChunkRef) (*ChunkRecord, error)
+	PrepareChunk(ctx context.Context, chunk *ChunkRecord, replace bool) (*ChunkRecord, error)
+	MarkChunkDurable(ctx context.Context, chunkID string) error
+	CommitObject(ctx context.Context, obj *ObjectManifest) error
+	MarkObjectDeleted(ctx context.Context, objectID string) error
+	FailStaleUploads(ctx context.Context, idleBefore time.Time) ([]string, error)
+	ListAllChunks(ctx context.Context) ([]*ChunkRecord, error)
+	LiveChunkRefs(ctx context.Context) (map[string]int, error)
+	ClaimChunksForDeletion(ctx context.Context, chunkIDs []string, holders map[string][]Replica) ([]*ChunkRecord, error)
+	RemoveDeletedChunk(ctx context.Context, chunkID string) error
+	AdoptChunks(ctx context.Context, holders map[string][]Replica) ([]string, error)
+	PurgeDeadObjects(ctx context.Context) (int, error)
+	SyncRefCounts(ctx context.Context) error
 
 	// Workers
 	SaveWorker(ctx context.Context, worker *WorkerRecord) error

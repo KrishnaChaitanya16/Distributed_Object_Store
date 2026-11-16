@@ -64,3 +64,41 @@ var (
 		Help: "Number of workers currently considered online by the health monitor.",
 	})
 )
+
+// Garbage collection and replica reconciliation
+var (
+	GCChunksDeletedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "minidfs_gc_chunks_deleted_total",
+		Help: "Unreferenced chunks removed from workers and bbolt by the garbage collector.",
+	})
+
+	GCObjectsPurgedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "minidfs_gc_objects_purged_total",
+		Help: "DELETED and FAILED manifests removed from bbolt.",
+	})
+
+	GCStaleUploadsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "minidfs_gc_stale_uploads_total",
+		Help: "STAGED uploads that went idle past the timeout and were marked FAILED.",
+	})
+
+	ReconcileExcessDeletedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "minidfs_reconcile_excess_deleted_total",
+		Help: "Copies removed from workers that are not listed replicas of a healthy chunk.",
+	})
+
+	ReconcileReplicasRestoredTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "minidfs_reconcile_replicas_restored_total",
+		Help: "Listed replicas that were missing on an online worker and were copied back.",
+	})
+
+	ReconcileChunksAdoptedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "minidfs_reconcile_chunks_adopted_total",
+		Help: "Referenced chunks whose bbolt record was missing and was rebuilt from worker inventories.",
+	})
+
+	ChunksLost = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "minidfs_chunks_lost",
+		Help: "Referenced chunks with no copy on any online worker in the last reconcile pass.",
+	})
+)
