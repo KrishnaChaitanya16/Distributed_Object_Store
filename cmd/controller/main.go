@@ -15,6 +15,7 @@ import (
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metadata"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/placement"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/rebalancer"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/workerclient"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/logger"
 )
@@ -78,9 +79,16 @@ func main() {
 
 	mon.Start(ctx)
 
+	// Background rebalancer: every 30 s restore RF=2 for chunks whose replica
+	// is on an offline worker. Replaces the dead slot with a healthy worker so
+	// the replica count stays at exactly 2 (no 3-replica accumulation).
+	rb := rebalancer.New(store, pool, table)
+	go rb.Run(ctx)
+
 	// When the monitor declares a worker OFFLINE, remove it from the ring
-	// so no new chunks are placed on it.
-	go watchOffline(ctx, table, ring)
+	// and immediately trigger a repair tick so RF=2 is restored in ~seconds
+	// rather than waiting up to 30 s for the next periodic tick.
+	go watchOffline(ctx, table, ring, rb)
 
 	// --- HTTP server ---
 	srv := api.New(cfg.addr, store, ring, pool, table)
@@ -115,8 +123,9 @@ func main() {
 	slog.Info("controller stopped")
 }
 
-// watchOffline listens for OFFLINE events, removes the worker from the ring and updates the gauge.
-func watchOffline(ctx context.Context, table *health.LeaseTable, ring *placement.Ring) {
+// watchOffline listens for OFFLINE events, removes the worker from the ring,
+// updates the gauge, and triggers an immediate rebalancer tick.
+func watchOffline(ctx context.Context, table *health.LeaseTable, ring *placement.Ring, rb *rebalancer.Rebalancer) {
 	ch := table.Subscribe()
 	for {
 		select {
@@ -126,6 +135,7 @@ func watchOffline(ctx context.Context, table *health.LeaseTable, ring *placement
 			slog.Warn("removing offline worker from ring", "worker_id", event.WorkerID)
 			ring.RemoveWorker(event.WorkerID)
 			metrics.WorkersOnline.Set(float64(len(ring.Workers())))
+			rb.TriggerNow(ctx) // restore RF=2 immediately, don't wait for 30s tick
 		}
 	}
 }

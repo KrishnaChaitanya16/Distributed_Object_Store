@@ -52,6 +52,12 @@ var (
 		Help: "Chunk fetches where the hedge timer fired and secondary was contacted.",
 	})
 
+	// Rebalancer
+	RebalancerRepairsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "minidfs_rebalancer_repairs_total",
+		Help: "Chunks re-replicated by the background rebalancer to restore RF=2.",
+	})
+
 	// Cluster
 	WorkersOnline = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "minidfs_workers_online",
