@@ -351,6 +351,73 @@ func TestGC_ContextCancelled_StopsGracefully(t *testing.T) {
 	}
 }
 
+// ── DELETED objects: crash-after-mark-deleted ─────────────────────────────────
+// If the controller crashes after UpdateObjectStatus(DELETED) but before
+// DecrementChunkRefCount runs, the manifest stays DELETED with orphan chunks.
+// The GC must clean these up (B2 fix: StatusDeleted added to cleanup pass).
+
+func TestGC_DeletedObject_OrphanChunks_CleanedUp(t *testing.T) {
+	store := newStore(t)
+	workers := newFakeWorkers()
+	g := New(store, workers) // production TTL — DELETED is always cleaned immediately
+
+	// Crash scenario: object was marked DELETED but chunks still have ref_count=1
+	// because the delete handler never got to DecrementChunkRefCount.
+	saveManifest(t, store, "del-obj", models.StatusDeleted, 5*time.Second)
+	saveChunkRecord(t, store, "del-c1", models.ChunkDurable, 1, "w1", "w2")
+	saveChunkRecord(t, store, "del-c2", models.ChunkDurable, 1, "w1", "w2")
+	saveChunkRefs(t, store, "del-obj", "del-c1", "del-c2")
+
+	g.Tick(context.Background())
+
+	// Manifest must be gone
+	_, err := store.GetObject(context.Background(), "del-obj")
+	assert.ErrorIs(t, err, models.ErrNotFound,
+		"DELETED manifest must be removed by GC")
+
+	// Chunks must be deleted from workers
+	ids := workers.deletedChunkIDs()
+	assert.Contains(t, ids, "del-c1", "del-c1 must be deleted from workers")
+	assert.Contains(t, ids, "del-c2", "del-c2 must be deleted from workers")
+
+	// Chunks must be gone from bbolt
+	_, err = store.GetChunk(context.Background(), "del-c1")
+	assert.ErrorIs(t, err, models.ErrNotFound)
+	_, err = store.GetChunk(context.Background(), "del-c2")
+	assert.ErrorIs(t, err, models.ErrNotFound)
+}
+
+func TestGC_DeletedObject_SharedChunk_OtherObjectUntouched(t *testing.T) {
+	store := newStore(t)
+	workers := newFakeWorkers()
+	g := New(store, workers)
+
+	// del-obj is DELETED (crash scenario); live-obj is COMMITTED.
+	// They share a chunk — the chunk must NOT be deleted from workers.
+	saveManifest(t, store, "del-obj", models.StatusDeleted, 5*time.Second)
+	saveManifest(t, store, "live-obj", models.StatusCommitted, 1*time.Minute)
+	saveChunkRecord(t, store, "shared-c", models.ChunkDurable, 2, "w1", "w2")
+	saveChunkRefs(t, store, "del-obj", "shared-c")
+	saveChunkRefs(t, store, "live-obj", "shared-c")
+
+	g.Tick(context.Background())
+
+	// del-obj gone
+	_, err := store.GetObject(context.Background(), "del-obj")
+	assert.ErrorIs(t, err, models.ErrNotFound)
+
+	// live-obj untouched
+	_, err = store.GetObject(context.Background(), "live-obj")
+	assert.NoError(t, err)
+
+	// Shared chunk ref_count decremented to 1, still on workers
+	assert.NotContains(t, workers.deletedChunkIDs(), "shared-c",
+		"chunk shared with a live object must NOT be deleted from workers")
+	chunk, err := store.GetChunk(context.Background(), "shared-c")
+	require.NoError(t, err)
+	assert.Equal(t, 1, chunk.RefCount, "ref_count must be decremented to 1")
+}
+
 // ── Idempotency GC: expired keys purged ───────────────────────────────────────
 
 func TestGC_PurgeExpiredIdempotencyKeys(t *testing.T) {

@@ -158,7 +158,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if manifest.Status == models.StatusDeleted {
+	// Only COMMITTED objects can be deleted. STAGED objects are mid-upload;
+	// FAILED objects belong to the GC; DELETED are already gone.
+	if manifest.Status != models.StatusCommitted {
 		http.Error(w, "object not found", http.StatusNotFound)
 		return
 	}
@@ -206,6 +208,13 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		if err := s.meta.DeleteChunk(r.Context(), ref.ChunkID); err != nil {
 			log.Error("delete chunk metadata", "chunk_id", ref.ChunkID, "err", err)
 		}
+	}
+
+	// Remove the manifest itself so bbolt doesn't accumulate DELETED tombstones.
+	// If this crashes, the GC's DELETED pass will clean it on the next tick.
+	if err := s.meta.DeleteObject(r.Context(), objectID); err != nil {
+		log.Warn("delete manifest", "object_id", objectID, "err", err)
+		// Non-fatal: the object is already marked DELETED; GC will finish the job.
 	}
 
 	log.Info("delete complete", "chunks", len(refs))

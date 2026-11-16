@@ -73,7 +73,7 @@ func (g *GC) Tick(ctx context.Context) {
 func (g *GC) cleanStaleObjects(ctx context.Context) {
 	now := time.Now().UTC()
 
-	for _, status := range []models.ObjectStatus{models.StatusStaged, models.StatusFailed} {
+	for _, status := range []models.ObjectStatus{models.StatusStaged, models.StatusFailed, models.StatusDeleted} {
 		objects, err := g.meta.ListObjectsByStatus(ctx, status)
 		if err != nil {
 			slog.Error("gc: list objects by status", "status", status, "err", err)
@@ -87,8 +87,8 @@ func (g *GC) cleanStaleObjects(ctx context.Context) {
 			default:
 			}
 
-			// FAILED objects are always stale (rollback already ran).
 			// STAGED objects need to be old enough that no active upload is still in progress.
+			// FAILED and DELETED objects are always stale — clean immediately.
 			if status == models.StatusStaged && now.Sub(obj.CreatedAt) < g.StagedTTL {
 				continue
 			}

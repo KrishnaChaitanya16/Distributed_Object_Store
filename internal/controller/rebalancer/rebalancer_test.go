@@ -17,6 +17,23 @@ import (
 
 // ── fakes ─────────────────────────────────────────────────────────────────────
 
+// fakePlacement implements models.PlacementStrategy with a fixed preferred target.
+type fakePlacement struct {
+	preferred string // returned by Secondary() when not empty
+	err       error  // returned instead of preferred when non-nil
+}
+
+func (f *fakePlacement) Primary(_ string) (string, error)              { return "", nil }
+func (f *fakePlacement) AddWorker(_, _ string)                         {}
+func (f *fakePlacement) RemoveWorker(_ string)                         {}
+func (f *fakePlacement) Workers() []string                             { return nil }
+func (f *fakePlacement) Secondary(_ string, _ string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.preferred, nil
+}
+
 type fakeHealth struct {
 	mu     sync.Mutex
 	online []string
@@ -111,7 +128,7 @@ func saveChunk(t *testing.T, store *metadata.MetadataStore, chunkID string, repl
 }
 
 func newRebalancer(store *metadata.MetadataStore, workers *fakeWorkers, health *fakeHealth) *Rebalancer {
-	rb := New(store, workers, health)
+	rb := New(store, workers, health, nil) // nil placement → linear-scan fallback
 	rb.interval = 10 * time.Millisecond
 	rb.rateLimit = 0
 	return rb
@@ -273,4 +290,126 @@ func TestRebalancer_InsufficientWorkers_Skips(t *testing.T) {
 	rb.tick(context.Background())
 
 	assert.Empty(t, workers.getCalls())
+}
+
+// ── Fix 2: ring-preferred secondary target ────────────────────────────────────
+
+func TestRebalancer_PrefersRingSecondaryTarget(t *testing.T) {
+	store := newTestStore(t)
+	saveWorkers(t, store, "w1", "w2", "w3", "w4")
+	// w1 online, w2 offline (dead replica), w3/w4 online
+	saveChunk(t, store, "chunk1", "w1", "w2")
+
+	health := &fakeHealth{}
+	health.setOnline("w1", "w3", "w4")
+	workers := &fakeWorkers{}
+
+	// Placement says the ring-preferred secondary for this chunk is w4.
+	pl := &fakePlacement{preferred: "w4"}
+	rb := New(store, workers, health, pl)
+	rb.rateLimit = 0
+	rb.tick(context.Background())
+
+	calls := workers.getCalls()
+	require.Len(t, calls, 1, "must trigger exactly one replication")
+	assert.Equal(t, "chunk1", calls[0].chunkID)
+	// saveWorkers assigns port 9000+(index+1): w4 is index 3 → port 9004
+	assert.Equal(t, "localhost:9004", calls[0].target,
+		"must replicate to ring-preferred worker w4 (localhost:9004)")
+
+	chunk, err := store.GetChunk(context.Background(), "chunk1")
+	require.NoError(t, err)
+	workerIDs := make([]string, len(chunk.Replicas))
+	for i, r := range chunk.Replicas {
+		workerIDs[i] = r.WorkerID
+	}
+	assert.Contains(t, workerIDs, "w4", "bbolt must record the ring-preferred worker")
+}
+
+func TestRebalancer_FallsBackToLinearScanWhenRingFails(t *testing.T) {
+	store := newTestStore(t)
+	saveWorkers(t, store, "w1", "w2", "w3")
+	saveChunk(t, store, "chunk1", "w1", "w2")
+
+	health := &fakeHealth{}
+	health.setOnline("w1", "w3")
+	workers := &fakeWorkers{}
+
+	// Placement returns an error — rebalancer must fall back to linear scan.
+	pl := &fakePlacement{err: models.ErrNoWorkers}
+	rb := New(store, workers, health, pl)
+	rb.rateLimit = 0
+	rb.tick(context.Background())
+
+	calls := workers.getCalls()
+	require.Len(t, calls, 1, "linear-scan fallback must still replicate the chunk")
+	assert.Equal(t, "chunk1", calls[0].chunkID)
+	// saveWorkers assigns port 9000+(index+1): w3 is index 2 → port 9003
+	assert.Equal(t, "localhost:9003", calls[0].target,
+		"fallback must replicate to the only remaining online non-holder (w3)")
+}
+
+// ── Edge: zero online workers → tick returns immediately, no panic ────────────
+
+func TestRebalancer_ZeroOnlineWorkers_NoAction(t *testing.T) {
+	store := newTestStore(t)
+	saveWorkers(t, store, "w1", "w2")
+	saveChunk(t, store, "chunk1", "w1", "w2")
+
+	health := &fakeHealth{}
+	// No workers online at all
+	workers := &fakeWorkers{}
+
+	rb := newRebalancer(store, workers, health)
+	assert.NotPanics(t, func() { rb.tick(context.Background()) },
+		"tick with zero online workers must not panic")
+	assert.Empty(t, workers.getCalls())
+}
+
+// ── Edge: ring-preferred target already holds the chunk → linear fallback ─────
+
+func TestRebalancer_RingPreferredAlreadyHasChunk_FallsBackToLinear(t *testing.T) {
+	store := newTestStore(t)
+	saveWorkers(t, store, "w1", "w2", "w3", "w4")
+	// w2 offline; chunk already on w1 and w2
+	saveChunk(t, store, "chunk1", "w1", "w2")
+
+	health := &fakeHealth{}
+	health.setOnline("w1", "w3", "w4")
+	workers := &fakeWorkers{}
+
+	// Ring says preferred secondary is w1 — but w1 already holds the chunk!
+	// Rebalancer must fall back to linear scan and pick w3.
+	pl := &fakePlacement{preferred: "w1"}
+	rb := New(store, workers, health, pl)
+	rb.rateLimit = 0
+	rb.tick(context.Background())
+
+	calls := workers.getCalls()
+	require.Len(t, calls, 1, "must still replicate even when ring preferred is already a holder")
+	assert.Equal(t, "chunk1", calls[0].chunkID)
+	// Linear scan: w1 excluded (already holder), w3 is first non-holder → port 9003
+	assert.Equal(t, "localhost:9003", calls[0].target,
+		"must fall back to linear-scan target when ring preferred already holds chunk")
+}
+
+// ── Edge: all online workers already hold the chunk → nothing to do ───────────
+
+func TestRebalancer_AllOnlineWorkersHoldChunk_NoAction(t *testing.T) {
+	store := newTestStore(t)
+	saveWorkers(t, store, "w1", "w2", "w3")
+	// All 3 workers online; chunk already on all 3 (unusual but possible after
+	// a manual repair followed by a failed cleanup).
+	saveChunk(t, store, "chunk1", "w1", "w2")
+
+	health := &fakeHealth{}
+	health.setOnline("w1", "w2")  // only 2 online; both already hold the chunk
+	workers := &fakeWorkers{}
+
+	rb := newRebalancer(store, workers, health)
+	rb.tick(context.Background())
+
+	// w1 and w2 are healthy — no dead slot → nothing to do.
+	assert.Empty(t, workers.getCalls(),
+		"chunk with all online workers healthy must not trigger replication")
 }

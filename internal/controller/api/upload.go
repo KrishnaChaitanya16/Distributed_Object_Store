@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -157,42 +158,53 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 				},
 				CreatedAt: time.Now().UTC(),
 			}
+			savedNew := true
 			if err := s.meta.SaveChunk(r.Context(), rec); err != nil {
-				s.rollback(r.Context(), objectID, log)
-				http.Error(w, "internal error", http.StatusInternalServerError)
-				return
+				if !errors.Is(err, models.ErrAlreadyExists) {
+					s.rollback(r.Context(), objectID, log)
+					http.Error(w, "internal error", http.StatusInternalServerError)
+					return
+				}
+				// Two uploads raced the bloom-filter check: another goroutine already
+				// saved and pushed this exact chunk. Treat as dedup — skip the worker
+				// push and fall through to IncrementRefCount.
+				savedNew = false
+				log.Debug("chunk already saved by concurrent upload — treating as dedup", "chunk_id", chunkID)
+				metrics.ChunksDedupTotal.Inc()
 			}
-			log.Debug("chunk saved to bbolt", "chunk_id", chunkID, "state", "PENDING")
+			if savedNew {
+				log.Debug("chunk saved to bbolt", "chunk_id", chunkID, "state", "PENDING")
 
-			// push to both workers
-			log.Debug("pushing chunk to primary worker", "chunk_id", chunkID, "worker_id", primaryID, "addr", s.workerAddr(primaryID))
-			if err := s.workers.PutChunk(r.Context(), s.workerAddr(primaryID), chunkID,
-				newBytesReader(chunk), int64(n)); err != nil {
-				log.Error("put chunk primary", "chunk_id", chunkID, "worker", primaryID, "err", err)
-				s.rollback(r.Context(), objectID, log)
-				http.Error(w, "worker error", http.StatusBadGateway)
-				return
-			}
-			log.Debug("chunk stored on primary", "chunk_id", chunkID, "worker_id", primaryID)
+				// push to both workers
+				log.Debug("pushing chunk to primary worker", "chunk_id", chunkID, "worker_id", primaryID, "addr", s.workerAddr(primaryID))
+				if err := s.workers.PutChunk(r.Context(), s.workerAddr(primaryID), chunkID,
+					newBytesReader(chunk), int64(n)); err != nil {
+					log.Error("put chunk primary", "chunk_id", chunkID, "worker", primaryID, "err", err)
+					s.rollback(r.Context(), objectID, log)
+					http.Error(w, "worker error", http.StatusBadGateway)
+					return
+				}
+				log.Debug("chunk stored on primary", "chunk_id", chunkID, "worker_id", primaryID)
 
-			log.Debug("pushing chunk to secondary worker", "chunk_id", chunkID, "worker_id", secondaryID, "addr", s.workerAddr(secondaryID))
-			if err := s.workers.PutChunk(r.Context(), s.workerAddr(secondaryID), chunkID,
-				newBytesReader(chunk), int64(n)); err != nil {
-				log.Error("put chunk secondary", "chunk_id", chunkID, "worker", secondaryID, "err", err)
-				s.rollback(r.Context(), objectID, log)
-				http.Error(w, "worker error", http.StatusBadGateway)
-				return
-			}
-			log.Debug("chunk stored on secondary", "chunk_id", chunkID, "worker_id", secondaryID)
+				log.Debug("pushing chunk to secondary worker", "chunk_id", chunkID, "worker_id", secondaryID, "addr", s.workerAddr(secondaryID))
+				if err := s.workers.PutChunk(r.Context(), s.workerAddr(secondaryID), chunkID,
+					newBytesReader(chunk), int64(n)); err != nil {
+					log.Error("put chunk secondary", "chunk_id", chunkID, "worker", secondaryID, "err", err)
+					s.rollback(r.Context(), objectID, log)
+					http.Error(w, "worker error", http.StatusBadGateway)
+					return
+				}
+				log.Debug("chunk stored on secondary", "chunk_id", chunkID, "worker_id", secondaryID)
 
-			if err := s.meta.UpdateChunkState(r.Context(), chunkID, models.ChunkDurable); err != nil {
-				s.rollback(r.Context(), objectID, log)
-				http.Error(w, "internal error", http.StatusInternalServerError)
-				return
+				if err := s.meta.UpdateChunkState(r.Context(), chunkID, models.ChunkDurable); err != nil {
+					s.rollback(r.Context(), objectID, log)
+					http.Error(w, "internal error", http.StatusInternalServerError)
+					return
+				}
+				log.Debug("chunk state updated in bbolt", "chunk_id", chunkID, "state", "DURABLE")
+				s.bloom.Add(chunkID)
+				metrics.ChunksNewTotal.Inc()
 			}
-			log.Debug("chunk state updated in bbolt", "chunk_id", chunkID, "state", "DURABLE")
-			s.bloom.Add(chunkID)
-			metrics.ChunksNewTotal.Inc()
 		} else {
 			log.Debug("chunk already exists (dedup) — skipping worker push", "chunk_id", chunkID)
 			metrics.ChunksDedupTotal.Inc()
