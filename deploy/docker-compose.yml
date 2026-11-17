@@ -60,6 +60,7 @@ services:
       CONTROLLER_ADDRESS: controller:8080
       HEARTBEAT_INTERVAL_S: "2"
       SCRUB_INTERVAL_S: "30"
+    cap_add: [NET_ADMIN]
     depends_on: [controller]
     restart: unless-stopped
 

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
@@ -243,63 +244,187 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		refs[i] = s.locate(r.Context(), refs[i])
 	}
 
-	emit(ctx, "download.start", "download requested", "object_id", objectID, "name", manifest.Name, "chunks", len(refs), "bytes", manifest.SizeBytes)
+	total := manifest.SizeBytes
 
-	// Verify chunk 0 before writing the status header so a fully corrupt first
-	// chunk returns 502 instead of a 200 with a truncated body.
+	// Always advertise range support.
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	// Parse an optional Range header (RFC 7233). rangeStart/rangeEnd are
+	// inclusive byte positions within the object [0, total-1].
+	rangeStart, rangeEnd, isRange, rangeErr := parseByteRange(r.Header.Get("Range"), total)
+	if rangeErr != nil {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", total))
+		http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	if !isRange {
+		rangeStart, rangeEnd = 0, total-1
+	}
+	serveBytes := rangeEnd - rangeStart + 1
+
+	emit(ctx, "download.start", "download requested", "object_id", objectID, "name", manifest.Name,
+		"chunks", len(refs), "bytes", total, "range", isRange, "range_start", rangeStart, "range_end", rangeEnd)
+
+	// Collect only the chunks that overlap [rangeStart, rangeEnd].
+	type chunkSlice struct {
+		ref        models.ChunkRef
+		sliceStart int // byte offset within the fetched chunk buf to start writing
+		sliceEnd   int // exclusive
+	}
+	var needed []chunkSlice
+	for _, ref := range refs {
+		chunkStart := ref.Offset
+		chunkEnd := ref.Offset + int64(ref.Size) - 1
+		if chunkEnd < rangeStart || chunkStart > rangeEnd {
+			continue // chunk entirely outside range — skip the network fetch
+		}
+		ss := 0
+		if rangeStart > chunkStart {
+			ss = int(rangeStart - chunkStart)
+		}
+		se := ref.Size
+		if rangeEnd < chunkEnd {
+			se = int(rangeEnd-chunkStart) + 1
+		}
+		needed = append(needed, chunkSlice{ref: ref, sliceStart: ss, sliceEnd: se})
+	}
+
+	// Pre-fetch the first needed chunk before writing headers so corruption
+	// on the first chunk returns 502 rather than a truncated 206/200 body.
 	var firstBuf []byte
 	var firstRepair func()
-	if len(refs) > 0 {
-		firstBuf, firstRepair, err = s.fetchWithFallback(r.Context(), refs[0], log)
+	if len(needed) > 0 {
+		firstBuf, firstRepair, err = s.fetchWithFallback(r.Context(), needed[0].ref, log)
 		if err != nil {
-			log.Error("chunk 0 unrecoverable", "object_id", objectID, "err", err)
+			log.Error("first chunk unrecoverable", "object_id", objectID, "err", err)
 			w.Header().Set("Content-Type", "application/json")
 			http.Error(w, `{"error":"no valid replica"}`, http.StatusBadGateway)
 			return
 		}
 	}
 
-	if manifest.ContentType != "" {
-		w.Header().Set("Content-Type", manifest.ContentType)
-	} else {
-		w.Header().Set("Content-Type", "application/octet-stream")
+	// Write response headers.
+	ct := manifest.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
 	}
+	w.Header().Set("Content-Type", ct)
 	w.Header().Set("X-Object-ID", objectID)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+manifest.Name+`"`)
-	w.Header().Set("Content-Length", strconv.FormatInt(manifest.SizeBytes, 10))
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Length", strconv.FormatInt(serveBytes, 10))
+	if isRange {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, total))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
 
-	if len(refs) == 0 {
+	if len(needed) == 0 {
 		log.Info("download complete", "chunks", 0, "bytes", 0)
 		return
 	}
 
+	// Stream the first chunk (already fetched).
 	if firstRepair != nil {
 		go firstRepair()
 	}
-	if _, writeErr := w.Write(firstBuf); writeErr != nil {
+	slice := needed[0]
+	out := firstBuf[slice.sliceStart:slice.sliceEnd]
+	if _, writeErr := w.Write(out); writeErr != nil {
 		return
 	}
-	log.Debug("chunk streamed to client", "chunk_id", refs[0].ChunkID, "bytes", len(firstBuf))
+	log.Debug("chunk streamed to client", "chunk_id", slice.ref.ChunkID, "bytes", len(out))
 
-	for _, ref := range refs[1:] {
-		buf, repair, fetchErr := s.fetchWithFallback(r.Context(), ref, log)
+	// Stream remaining chunks, fetching only the ones we need.
+	for _, cs := range needed[1:] {
+		buf, repair, fetchErr := s.fetchWithFallback(r.Context(), cs.ref, log)
 		if fetchErr != nil {
-			log.Error("chunk unrecoverable — cutting connection", "chunk_id", ref.ChunkID, "err", fetchErr)
+			log.Error("chunk unrecoverable — cutting connection", "chunk_id", cs.ref.ChunkID, "err", fetchErr)
 			return
 		}
 		if repair != nil {
 			go repair()
 		}
-		if _, writeErr := w.Write(buf); writeErr != nil {
+		out := buf[cs.sliceStart:cs.sliceEnd]
+		if _, writeErr := w.Write(out); writeErr != nil {
 			return
 		}
-		log.Debug("chunk streamed to client", "chunk_id", ref.ChunkID, "bytes", len(buf))
+		log.Debug("chunk streamed to client", "chunk_id", cs.ref.ChunkID, "bytes", len(out))
 	}
 
-	metrics.DownloadBytesTotal.Add(float64(manifest.SizeBytes))
-	log.Info("download complete", "chunks", len(refs), "bytes", manifest.SizeBytes)
-	emit(ctx, "download.done", "object streamed to the client, every chunk verified", "object_id", objectID, "chunks", len(refs), "bytes", manifest.SizeBytes)
+	metrics.DownloadBytesTotal.Add(float64(serveBytes))
+	log.Info("download complete", "chunks", len(needed), "bytes", serveBytes, "range", isRange)
+	emit(ctx, "download.done", "object streamed to the client, every chunk verified",
+		"object_id", objectID, "chunks", len(needed), "bytes", serveBytes, "range", isRange)
+}
+
+// parseByteRange parses a single RFC 7233 Range header value against a known
+// total size. Returns (start, end, true, nil) on a valid range request,
+// (0, 0, false, nil) when no Range header is present, or an error for
+// syntactically invalid or unsatisfiable ranges.
+//
+// Supports:
+//
+//	bytes=500-999   → start=500, end=999
+//	bytes=500-      → start=500, end=total-1
+//	bytes=-500      → last 500 bytes
+func parseByteRange(header string, total int64) (start, end int64, isRange bool, err error) {
+	if header == "" {
+		return 0, 0, false, nil
+	}
+	if total == 0 {
+		return 0, 0, false, errors.New("empty object")
+	}
+	if !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, false, errors.New("unsupported range unit")
+	}
+	spec := strings.TrimPrefix(header, "bytes=")
+	// Multi-range (bytes=0-100,200-300) — not supported, return 416.
+	if strings.Contains(spec, ",") {
+		return 0, 0, false, errors.New("multi-range not supported")
+	}
+	parts := strings.SplitN(spec, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, false, errors.New("malformed range")
+	}
+	rawStart, rawEnd := parts[0], parts[1]
+
+	switch {
+	case rawStart == "" && rawEnd != "":
+		// Suffix range: bytes=-N → last N bytes.
+		n, e := strconv.ParseInt(rawEnd, 10, 64)
+		if e != nil || n <= 0 {
+			return 0, 0, false, errors.New("malformed suffix range")
+		}
+		if n > total {
+			n = total
+		}
+		return total - n, total - 1, true, nil
+	case rawStart != "" && rawEnd == "":
+		// Open-ended range: bytes=N-
+		s, e := strconv.ParseInt(rawStart, 10, 64)
+		if e != nil || s < 0 {
+			return 0, 0, false, errors.New("malformed open range")
+		}
+		if s >= total {
+			return 0, 0, false, errors.New("range start beyond EOF")
+		}
+		return s, total - 1, true, nil
+	default:
+		// Explicit range: bytes=N-M
+		s, e1 := strconv.ParseInt(rawStart, 10, 64)
+		en, e2 := strconv.ParseInt(rawEnd, 10, 64)
+		if e1 != nil || e2 != nil || s < 0 || en < s {
+			return 0, 0, false, errors.New("malformed explicit range")
+		}
+		if s >= total {
+			return 0, 0, false, errors.New("range start beyond EOF")
+		}
+		if en >= total {
+			en = total - 1
+		}
+		return s, en, true, nil
+	}
 }
 
 // locations lists the workers bbolt says hold the chunk, online ones first; refs from before a rebalance fall back to their original pair.
