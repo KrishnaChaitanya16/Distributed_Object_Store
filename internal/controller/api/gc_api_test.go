@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -451,4 +452,166 @@ func TestIdempotencyKeyIsKeptWhenOnlyRecordingTheResultFailed(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, uploadWithKey(t, srv, "k", "committed anyway", true).Code, "releasing the key here would let a retry store a second copy")
 	objs, _ := h.store.ListObjectsByStatus(context.Background(), models.StatusCommitted)
 	assert.Len(t, objs, 1)
+}
+
+// ── Orphan grace period ───────────────────────────────────────────────────────
+
+// listablePool wraps chunkStore and returns real per-worker inventories to the
+// reconciler, enabling orphan-grace and excess-replica tests at the API level.
+type listablePool struct {
+	*chunkStore
+}
+
+func (lp *listablePool) ListChunks(_ context.Context, addr, _ string) ([]string, error) {
+	lp.mu.Lock()
+	defer lp.mu.Unlock()
+	var ids []string
+	prefix := addr + "|"
+	for k := range lp.chunks {
+		if strings.HasPrefix(k, prefix) {
+			ids = append(ids, strings.TrimPrefix(k, prefix))
+		}
+	}
+	return ids, nil
+}
+
+// newRecon builds a gc.Reconciler wired to the given harness store and pool.
+func newRecon(t *testing.T, h *testHarness, pool models.WorkerClientPool, grace, stagedTimeout time.Duration) *gc.Reconciler {
+	t.Helper()
+	health := &fakeHealth{online: []string{"w1", "w2", "w3", "w4"}}
+	col := gc.NewCollector(h.store, pool, health)
+	rec, err := gc.NewReconciler(h.store, pool, health, col, gc.Config{
+		Interval:      24 * time.Hour,
+		StagedTimeout: stagedTimeout,
+		OrphanGrace:   grace,
+	})
+	require.NoError(t, err)
+	return rec
+}
+
+// TestOrphanGrace_ChunkSurvivesDuringWindowThenDeleted verifies that a chunk
+// present on workers but absent from bbolt is kept during the grace period and
+// only removed once the grace window has passed.
+func TestOrphanGrace_ChunkSurvivesDuringWindowThenDeleted(t *testing.T) {
+	h := newHarness(t)
+	lpool := &listablePool{h.workers}
+	ctx := context.Background()
+
+	// Upload an object so bbolt has at least one committed record.
+	rec := rawUpload(t, h.srv, "keepme")
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// Manually inject a foreign chunk on two workers — not known to bbolt.
+	h.workers.mu.Lock()
+	h.workers.chunks["localhost:9001|orphanchunk"] = []byte("orphan data")
+	h.workers.chunks["localhost:9002|orphanchunk"] = []byte("orphan data")
+	h.workers.mu.Unlock()
+
+	grace := 150 * time.Millisecond
+	recon := newRecon(t, h, lpool, grace, 10*time.Minute)
+
+	// First pass — orphan is first seen; grace clock starts.
+	r1 := recon.Pass(ctx)
+	assert.Zero(t, r1.ChunksDeleted, "orphan must survive the first pass")
+	h.workers.mu.Lock()
+	_, stillThere := h.workers.chunks["localhost:9001|orphanchunk"]
+	h.workers.mu.Unlock()
+	assert.True(t, stillThere, "orphan chunk must still be on worker after first pass")
+
+	// Wait for grace to expire, then run a second pass.
+	time.Sleep(grace + 20*time.Millisecond)
+	r2 := recon.Pass(ctx)
+	// ChunksDeleted counts distinct chunk IDs, not individual replicas.
+	assert.Equal(t, 1, r2.ChunksDeleted, "orphan chunk ID must be deleted after grace expires")
+	h.workers.mu.Lock()
+	_, goneFromPrimary := h.workers.chunks["localhost:9001|orphanchunk"]
+	_, goneFromSecondary := h.workers.chunks["localhost:9002|orphanchunk"]
+	h.workers.mu.Unlock()
+	assert.False(t, goneFromPrimary, "orphan must be gone from primary worker")
+	assert.False(t, goneFromSecondary, "orphan must be gone from secondary worker")
+}
+
+// TestOrphanGrace_OrphanThatGetsCommittedBeforeGraceExpiry is never deleted.
+func TestOrphanGrace_OrphanThatGetsCommittedBeforeGraceExpiry(t *testing.T) {
+	h := newHarness(t)
+	lpool := &listablePool{h.workers}
+	ctx := context.Background()
+
+	// Inject orphan chunk on both workers before bbolt knows about it.
+	cid := chunkIDOf("latecommit")
+	h.workers.mu.Lock()
+	h.workers.chunks["localhost:9001|"+cid] = []byte("latecommit")
+	h.workers.chunks["localhost:9002|"+cid] = []byte("latecommit")
+	h.workers.mu.Unlock()
+
+	grace := 150 * time.Millisecond
+	recon := newRecon(t, h, lpool, grace, 10*time.Minute)
+
+	// First pass — orphan seen, clock started.
+	r1 := recon.Pass(ctx)
+	assert.Zero(t, r1.ChunksDeleted)
+
+	// Before grace expires, upload the same content → bbolt now knows the chunk.
+	uploadRec := rawUpload(t, h.srv, "latecommit")
+	require.Equal(t, http.StatusCreated, uploadRec.Code)
+
+	// Grace expires — but the chunk is now referenced; must not be deleted.
+	time.Sleep(grace + 20*time.Millisecond)
+	r2 := recon.Pass(ctx)
+	assert.Zero(t, r2.ChunksDeleted, "referenced chunk must never be deleted even after grace expires")
+}
+
+// ── Worker failure mid-upload ─────────────────────────────────────────────────
+
+// secondaryFailPool lets the primary PutChunk succeed but fails every secondary.
+type secondaryFailPool struct {
+	*chunkStore
+	calls atomic.Int32
+}
+
+func (p *secondaryFailPool) PutChunk(ctx context.Context, addr, id string, data io.Reader, size int64) error {
+	n := p.calls.Add(1)
+	if n%2 == 0 {
+		io.Copy(io.Discard, data) //nolint:errcheck
+		return errors.New("secondary worker unavailable")
+	}
+	return p.chunkStore.PutChunk(ctx, addr, id, data, size)
+}
+
+func (p *secondaryFailPool) ListChunks(ctx context.Context, addr, id string) ([]string, error) {
+	return p.chunkStore.ListChunks(ctx, addr, id)
+}
+
+// TestWorkerFailureMidUpload_StagedObjectIsCleanedByReconciler verifies that
+// when a worker returns an error mid fan-out the upload is marked FAILED and
+// the reconciler's next pass purges the FAILED manifest.
+func TestWorkerFailureMidUpload_StagedObjectIsCleanedByReconciler(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	// Use a pool where the secondary write always fails.
+	failingPool := &secondaryFailPool{chunkStore: h.workers}
+	srv := New(":0", h.store, h.ring, failingPool, &fakeHealth{})
+
+	rec := rawUpload(t, srv, "midupload content")
+	// Upload must fail — secondary worker error → 502.
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+
+	// bbolt must NOT have a COMMITTED record.
+	committed, _ := h.store.ListObjectsByStatus(ctx, models.StatusCommitted)
+	assert.Empty(t, committed, "failed upload must not be committed")
+
+	// Run the reconciler with a 1ns staged timeout so it expires immediately.
+	lpool := &listablePool{h.workers}
+	recon := newRecon(t, h, lpool, 0, time.Nanosecond)
+	recon.Pass(ctx)
+
+	// After reconciler pass: no committed objects, FAILED/STAGED manifest purged.
+	committed2, _ := h.store.ListObjectsByStatus(ctx, models.StatusCommitted)
+	assert.Empty(t, committed2, "no committed objects after reconciler pass")
+
+	failed, _ := h.store.ListObjectsByStatus(ctx, models.StatusFailed)
+	staged, _ := h.store.ListObjectsByStatus(ctx, models.StatusStaged)
+	assert.Empty(t, failed, "FAILED manifest should be purged by reconciler")
+	assert.Empty(t, staged, "STAGED manifest should be purged by reconciler")
 }
