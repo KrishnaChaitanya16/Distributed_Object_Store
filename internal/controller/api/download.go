@@ -52,6 +52,15 @@ func (s *Server) fetchVerified(ctx context.Context, addr, chunkID string, size i
 // On a primary hash mismatch (and secondary OK) it returns a non-nil repairFunc.
 // Plain network errors and 404s do NOT trigger repair.
 func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log *slog.Logger) (buf []byte, repairFunc func(), err error) {
+	// Fast-fail before attempting network calls: if both replica workers are
+	// known-offline we'd just wait for TCP timeouts on two dead hosts.
+	primaryOnline := s.health.GetWorkerStatus(ref.PrimaryID) == models.WorkerOnline
+	secondaryOnline := s.health.GetWorkerStatus(ref.SecondaryID) == models.WorkerOnline
+	if !primaryOnline && !secondaryOnline {
+		return nil, nil, fmt.Errorf("chunk %s: both replica workers offline (primary=%s secondary=%s)",
+			ref.ChunkID, ref.PrimaryID, ref.SecondaryID)
+	}
+
 	primaryAddr := s.workerAddr(ref.PrimaryID)
 	secondaryAddr := s.workerAddr(ref.SecondaryID)
 
@@ -229,7 +238,14 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Error("chunk 0 unrecoverable", "object_id", objectID, "err", err)
 			w.Header().Set("Content-Type", "application/json")
-			http.Error(w, `{"error":"no valid replica"}`, http.StatusBadGateway)
+			// Both-offline means the data may still exist — return 503 (retryable)
+			// rather than 502 (bad gateway / data corruption).
+			if s.health.GetWorkerStatus(refs[0].PrimaryID) != models.WorkerOnline &&
+				s.health.GetWorkerStatus(refs[0].SecondaryID) != models.WorkerOnline {
+				http.Error(w, `{"error":"both replica workers offline — try again later"}`, http.StatusServiceUnavailable)
+			} else {
+				http.Error(w, `{"error":"no valid replica"}`, http.StatusBadGateway)
+			}
 			return
 		}
 	}

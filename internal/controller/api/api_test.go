@@ -228,3 +228,39 @@ func TestDelete_NotFound(t *testing.T) {
 	srv.http.Handler.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
+
+func TestUpload_InsufficientWorkers_Returns503(t *testing.T) {
+	dir := t.TempDir()
+	store := mustOpenStore(t, dir)
+	pool := newFakeWorkerPool()
+	placement := &fakePlacement{workers: []string{"w1", "w2"}}
+
+	// Only 1 worker online — not enough for primary + secondary
+	srv := New(":0", store, placement, pool, &fakeHealth{online: []string{"w1"}})
+
+	body, ct := multipartBody(t, "f.txt", "hello")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Contains(t, rec.Body.String(), "insufficient")
+}
+
+func TestUpload_NoWorkers_Returns503(t *testing.T) {
+	dir := t.TempDir()
+	store := mustOpenStore(t, dir)
+	pool := newFakeWorkerPool()
+	placement := &fakePlacement{workers: []string{}}
+
+	srv := New(":0", store, placement, pool, &fakeHealth{online: []string{}})
+
+	body, ct := multipartBody(t, "f.txt", "hello")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
