@@ -274,3 +274,72 @@ func TestRange_CrossChunkBoundary_OpenEndFromChunk1(t *testing.T) {
 	assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", start, total-1, total),
 		rec.Header().Get("Content-Range"))
 }
+
+// ── Three-chunk byte-range tests ─────────────────────────────────────────────
+//
+// Upload a 3-chunk file (chunk0=1MiB 'A', chunk1=1MiB 'B', chunk2=512B 'C')
+// and exercise ranges that touch one, two, or all three chunks.
+
+func uploadThreeChunkObj(t *testing.T, srv *Server) (objectID string, totalSize int) {
+	t.Helper()
+	content := strings.Repeat("A", chunkSize) + strings.Repeat("B", chunkSize) + strings.Repeat("C", 512)
+	body, ct := multipartBody(t, "threechunk.bin", content)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusCreated, rec.Code, "upload must succeed")
+	var resp uploadResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.Equal(t, 3, resp.Chunks, "file must be split into exactly 3 chunks")
+	return resp.ObjectID, 2*chunkSize + 512
+}
+
+func TestRange_ThreeChunk_FullSpan(t *testing.T) {
+	srv, _ := newTestServer(t)
+	id, total := uploadThreeChunkObj(t, srv)
+
+	// Range spanning all three chunks: last 8 bytes of chunk0 … first 8 of chunk2.
+	start := chunkSize - 8
+	end := 2*chunkSize + 7
+	rec := rangeGet(t, srv, id, fmt.Sprintf("bytes=%d-%d", start, end))
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+
+	body, _ := io.ReadAll(rec.Body)
+	want := strings.Repeat("A", 8) + strings.Repeat("B", chunkSize) + strings.Repeat("C", 8)
+	assert.Equal(t, want, string(body))
+	assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", start, end, total),
+		rec.Header().Get("Content-Range"))
+	assert.Equal(t, fmt.Sprintf("%d", chunkSize+16), rec.Header().Get("Content-Length"))
+}
+
+func TestRange_ThreeChunk_MiddleChunkOnly(t *testing.T) {
+	srv, _ := newTestServer(t)
+	id, total := uploadThreeChunkObj(t, srv)
+
+	// Range entirely within chunk1 (the second MiB of Bs).
+	start := chunkSize + 100
+	end := chunkSize + 199
+	rec := rangeGet(t, srv, id, fmt.Sprintf("bytes=%d-%d", start, end))
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+
+	body, _ := io.ReadAll(rec.Body)
+	assert.Equal(t, strings.Repeat("B", 100), string(body))
+	assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", start, end, total),
+		rec.Header().Get("Content-Range"))
+}
+
+func TestRange_ThreeChunk_SuffixAcrossLastTwo(t *testing.T) {
+	srv, _ := newTestServer(t)
+	id, total := uploadThreeChunkObj(t, srv)
+
+	// Suffix of 600 bytes: last 88 bytes of chunk1 + all 512 bytes of chunk2.
+	rec := rangeGet(t, srv, id, "bytes=-600")
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+
+	body, _ := io.ReadAll(rec.Body)
+	assert.Len(t, body, 600)
+	assert.Equal(t, strings.Repeat("B", 88)+strings.Repeat("C", 512), string(body))
+	assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", total-600, total-1, total),
+		rec.Header().Get("Content-Range"))
+}

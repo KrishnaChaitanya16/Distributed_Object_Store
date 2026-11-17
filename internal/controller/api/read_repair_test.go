@@ -364,6 +364,46 @@ func TestReadRepair_BothLaterChunkCorrupt_ContentLengthSignalsShortWrite(t *test
 	assert.Equal(t, bytes.Join(chunks[:3], nil), rec.Body.Bytes(), "first 3 chunks must be intact")
 }
 
+// ── quarantine tests ──────────────────────────────────────────────────────────
+//
+// Quarantine = worker moves a chunk to /data/quarantine/ → GetChunk returns
+// models.ErrNotFound.  Unlike a hash mismatch, a 404 is a plain error: download
+// falls back to the secondary but read-repair does NOT fire.
+
+func TestQuarantine_ErrNotFound_FallsBackNoRepair(t *testing.T) {
+	h, pool := newRepairHarness(t)
+	content := "quarantine fallback test payload"
+	resp := uploadViaPool(t, h.srv, pool, "q.bin", content)
+	require.Equal(t, 1, resp.Chunks)
+
+	refs, _ := h.store.GetChunkRefs(context.Background(), resp.ObjectID)
+	primaryAddr := fmt.Sprintf("localhost:%d", 9000+workerNum(refs[0].PrimaryID))
+	pool.setErr(primaryAddr, refs[0].ChunkID, models.ErrNotFound)
+
+	rec := downloadViaPool(h.srv, resp.ObjectID)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, []byte(content), rec.Body.Bytes(), "secondary must serve the full object")
+
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, 0, pool.repairCount(), "ErrNotFound must not trigger read-repair")
+}
+
+func TestQuarantine_BothReplicasErrNotFound_Returns502(t *testing.T) {
+	h, pool := newRepairHarness(t)
+	content := "both quarantined payload"
+	resp := uploadViaPool(t, h.srv, pool, "q2.bin", content)
+
+	refs, _ := h.store.GetChunkRefs(context.Background(), resp.ObjectID)
+	primaryAddr := fmt.Sprintf("localhost:%d", 9000+workerNum(refs[0].PrimaryID))
+	secondaryAddr := fmt.Sprintf("localhost:%d", 9000+workerNum(refs[0].SecondaryID))
+	pool.setErr(primaryAddr, refs[0].ChunkID, models.ErrNotFound)
+	pool.setErr(secondaryAddr, refs[0].ChunkID, models.ErrNotFound)
+
+	rec := downloadViaPool(h.srv, resp.ObjectID)
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+	assert.Equal(t, 0, pool.repairCount(), "ErrNotFound on both replicas must not trigger repair")
+}
+
 // ── metadata chunk locations tests ───────────────────────────────────────────
 
 func TestMetadata_IncludesChunkLocations_3Chunks(t *testing.T) {
