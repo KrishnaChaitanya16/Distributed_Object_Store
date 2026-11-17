@@ -15,11 +15,11 @@ import (
 func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 	var req models.RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		writeError(w, r, http.StatusBadRequest, "invalid JSON")
 		return
 	}
 	if req.WorkerID == "" || req.Address == "" || req.Port == 0 {
-		http.Error(w, "worker_id, address and port are required", http.StatusBadRequest)
+		writeError(w, r, http.StatusBadRequest, "worker_id, address and port are required")
 		return
 	}
 
@@ -35,7 +35,7 @@ func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.meta.SaveWorker(r.Context(), record); err != nil {
 		slog.Error("save worker", "worker_id", req.WorkerID, "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -67,12 +67,12 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		WorkerID string `json:"worker_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WorkerID == "" {
-		http.Error(w, "worker_id required", http.StatusBadRequest)
+		writeError(w, r, http.StatusBadRequest, "worker_id required")
 		return
 	}
 	record, err := s.meta.GetWorker(r.Context(), req.WorkerID)
 	if err != nil {
-		http.Error(w, "worker not registered", http.StatusNotFound)
+		writeError(w, r, http.StatusNotFound, "worker not registered")
 		return
 	}
 

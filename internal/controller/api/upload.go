@@ -40,7 +40,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		existing, err := s.meta.AcquireIdempotencyLock(r.Context(), idempKey)
 		if err != nil {
 			log.Error("acquire idempotency lock", "key", idempKey, "err", err)
-			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+			writeError(w, r, http.StatusInternalServerError, "internal error")
 			return
 		}
 		if existing != nil {
@@ -54,7 +54,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 				log.Info("idempotency replay", "key", idempKey)
 				return
 			default: // PROCESSING
-				http.Error(w, `{"error":"request with this Idempotency-Key is already processing"}`, http.StatusConflict)
+				writeError(w, r, http.StatusConflict, "request with this Idempotency-Key is already processing")
 				return
 			}
 		}
@@ -70,12 +70,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// --- parse multipart (max 10 GB in memory buffer = 32 MB) ---
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		http.Error(w, "expected multipart/form-data with field 'file'", http.StatusBadRequest)
+		writeError(w, r, http.StatusBadRequest, "expected multipart/form-data with field 'file'")
 		return
 	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "missing 'file' field", http.StatusBadRequest)
+		writeError(w, r, http.StatusBadRequest, "missing 'file' field")
 		return
 	}
 	defer file.Close()
@@ -84,7 +84,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	var custom map[string]string
 	if raw := r.FormValue("metadata"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &custom); err != nil {
-			http.Error(w, `{"error":"metadata must be a JSON object of string values"}`, http.StatusBadRequest)
+			writeError(w, r, http.StatusBadRequest, "metadata must be a JSON object of string values")
 			return
 		}
 	}
@@ -93,7 +93,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// a primary and a secondary, and a connection-refused error mid-upload is
 	// worse than an immediate 503.
 	if online := s.health.ListOnlineWorkers(); len(online) < 2 {
-		http.Error(w, `{"error":"insufficient healthy workers — try again shortly"}`, http.StatusServiceUnavailable)
+		writeError(w, r, http.StatusServiceUnavailable, "insufficient healthy workers — try again shortly")
 		return
 	}
 
@@ -110,7 +110,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.meta.SaveObject(r.Context(), manifest); err != nil {
 		log.Error("save staged manifest", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	emit(ctx, "upload.start", "upload received, manifest staged", "object_id", objectID, "name", header.Filename, "size", header.Size, "content_type", manifest.ContentType)
@@ -142,13 +142,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		primaryID, err := s.placement.Primary(chunkID)
 		if err != nil {
 			s.rollback(r.Context(), objectID, log)
-			http.Error(w, "no healthy workers", http.StatusServiceUnavailable)
+			writeError(w, r, http.StatusServiceUnavailable, "no healthy workers")
 			return
 		}
 		secondaryID, err := s.placement.Secondary(chunkID, primaryID)
 		if err != nil {
 			s.rollback(r.Context(), objectID, log)
-			http.Error(w, "insufficient workers for replication", http.StatusServiceUnavailable)
+			writeError(w, r, http.StatusServiceUnavailable, "insufficient workers for replication")
 			return
 		}
 
@@ -169,7 +169,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			log.Error("store chunk", "chunk_id", chunkID, "index", index, "err", err)
 			emit(ctx, "upload.error", "storing a chunk failed", "object_id", objectID, "index", index, "chunk_id", chunkID, "error", err.Error())
 			s.rollback(r.Context(), objectID, log)
-			http.Error(w, msg, status)
+			writeError(w, r, status, msg)
 			return
 		}
 
@@ -181,7 +181,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		if readErr != nil {
 			s.rollback(r.Context(), objectID, log)
-			http.Error(w, "read error", http.StatusBadRequest)
+			writeError(w, r, http.StatusBadRequest, "read error")
 			return
 		}
 	}
@@ -196,10 +196,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		log.Error("commit object", "object_id", objectID, "err", err)
 		s.rollback(r.Context(), objectID, log)
 		if errors.Is(err, models.ErrNotStaged) {
-			http.Error(w, "upload expired before commit, retry", http.StatusServiceUnavailable)
+			writeError(w, r, http.StatusServiceUnavailable, "upload expired before commit, retry")
 			return
 		}
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 

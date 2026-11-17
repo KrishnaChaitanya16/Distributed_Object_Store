@@ -458,16 +458,20 @@ Validation is centralised in `internal/config/` — out-of-range values fail fas
 
 ### 3.8 Error Response Schema
 
-**Status:** RESOLVED (partial) — `{"error": "<message>"}` JSON body on all non-2xx responses.
+**Status:** RESOLVED — all non-2xx responses return a JSON body with `error`, `code`, and `request_id`.
 
 **Actual format implemented:**
 ```json
-{ "error": "object not found" }
+{
+  "error":      "object not found",
+  "code":       "not_found",
+  "request_id": "a3f8c12d9e4b7061"
+}
 ```
 
-**What was deferred:** The `code` and `request_id` fields from the draft schema were not implemented. Machine-readable error codes are useful for client retry logic but were not required by the project spec. `request_id` requires injecting a UUID at the HTTP middleware layer — deferred post-submission.
+**Implementation:** `internal/controller/api/apierror.go` — `writeError(w, r, status, msg)` helper replaces all `http.Error` calls throughout the api package. The `instrument` middleware injects a 16-hex-char random request ID into every request context and sets the `X-Request-ID` response header.
 
-**Coverage:** `objects.go` returns JSON error bodies consistently. `download.go` has some bare `http.Error` strings (not JSON-wrapped) for internal paths — acceptable for a project scope.
+**Error codes:** `bad_request` · `not_found` · `conflict` · `range_not_satisfiable` · `service_unavailable` · `bad_gateway` · `internal_error` (default).
 
 ---
 
@@ -667,4 +671,5 @@ Both controller and worker use `logger.Init()` on startup. Helper constructors `
 | 2026-11-17 | Added Section 5 — real-world evidence for every architectural choice | Viva preparation: each decision backed by published paper or production system measurement |
 | 2026-11-17 | Resolved Section 3 — all 10 PENDING decisions updated with actual implementation details | Implementation complete; design doc now matches codebase |
 | 2026-11-17 | Moved byte-range downloads from Cut Features to implemented | RFC 7233 Range: header implemented in download.go |
+| 2026-11-17 | §3.8 fully resolved — `code` + `request_id` added to all error responses | `apierror.go` writeError helper; X-Request-ID header on every response |
 

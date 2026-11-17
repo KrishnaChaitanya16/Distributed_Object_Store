@@ -222,22 +222,22 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	manifest, err := s.meta.GetObject(r.Context(), objectID)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
-			http.Error(w, "object not found", http.StatusNotFound)
+			writeError(w, r, http.StatusNotFound, "object not found")
 			return
 		}
 		log.Error("get object", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if manifest.Status != models.StatusCommitted {
-		http.Error(w, "object not available", http.StatusNotFound)
+		writeError(w, r, http.StatusNotFound, "object not available")
 		return
 	}
 
 	refs, err := s.meta.GetChunkRefs(r.Context(), objectID)
 	if err != nil {
 		log.Error("get chunk refs", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	for i := range refs {
@@ -254,7 +254,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	rangeStart, rangeEnd, isRange, rangeErr := parseByteRange(r.Header.Get("Range"), total)
 	if rangeErr != nil {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", total))
-		http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+		writeError(w, r, http.StatusRequestedRangeNotSatisfiable, "invalid range")
 		return
 	}
 	if !isRange {
@@ -297,8 +297,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		firstBuf, firstRepair, err = s.fetchWithFallback(r.Context(), needed[0].ref, log)
 		if err != nil {
 			log.Error("first chunk unrecoverable", "object_id", objectID, "err", err)
-			w.Header().Set("Content-Type", "application/json")
-			http.Error(w, `{"error":"no valid replica"}`, http.StatusBadGateway)
+			writeError(w, r, http.StatusBadGateway, "no valid replica")
 			return
 		}
 	}
