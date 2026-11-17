@@ -393,6 +393,77 @@ func TestRebalancer_RingPreferredAlreadyHasChunk_FallsBackToLinear(t *testing.T)
 		"must fall back to linear-scan target when ring preferred already holds chunk")
 }
 
+// ── Run loop and TriggerNow ───────────────────────────────────────────────────
+
+func TestRebalancer_Run_RepairsOnTick(t *testing.T) {
+	store := newTestStore(t)
+	saveWorkers(t, store, "w1", "w2", "w3")
+	saveChunk(t, store, "chunk1", "w1", "w2")
+
+	health := &fakeHealth{}
+	health.setOnline("w1", "w3") // w2 offline → needs repair
+	workers := &fakeWorkers{}
+
+	rb := newRebalancer(store, workers, health)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rb.Run(ctx)
+	}()
+
+	// Wait for at least one replication call, then cancel.
+	require.Eventually(t, func() bool {
+		return len(workers.getCalls()) >= 1
+	}, 500*time.Millisecond, 5*time.Millisecond, "Run must trigger repair within timeout")
+
+	cancel()
+	<-done
+	assert.Equal(t, "chunk1", workers.getCalls()[0].chunkID)
+}
+
+func TestRebalancer_Run_StopsOnContextCancel(t *testing.T) {
+	store := newTestStore(t)
+	health := &fakeHealth{}
+	health.setOnline("w1", "w2")
+	workers := &fakeWorkers{}
+
+	rb := newRebalancer(store, workers, health)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rb.Run(ctx)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not stop after context cancel")
+	}
+}
+
+func TestRebalancer_TriggerNow_RepairsAsync(t *testing.T) {
+	store := newTestStore(t)
+	saveWorkers(t, store, "w1", "w2", "w3")
+	saveChunk(t, store, "chunk1", "w1", "w2")
+
+	health := &fakeHealth{}
+	health.setOnline("w1", "w3") // w2 offline
+	workers := &fakeWorkers{}
+
+	rb := newRebalancer(store, workers, health)
+	rb.TriggerNow(context.Background())
+
+	require.Eventually(t, func() bool {
+		return len(workers.getCalls()) >= 1
+	}, 500*time.Millisecond, 5*time.Millisecond, "TriggerNow must fire a repair asynchronously")
+	assert.Equal(t, "chunk1", workers.getCalls()[0].chunkID)
+}
+
 // ── Edge: all online workers already hold the chunk → nothing to do ───────────
 
 func TestRebalancer_AllOnlineWorkersHoldChunk_NoAction(t *testing.T) {
