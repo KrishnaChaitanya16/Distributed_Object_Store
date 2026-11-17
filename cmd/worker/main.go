@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +18,7 @@ import (
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/registration"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/scrubber"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/storage"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/logger"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
@@ -35,17 +36,23 @@ type workerConfig struct {
 func main() {
 	cfg, err := loadConfig(os.Getenv)
 	if err != nil {
-		log.Fatalf("worker config: %v", err)
+		slog.Error("worker config", "err", err)
+		os.Exit(1)
 	}
-	log.Printf("worker %s starting on :%d data=%s controller=%s scrub=%s", cfg.workerID, cfg.port, cfg.dataDir, cfg.controllerAddr, cfg.scrubInterval)
+
+	logger.Init()
+
+	slog.Info("worker starting", "worker_id", cfg.workerID, "port", cfg.port, "data_dir", cfg.dataDir, "controller", cfg.controllerAddr, "scrub_interval", cfg.scrubInterval)
 
 	store, err := storage.New(cfg.dataDir)
 	if err != nil {
-		log.Fatalf("open chunk store: %v", err)
+		slog.Error("open chunk store", "err", err)
+		os.Exit(1)
 	}
 	scrub, err := scrubber.New(store, scrubber.Config{Interval: cfg.scrubInterval, Pause: cfg.scrubPause})
 	if err != nil {
-		log.Fatalf("scrubber: %v", err)
+		slog.Error("scrubber init", "err", err)
+		os.Exit(1)
 	}
 	selfAddr := net.JoinHostPort(cfg.address, strconv.Itoa(cfg.port))
 	peer := &http.Client{Timeout: 30 * time.Second}
@@ -53,11 +60,13 @@ func main() {
 	// Listen before registering so the controller can reach us as soon as it knows about us.
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
-		log.Fatalf("listen: %v", err)
+		slog.Error("listen", "err", err)
+		os.Exit(1)
 	}
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server: %v", err)
+			slog.Error("http server", "err", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -83,17 +92,18 @@ func main() {
 	}()
 
 	<-ctx.Done()
-	log.Printf("worker %s shutting down", cfg.workerID)
+	slog.Info("worker shutting down", "worker_id", cfg.workerID)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown: %v", err)
+		slog.Error("shutdown error", "err", err)
 	}
 	select {
 	case <-scrubDone:
 	case <-shutdownCtx.Done():
-		log.Printf("shutdown: scrubber did not stop in time")
+		slog.Warn("shutdown: scrubber did not stop in time")
 	}
+	slog.Info("worker stopped", "worker_id", cfg.workerID)
 }
 
 func loadConfig(getenv config.Getenv) (workerConfig, error) {
