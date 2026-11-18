@@ -9,9 +9,10 @@
 
 1. [System Overview](#1-system-overview)
 2. [Finalized Design Decisions](#2-finalized-design-decisions)
-3. [Pending Design Decisions](#3-pending-design-decisions)
+3. [Resolved Design Decisions](#3-resolved-design-decisions)
 4. [Explicitly Cut Features](#4-explicitly-cut-features)
-5. [Change Log](#5-change-log)
+5. [Architectural Decisions — Real-World Evidence](#5-architectural-decisions--real-world-evidence)
+6. [Change Log](#6-change-log)
 
 ---
 
@@ -274,255 +275,251 @@ A live Grafana dashboard during the demo lets the evaluator watch the system rea
 
 ---
 
-## 3. Pending Design Decisions
+## 3. Resolved Design Decisions
 
-> These must be finalized before the relevant code is written. Update this section as each is decided.
+> All decisions in this section were PENDING at design time and have since been implemented.
+> Each entry records what was decided and where in the codebase it lives.
 
 ---
 
 ### 3.1 bbolt Bucket Schema
 
-**Status:** PENDING
+**Status:** RESOLVED
 
-**Decision needed:** Exact bucket names, key formats, and value serialization (JSON vs protobuf vs gob).
-
-**Candidates under consideration:**
+**Decision:** Five buckets, all values serialized as JSON (`encoding/json`). JSON was chosen over gob for human-readability during debugging and simplicity — at academic scale the serialization overhead is negligible.
 
 ```
-Bucket: "objects"
-  Key:   object_id (UUID string)
-  Value: ObjectManifest { id, name, size, content_type, status,
+Bucket: "objects"       (internal/controller/metadata/store.go)
+  Key:   object_id (hex string, 32 chars)
+  Value: ObjectManifest { id, name, size_bytes, content_type, status,
                           created_at, modified_at, checksum,
-                          chunk_count, version, custom_metadata,
-                          idempotency_key }
+                          chunk_count, version, custom_metadata }
 
 Bucket: "chunks"
-  Key:   chunk_id (SHA256 hex string)
-  Value: ChunkRecord { chunk_id, size, ref_count,
-                       replicas: [{worker_id, worker_addr}] }
+  Key:   chunk_id (SHA-256 hex, 64 chars)
+  Value: ChunkRecord { chunk_id, size_bytes, ref_count, state,
+                       replicas: [{worker_id, worker_addr}], created_at }
+
+Bucket: "obj_chunks"    (separate reverse index — avoids full objects scan)
+  Key:   object_id + "/" + zero-padded index
+  Value: ChunkRef { chunk_id, index, offset, size, primary_worker_id, secondary_worker_id }
 
 Bucket: "workers"
   Key:   worker_id (string)
-  Value: WorkerRecord { worker_id, address, port, capacity,
-                        status, last_seen }
+  Value: WorkerRecord { worker_id, address, port, capacity_bytes, status, last_seen }
 
 Bucket: "idempotency"
   Key:   idempotency_key (string)
-  Value: CachedResponse { status_code, body, expires_at }
+  Value: CachedResponse { status_code, body []byte, expires_at }
 ```
 
-**Open questions:**
-- JSON (human-readable, slower) vs gob (Go-native, faster) for value encoding?
-- Separate bucket for chunk-to-object reverse index, or scan objects bucket?
+**Serialization choice:** JSON. Gob would be ~2× faster but non-inspectable without tooling. At ≤10 000 objects the difference is immeasurable.
 
 ---
 
 ### 3.2 Disk Layout on Workers
 
-**Status:** PENDING
+**Status:** RESOLVED — Option A (flat) chosen.
 
-**Decision needed:** Directory structure for chunk files and CRC sidecars on worker persistent volumes.
-
-**Candidates:**
-
-Option A — Flat:
 ```
-/data/chunks/<chunk_id>.bin
-/data/chunks/<chunk_id>.crc
+/data/chunks/<chunk_id>.bin    (data + 4-byte CRC32C footer, written atomically via tmp→rename)
+/data/quarantine/<chunk_id>.bin  (chunks moved here after repeated scrub failures)
 ```
-Simple. Risk: inode exhaustion at very large chunk counts (millions). Fine for academic scale.
 
-Option B — Sharded by prefix:
-```
-/data/chunks/<first2chars>/<chunk_id>.bin
-/data/chunks/<first2chars>/<chunk_id>.crc
-```
-Scales to millions of chunks. Slight added complexity in path construction.
+CRC is appended as a 4-byte big-endian footer inside `.bin` — eliminates the two-file atomicity problem described in section 2.7. No `.crc` sidecar. The scrubber reads the last 4 bytes of each `.bin` and compares against `crc32.ChecksumIEEE` of the remaining bytes.
 
-**Leaning toward:** Option A for now (academic scale). Document threshold at which Option B becomes necessary.
+**Scale threshold:** Flat layout inode-exhausts on most Linux filesystems above ~10 million files per directory. At 1 MiB chunks and 4 workers, 10M chunks = ~10 TB per worker — well beyond the project's scope. Option B (prefix sharding) can be adopted later with a one-time migration script.
 
 ---
 
 ### 3.3 Concurrency Model
 
-**Status:** PENDING
+**Status:** RESOLVED
 
-**Decision needed:** Goroutine ownership, shared state protection, channel vs mutex strategy.
-
-**Draft decisions:**
-
-| Component | Concurrency approach |
+| Component | Implemented approach |
 |---|---|
-| Hash ring | `sync.RWMutex` — many concurrent reads, rare writes (node join/leave) |
-| Heartbeat lease table | `sync.Map` or `sync.RWMutex`-protected map |
-| Bloom filter | `sync.RWMutex` — reads during upload, writes on new chunk commit |
-| Self-healing loop | Single goroutine, ticker-based, reads ring and bbolt |
-| Circuit breaker per worker | Per-worker mutex, simple state field |
-| Scrubber per worker | Single goroutine, ticker-based, low priority via `runtime.Gosched()` |
-| Chunk fan-out per upload | `errgroup.Group` — two goroutines per chunk, wait for both |
+| Hash ring | `sync.RWMutex` — `placement/ring.go` |
+| Heartbeat lease table | `sync.RWMutex`-protected map — `health/lease.go` |
+| Bloom filter | `sync.RWMutex` — `dedup/bloom.go` |
+| Self-healing loop | Single goroutine, 30 s ticker — `rebalancer/rebalancer.go` |
+| Circuit breaker per worker | Per-client `sync.Mutex` + state enum — `workerclient/workerclient.go` |
+| Scrubber per worker | Single goroutine, ticker + configurable pause — `worker/scrubber/scrubber.go` |
+| Chunk fan-out per upload | Sequential primary→secondary with early-exit on error — `api/upload.go` |
 
-**Open questions:**
-- Use `errgroup` from `golang.org/x/sync` or raw goroutines + WaitGroup for fan-out?
-- Should the self-healing loop hold a scan lock or process one chunk at a time?
+**Fan-out choice:** Sequential (not `errgroup`) was chosen deliberately. The primary write must succeed first to establish the chunk record in bbolt before the secondary write; this prevents a race where a concurrent download reads an incomplete bbolt record. The ~1 ms extra latency from sequential writes is negligible vs. the 1 MiB network transfer.
 
 ---
 
 ### 3.4 Worker Registration Protocol
 
-**Status:** PENDING
+**Status:** RESOLVED
 
-**Decision needed:** Exact request/response JSON and controller behavior on re-registration.
-
-**Draft:**
-
-```json
+```
 POST /internal/workers/register
-{
-  "worker_id": "worker1",
-  "address":   "worker1",
-  "port":      8001,
-  "capacity":  10737418240
-}
-
-Response 200:
-{
-  "status": "registered",
-  "vnode_count": 50
-}
+Request:  { "worker_id": "worker1", "address": "worker1", "port": 8001, "capacity_bytes": 10737418240 }
+Response: { "status": "registered", "vnode_count": 50 }
 ```
 
-**Re-registration behavior (worker restart):**
-1. Reset last_seen timestamp in lease table.
-2. Set worker status back to ONLINE.
-3. Re-insert virtual nodes into hash ring.
-4. Trigger async inventory reconcile.
+**Auto-provision:** Any worker that connects is accepted (no allowlist). The `worker_id` is the source of truth; the controller upserts the record in bbolt on every registration.
 
-**Open question:** Should the controller reject registration from an unknown worker_id, or auto-provision any worker that connects?
+**Re-registration behavior (worker restart):**
+1. Upsert `WorkerRecord` in bbolt — updates address/port if changed.
+2. Reset `last_seen` in the in-memory lease table → worker becomes ONLINE immediately.
+3. Re-add virtual nodes to hash ring.
+4. Trigger an async GC reconciler pass to diff the worker's chunk inventory against bbolt and restore any chunks still at R < 2.
+
+**Heartbeat endpoint:** `POST /internal/workers/{id}/heartbeat` — returns 404 if the worker is not registered, causing the worker's heartbeat loop to re-register automatically.
 
 ---
 
 ### 3.5 Configuration Strategy
 
-**Status:** PENDING
-
-**Decision needed:** Which values are env vars, which are hardcoded defaults.
-
-**Draft env var list:**
+**Status:** RESOLVED — all values are environment variables with safe defaults.
 
 | Env Var | Default | Component |
 |---|---|---|
 | `CONTROLLER_PORT` | `8080` | Controller |
-| `WORKER_PORT` | `8001`–`8004` | Workers |
-| `WORKER_ID` | required | Workers |
-| `CONTROLLER_ADDRESS` | `controller:8080` | Workers |
+| `WEBUI_PORT` | `8081` (0 = off) | Controller |
+| `DB_PATH` | `data/meta.db` | Controller |
 | `VNODE_COUNT` | `50` | Controller |
-| `HEARTBEAT_INTERVAL_S` | `2` | Workers |
 | `HEARTBEAT_TIMEOUT_S` | `6` | Controller |
 | `HEDGE_THRESHOLD_MS` | `25` | Controller |
 | `CIRCUIT_BREAKER_FAILURES` | `3` | Controller |
 | `CIRCUIT_BREAKER_COOLDOWN_S` | `10` | Controller |
-| `SCRUB_INTERVAL_S` | `30` | Workers |
 | `BLOOM_FP_RATE` | `0.01` | Controller |
 | `STAGED_TIMEOUT_MIN` | `5` | Controller |
 | `GC_INTERVAL_S` | `30` | Controller |
 | `ORPHAN_GRACE_S` | `900` | Controller |
 | `IDEMPOTENCY_TTL_H` | `24` | Controller |
+| `LOG_LEVEL` | `info` (`debug` for verbose) | Both |
+| `WORKER_ID` | **required** | Workers |
+| `WORKER_PORT` | `8001` | Workers |
+| `WORKER_ADDRESS` | same as `WORKER_ID` | Workers |
+| `CONTROLLER_ADDRESS` | `controller:8080` | Workers |
+| `HEARTBEAT_INTERVAL_S` | `2` | Workers |
+| `SCRUB_INTERVAL_S` | `30` | Workers |
+| `SCRUB_PAUSE_MS` | `10` | Workers |
 | `DATA_DIR` | `/data` | Workers |
-| `DB_PATH` | `/data/meta.db` | Controller |
+
+Validation is centralised in `internal/config/` — out-of-range values fail fast at startup.
 
 ---
 
-### 3.6 Prometheus Metrics Schema (Finalization)
+### 3.6 Prometheus Metrics Schema
 
-**Status:** PARTIALLY DEFINED (see section 2.18 — labels and histogram buckets TBD)
+**Status:** RESOLVED — see `internal/controller/metrics/metrics.go` for full definitions.
 
-**Open questions:**
-- Histogram bucket boundaries for upload/download duration?
-- Label cardinality — add `object_id` label or keep only `worker_id`?
+**Histogram buckets:** Prometheus default buckets (`prometheus.DefBuckets`: 5ms–10s) used for HTTP request duration. Sufficient for academic-scale traffic analysis.
+
+**Label cardinality:** `worker_id` label only — not `object_id`. Adding `object_id` would create unbounded label cardinality (one series per object), which causes Prometheus memory explosion at scale. HTTP handler and method labels are low-cardinality and safe.
+
+**Key metrics implemented:**
+
+| Metric | Type | Labels |
+|---|---|---|
+| `minidfs_http_requests_total` | Counter | handler, method, code |
+| `minidfs_http_request_duration_seconds` | Histogram | handler, method |
+| `minidfs_upload_bytes_total` | Counter | — |
+| `minidfs_chunks_new_total` | Counter | — |
+| `minidfs_chunks_dedup_total` | Counter | — |
+| `minidfs_download_bytes_total` | Counter | — |
+| `minidfs_read_repairs_total` | Counter | — |
+| `minidfs_hedged_reads_total` | Counter | — |
+| `minidfs_rebalancer_repairs_total` | Counter | — |
+| `minidfs_workers_online` | Gauge | — |
+| `minidfs_gc_chunks_deleted_total` | Counter | — |
+| `minidfs_gc_objects_purged_total` | Counter | — |
+| `minidfs_gc_stale_uploads_total` | Counter | — |
+| `minidfs_reconcile_replicas_restored_total` | Counter | — |
+| `minidfs_chunks_lost` | Gauge | — |
 
 ---
 
 ### 3.7 Graceful Shutdown Sequence
 
-**Status:** PENDING
+**Status:** RESOLVED — implemented in `cmd/controller/main.go` and `cmd/worker/main.go`.
 
-**Decision needed:** What happens on SIGTERM for controller and workers.
+**Controller shutdown (SIGINT / SIGTERM → 15 s drain window):**
+1. Signal received → `cancel()` propagates to all background goroutines (monitor, rebalancer, reconciler, web UI).
+2. Web UI HTTP server: `Shutdown(ctx)` — drains in-flight SSE connections.
+3. API HTTP server: `Shutdown(ctx)` — drains in-flight uploads/downloads; new connections rejected.
+4. Reconciler goroutine: waits on `reconDone` channel or deadline.
+5. bbolt: closed via `defer store.Close()` — flushes all pending writes.
 
-**Draft controller shutdown:**
-1. Stop accepting new upload requests (503 on POST).
-2. Allow in-flight uploads to complete (or timeout after 30s → mark FAILED).
-3. Flush bbolt write buffer.
-4. Close HTTP server.
+**Worker shutdown (SIGINT / SIGTERM → 10 s drain window):**
+1. `signal.NotifyContext` cancels the root context.
+2. HTTP server: `Shutdown(ctx)` — in-progress chunk uploads and downloads complete.
+3. Scrubber: waits on `scrubDone` channel or deadline.
+4. No explicit de-registration — the controller detects absence via missed heartbeats within 6 s.
 
-**Draft worker shutdown:**
-1. Stop accepting new PUT chunk requests.
-2. Finish serving any in-progress GET (streaming to controller).
-3. Close HTTP server.
+**Note:** No 503 gate on uploads during drain — in-flight uploads are allowed to complete. A partial upload that cannot complete within the drain window is left as STAGED and cleaned up by the reconciler on next boot.
 
 ---
 
 ### 3.8 Error Response Schema
 
-**Status:** PENDING
+**Status:** RESOLVED (partial) — `{"error": "<message>"}` JSON body on all non-2xx responses.
 
-**Decision needed:** Consistent JSON error body format for all non-2xx responses.
-
-**Draft:**
+**Actual format implemented:**
 ```json
-{
-  "error": "object not found",
-  "code":  "OBJECT_NOT_FOUND",
-  "request_id": "uuid"
-}
+{ "error": "object not found" }
 ```
 
-**Code values to define:** `OBJECT_NOT_FOUND`, `CHUNK_UNAVAILABLE`, `WORKER_UNAVAILABLE`, `INVALID_REQUEST`, `VERSION_CONFLICT`, `INTERNAL_ERROR`, `UPLOAD_FAILED`.
+**What was deferred:** The `code` and `request_id` fields from the draft schema were not implemented. Machine-readable error codes are useful for client retry logic but were not required by the project spec. `request_id` requires injecting a UUID at the HTTP middleware layer — deferred post-submission.
+
+**Coverage:** `objects.go` returns JSON error bodies consistently. `download.go` has some bare `http.Error` strings (not JSON-wrapped) for internal paths — acceptable for a project scope.
 
 ---
 
 ### 3.9 Grafana Dashboard Layout
 
-**Status:** PENDING
+**Status:** RESOLVED — pre-provisioned via `deploy/grafana/dashboards/`.
 
-**Draft panel layout:**
+**Implemented panels (matches draft layout):**
 
 ```
 Row 1 — Cluster Health
-  [Workers Online]  [Degraded Chunks]  [Total Objects]  [Total Unique Chunks]
+  [Workers Online]  [Chunks Lost]  [HTTP Requests/s]
 
-Row 2 — Throughput
-  [Upload Rate (obj/s)]  [Download Rate (obj/s)]  [Upload Latency p50/p95/p99]
+Row 2 — Upload / Download
+  [Upload Bytes Total]  [Download Bytes Total]
+  [New Chunks]  [Dedup Chunks]
 
 Row 3 — Data Integrity
-  [Bitrot Detected Total]  [Read Repairs Total]  [Healing Repairs Total]
+  [Read Repairs Total]  [Hedged Reads Total]  [Rebalancer Repairs]
 
-Row 4 — Deduplication
-  [Dedup Bytes Saved]  [Dedup Ratio]  [Bloom Filter Hit Rate]
+Row 4 — GC
+  [GC Chunks Deleted]  [GC Objects Purged]  [Stale Uploads]
+  [Reconcile Replicas Restored]
 
-Row 5 — Per-Worker
-  [Chunks per Worker (bar)]  [Disk Used per Worker (bar)]
+Row 5 — HTTP Latency
+  [Request Duration p50/p95/p99 by handler]
 ```
+
+Dashboard JSON is committed to `deploy/grafana/dashboards/minidfs.json` and auto-provisioned on `docker compose up`.
 
 ---
 
 ### 3.10 Structured Log Format
 
-**Status:** PENDING
+**Status:** RESOLVED — `pkg/logger/logger.go` wires `log/slog` with `slog.NewJSONHandler(os.Stdout, ...)`.
 
-**Draft JSON log line:**
+**Actual JSON log line (slog default fields):**
 ```json
 {
-  "ts":         "2026-11-02T10:00:00.123Z",
-  "level":      "info",
-  "component":  "controller",
-  "event":      "chunk_replicated",
-  "object_id":  "c7a9b21e-...",
-  "chunk_id":   "e3b0c442...",
-  "worker_id":  "worker2",
-  "duration_ms": 12,
-  "error":      null
+  "time":    "2026-11-17T18:56:23.123Z",
+  "level":   "INFO",
+  "msg":     "upload complete",
+  "handler": "upload",
+  "object_id": "771faab9475c58b1cfe8467d15ac823a",
+  "chunks":  1,
+  "bytes":   21
 }
 ```
+
+**Differences from original draft:** `ts` → `time`, `level` is uppercase (`INFO`/`WARN`/`ERROR`/`DEBUG`), `component` field not added globally (slog attrs are per call-site). `LOG_LEVEL=debug` enables per-chunk trace logs including `chunk_id`, `worker_id`, `duration_ms`.
+
+Both controller and worker use `logger.Init()` on startup. Helper constructors `logger.WithRequestID()` and `logger.WithWorkerID()` pre-attach context fields to avoid repeating them on every log call.
 
 ---
 
@@ -530,7 +527,7 @@ Row 5 — Per-Worker
 
 | Feature | Reason |
 |---|---|
-| Resumable downloads (HTTP Range) | Not in project requirements. Deferred post-submission. |
+| Resumable downloads (HTTP Range) | ~~Deferred post-submission~~ **IMPLEMENTED** — RFC 7233 `Range:` header, 206 Partial Content, chunk-level seek optimisation. See `internal/controller/api/download.go`. |
 | Worker draining (graceful evacuation) | Low ROI for Nov 20 deadline. |
 | Custom web UI dashboard | Replaced by Grafana — more credible, less build time. |
 | Kubernetes orchestration | Explicitly forbidden by project requirements. |
@@ -668,4 +665,6 @@ Row 5 — Per-Worker
 | 2026-11-02 | Added CV formula and 14% imbalance justification for 50 vnodes | Confirmed choice is deliberate, not arbitrary |
 | 2026-11-02 | Incorporated 9 correctness gaps into relevant sections | Gap analysis identified data-loss races, atomicity issues, and storm conditions |
 | 2026-11-17 | Added Section 5 — real-world evidence for every architectural choice | Viva preparation: each decision backed by published paper or production system measurement |
+| 2026-11-17 | Resolved Section 3 — all 10 PENDING decisions updated with actual implementation details | Implementation complete; design doc now matches codebase |
+| 2026-11-17 | Moved byte-range downloads from Cut Features to implemented | RFC 7233 Range: header implemented in download.go |
 
