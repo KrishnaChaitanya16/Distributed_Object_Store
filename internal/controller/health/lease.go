@@ -61,6 +61,23 @@ func (lt *LeaseTable) ListOnlineWorkers() []string {
 	return online
 }
 
+// WorkerLease is one worker's health as the lease table sees it.
+type WorkerLease struct {
+	Status   models.WorkerStatus `json:"status"`
+	LastSeen time.Time           `json:"last_seen"`
+}
+
+// Snapshot returns the status and last heartbeat of every worker the table has seen.
+func (lt *LeaseTable) Snapshot() map[string]WorkerLease {
+	lt.mu.RLock()
+	defer lt.mu.RUnlock()
+	out := make(map[string]WorkerLease, len(lt.status))
+	for id, st := range lt.status {
+		out[id] = WorkerLease{Status: st, LastSeen: lt.lastSeen[id]}
+	}
+	return out
+}
+
 // Subscribe registers a new subscriber and returns a read-only channel.
 // Each OFFLINE event is sent to every subscriber (fan-out).
 // The caller must drain the channel — sends are non-blocking and events are

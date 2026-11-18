@@ -11,5 +11,5 @@ FROM alpine:3.20
 RUN apk --no-cache add ca-certificates
 WORKDIR /app
 COPY --from=builder /controller .
-EXPOSE 8080
+EXPOSE 8080 8081
 ENTRYPOINT ["/app/controller"]

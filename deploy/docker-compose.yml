@@ -27,6 +27,7 @@ services:
       - controller-data:/data
     environment:
       CONTROLLER_PORT: "8080"
+      WEBUI_PORT: "8081"
       DB_PATH: /data/meta.db
       LOG_LEVEL: "${LOG_LEVEL:-info}"
       VNODE_COUNT: "50"
@@ -59,6 +60,7 @@ services:
       CONTROLLER_ADDRESS: controller:8080
       HEARTBEAT_INTERVAL_S: "2"
       SCRUB_INTERVAL_S: "30"
+    cap_add: [NET_ADMIN]
     depends_on: [controller]
     restart: unless-stopped
 

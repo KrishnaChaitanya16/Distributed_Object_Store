@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,6 +19,7 @@ import (
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/placement"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/rebalancer"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/web"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/workerclient"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/logger"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
@@ -28,6 +31,10 @@ type controllerConfig struct {
 	gcInterval    time.Duration
 	stagedTimeout time.Duration
 	orphanGrace   time.Duration
+	webPort       int
+	webDir        string
+	demoMode      bool
+	dockerSocket  string
 }
 
 func loadConfig(getenv config.Getenv) (controllerConfig, error) {
@@ -48,7 +55,19 @@ func loadConfig(getenv config.Getenv) (controllerConfig, error) {
 	if err != nil {
 		return controllerConfig{}, err
 	}
+	webPort, err := config.OptionalPort(getenv, "WEBUI_PORT", 8081)
+	if err != nil {
+		return controllerConfig{}, err
+	}
+	demoMode, err := config.Bool(getenv, "DEMO_MODE", false)
+	if err != nil {
+		return controllerConfig{}, err
+	}
 	return controllerConfig{
+		webPort:       webPort,
+		webDir:        config.Str(getenv, "WEBUI_DIR", ""),
+		demoMode:      demoMode,
+		dockerSocket:  config.Str(getenv, "DOCKER_SOCKET", "/var/run/docker.sock"),
 		addr:          fmt.Sprintf(":%d", port),
 		dbPath:        dbPath,
 		gcInterval:    time.Duration(gcInterval) * time.Second,
@@ -146,6 +165,33 @@ func main() {
 		}
 	}()
 
+	// Demo UI: dashboard, live event stream and the REST API on one origin; off when WEBUI_PORT=0.
+	var uiHTTP *http.Server
+	if cfg.webPort > 0 {
+		var demo *web.Docker
+		if cfg.demoMode {
+			demo = web.NewDocker(cfg.dockerSocket)
+			slog.Warn("DEMO_MODE is on: the UI can stop containers and damage chunks through the Docker socket", "socket", cfg.dockerSocket)
+		}
+		ui := web.New(web.Deps{
+			StaticDir: cfg.webDir,
+			Meta:      store, Workers: pool, Ring: ring, Health: table, Bloom: srv.Bloom(), Recon: recon, API: srv.Handler(), Demo: demo,
+			Config: web.Config{
+				ChunkSize: api.ChunkSize, ReplicationLevel: 2, HedgeMs: srv.HedgeMs(),
+				LeaseTimeoutS: int(health.LeaseTimeout.Seconds()), HeartbeatS: int(health.HeartbeatInterval.Seconds()),
+				GCIntervalS: int(cfg.gcInterval.Seconds()), StagedTimeoutMin: int(cfg.stagedTimeout.Minutes()), OrphanGraceS: int(cfg.orphanGrace.Seconds()),
+			},
+		})
+		go ui.Run(ctx)
+		uiHTTP = &http.Server{Addr: fmt.Sprintf(":%d", cfg.webPort), Handler: ui.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+		go func() {
+			slog.Info("web UI listening", "addr", uiHTTP.Addr, "demo_mode", cfg.demoMode, "static_dir", cfg.webDir)
+			if err := uiHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("web UI error", "err", err)
+			}
+		}()
+	}
+
 	// --- graceful shutdown on SIGINT / SIGTERM ---
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -159,6 +205,9 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
 
+	if uiHTTP != nil {
+		uiHTTP.Shutdown(shutdownCtx) //nolint:errcheck
+	}
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown error", "err", err)
 	}

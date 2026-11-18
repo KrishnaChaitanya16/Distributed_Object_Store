@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/chunklock"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/events"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -199,6 +200,7 @@ func (r *Rebalancer) fixChunk(ctx context.Context, chunk *models.ChunkRecord, on
 			"chunk_id", chunk.ChunkID, "worker", targetID, "err", err)
 	}
 
+	events.Emit("rebalance.copy", "dead replica replaced on another worker", "chunk_id", chunk.ChunkID, "from", source.WorkerID, "to", targetID, "replaced", deadWorkerID)
 	slog.Info("rebalancer: RF=2 restored",
 		"chunk_id", chunk.ChunkID,
 		"source", source.WorkerID,

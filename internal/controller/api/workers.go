@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/events"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -44,6 +45,7 @@ func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 	metrics.WorkersOnline.Set(float64(len(s.placement.Workers())))
 
 	slog.Info("worker registered", "worker_id", req.WorkerID, "addr", workerAddr)
+	events.Emit("worker.register", "worker registered with the controller", "worker", req.WorkerID, "addr", workerAddr)
 	// A (re)registering worker may bring back copies that were replaced while it was away, so reconcile now.
 	if s.recon != nil {
 		s.recon.Trigger()
