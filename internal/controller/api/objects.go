@@ -17,7 +17,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	objects, err := s.meta.ListObjectsByStatus(r.Context(), models.StatusCommitted)
 	if err != nil {
 		slog.Error("list objects", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -45,22 +45,21 @@ func (s *Server) handleGetMetadata(w http.ResponseWriter, r *http.Request) {
 	manifest, err := s.meta.GetObject(r.Context(), objectID)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
-			http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
+			writeError(w, r, http.StatusNotFound, "object not found")
 			return
 		}
-		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if manifest.Status != models.StatusCommitted {
-		http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
+		writeError(w, r, http.StatusNotFound, "object not found")
 		return
 	}
 
 	refs, err := s.meta.GetChunkRefs(r.Context(), objectID)
 	if err != nil {
 		slog.Error("get chunk refs for metadata", "object_id", objectID, "err", err)
-		w.Header().Set("Content-Type", "application/json")
-		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -94,13 +93,13 @@ func (s *Server) handlePatchMetadata(w http.ResponseWriter, r *http.Request) {
 	// Parse body first so bad JSON gives 400 before we touch the store.
 	var patch map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
-		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		writeError(w, r, http.StatusBadRequest, "invalid JSON")
 		return
 	}
 
 	ifMatch, err := parseIfMatch(r.Header.Get("If-Match"))
 	if err != nil {
-		http.Error(w, `{"error":"invalid If-Match"}`, http.StatusBadRequest)
+		writeError(w, r, http.StatusBadRequest, "invalid If-Match")
 		return
 	}
 
@@ -108,13 +107,13 @@ func (s *Server) handlePatchMetadata(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, models.ErrNotFound):
-			http.Error(w, `{"error":"object not found"}`, http.StatusNotFound)
+			writeError(w, r, http.StatusNotFound, "object not found")
 		case errors.Is(err, models.ErrVersionConflict):
 			log.Warn("version conflict on patch", "object_id", objectID)
-			http.Error(w, `{"error":"version conflict — re-read and retry"}`, http.StatusConflict)
+			writeError(w, r, http.StatusConflict, "version conflict — re-read and retry")
 		default:
 			log.Error("patch metadata", "err", err)
-			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+			writeError(w, r, http.StatusInternalServerError, "internal error")
 		}
 		return
 	}
@@ -152,35 +151,35 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	manifest, err := s.meta.GetObject(r.Context(), objectID)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
-			http.Error(w, "object not found", http.StatusNotFound)
+			writeError(w, r, http.StatusNotFound, "object not found")
 			return
 		}
 		log.Error("get object", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 	// Only COMMITTED objects can be deleted. STAGED objects are mid-upload;
 	// FAILED objects belong to the GC; DELETED are already gone.
 	if manifest.Status != models.StatusCommitted {
-		http.Error(w, "object not found", http.StatusNotFound)
+		writeError(w, r, http.StatusNotFound, "object not found")
 		return
 	}
 
 	refs, err := s.meta.GetChunkRefs(r.Context(), objectID)
 	if err != nil {
 		log.Error("get chunk refs", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	// The COMMITTED to DELETED flip is atomic, so of two concurrent deletes exactly one succeeds.
 	if err := s.meta.MarkObjectDeleted(r.Context(), objectID); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
-			http.Error(w, "object not found", http.StatusNotFound)
+			writeError(w, r, http.StatusNotFound, "object not found")
 			return
 		}
 		log.Error("mark deleted", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 		return
 	}
 

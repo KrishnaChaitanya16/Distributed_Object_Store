@@ -546,3 +546,43 @@ func TestPurgeExpiredIdempotencyKeysDropsOnlyExpired(t *testing.T) {
 	assert.Equal(t, "", keyStatus(t, s, "expired"))
 	assert.Equal(t, "COMMITTED", keyStatus(t, s, "alive"))
 }
+
+// ── ListAllChunks ──────────────────────────────────────────────────────────────
+
+func TestListAllChunks_ReturnsAllStates(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	chunkIn(t, s, "c-pending", models.ChunkPending, "w1")
+	chunkIn(t, s, "c-durable", models.ChunkDurable, "w1", "w2")
+	chunkIn(t, s, "c-delete", models.ChunkPendingDelete, "w1")
+
+	chunks, err := s.ListAllChunks(ctx)
+	require.NoError(t, err)
+	require.Len(t, chunks, 3, "must return all three chunks regardless of state")
+
+	ids := make(map[string]models.ChunkState, len(chunks))
+	for _, c := range chunks {
+		ids[c.ChunkID] = c.State
+	}
+	assert.Equal(t, models.ChunkPending, ids["c-pending"])
+	assert.Equal(t, models.ChunkDurable, ids["c-durable"])
+	assert.Equal(t, models.ChunkPendingDelete, ids["c-delete"])
+}
+
+func TestListAllChunks_Empty(t *testing.T) {
+	s := newTestStore(t)
+	chunks, err := s.ListAllChunks(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, chunks)
+}
+
+func TestListAllChunks_PreservesReplicas(t *testing.T) {
+	s := newTestStore(t)
+	chunkIn(t, s, "c1", models.ChunkDurable, "w1", "w2")
+
+	chunks, err := s.ListAllChunks(context.Background())
+	require.NoError(t, err)
+	require.Len(t, chunks, 1)
+	assert.Len(t, chunks[0].Replicas, 2, "replicas must round-trip through ListAllChunks")
+}

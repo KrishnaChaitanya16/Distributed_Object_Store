@@ -98,10 +98,15 @@ func New(
 	return s
 }
 
-// instrument wraps a handler with Prometheus request counting and latency recording.
+// instrument wraps a handler with Prometheus request counting, latency recording,
+// and request ID injection. Every request gets a unique X-Request-ID header so
+// clients can correlate error responses with server logs.
 func (s *Server) instrument(name string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+		reqID := newRequestID()
+		w.Header().Set("X-Request-ID", reqID)
+		r = r.WithContext(context.WithValue(r.Context(), requestIDKey{}, reqID))
 		start := time.Now()
 		next(rw, r)
 		dur := time.Since(start).Seconds()
