@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -185,4 +186,91 @@ func TestRange_FullObjectViaRange(t *testing.T) {
 	require.Equal(t, http.StatusPartialContent, rec.Code)
 	body, _ := io.ReadAll(rec.Body)
 	assert.Equal(t, rangeContent, string(body))
+}
+
+// ── Cross-chunk byte-range tests ─────────────────────────────────────────────
+//
+// These tests upload a file larger than chunkSize (1 MiB) so the object is
+// split into two chunks, then request a byte range that spans the chunk
+// boundary.  This exercises the chunk-skip optimisation in handleDownload:
+// only the two overlapping chunks should be fetched, not the whole file.
+
+func uploadTwoChunkObj(t *testing.T, srv *Server) (objectID string, totalSize int) {
+	t.Helper()
+	// chunk0: 1 MiB of 'A', chunk1: 512 bytes of 'B'
+	content := strings.Repeat("A", chunkSize) + strings.Repeat("B", 512)
+	body, ct := multipartBody(t, "twochunk.bin", content)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusCreated, rec.Code, "upload must succeed")
+	var resp uploadResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.Equal(t, 2, resp.Chunks, "file must be split into exactly 2 chunks")
+	return resp.ObjectID, chunkSize + 512
+}
+
+func TestRange_CrossChunkBoundary_ReturnsCorrectBytes(t *testing.T) {
+	srv, _ := newTestServer(t)
+	id, total := uploadTwoChunkObj(t, srv)
+
+	// Request 16 bytes straddling the boundary: last 8 bytes of chunk0 + first 8 of chunk1.
+	last8OfChunk0 := chunkSize - 8
+	first8OfChunk1 := chunkSize + 7
+	rec := rangeGet(t, srv, id, fmt.Sprintf("bytes=%d-%d", last8OfChunk0, first8OfChunk1))
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+
+	want := strings.Repeat("A", 8) + strings.Repeat("B", 8)
+	body, _ := io.ReadAll(rec.Body)
+	assert.Equal(t, want, string(body), "boundary bytes must be correct")
+	assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", last8OfChunk0, first8OfChunk1, total),
+		rec.Header().Get("Content-Range"))
+	assert.Equal(t, "16", rec.Header().Get("Content-Length"))
+}
+
+func TestRange_CrossChunkBoundary_SecondChunkOnly(t *testing.T) {
+	srv, _ := newTestServer(t)
+	id, total := uploadTwoChunkObj(t, srv)
+
+	// Range entirely within chunk1 (the 512-byte tail).
+	start := chunkSize + 100
+	end := chunkSize + 199
+	rec := rangeGet(t, srv, id, fmt.Sprintf("bytes=%d-%d", start, end))
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+
+	body, _ := io.ReadAll(rec.Body)
+	assert.Equal(t, strings.Repeat("B", 100), string(body))
+	assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", start, end, total),
+		rec.Header().Get("Content-Range"))
+}
+
+func TestRange_CrossChunkBoundary_SuffixSpansChunks(t *testing.T) {
+	srv, _ := newTestServer(t)
+	id, total := uploadTwoChunkObj(t, srv)
+
+	// Suffix range of 600 bytes: last 88 bytes of chunk0 + all 512 bytes of chunk1.
+	rec := rangeGet(t, srv, id, "bytes=-600")
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+
+	body, _ := io.ReadAll(rec.Body)
+	assert.Len(t, body, 600)
+	assert.Equal(t, strings.Repeat("A", 88)+strings.Repeat("B", 512), string(body))
+	assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", total-600, total-1, total),
+		rec.Header().Get("Content-Range"))
+}
+
+func TestRange_CrossChunkBoundary_OpenEndFromChunk1(t *testing.T) {
+	srv, _ := newTestServer(t)
+	id, total := uploadTwoChunkObj(t, srv)
+
+	// Open-end range starting 10 bytes into chunk1: returns remaining 502 bytes.
+	start := chunkSize + 10
+	rec := rangeGet(t, srv, id, fmt.Sprintf("bytes=%d-", start))
+	require.Equal(t, http.StatusPartialContent, rec.Code)
+
+	body, _ := io.ReadAll(rec.Body)
+	assert.Equal(t, strings.Repeat("B", 502), string(body))
+	assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", start, total-1, total),
+		rec.Header().Get("Content-Range"))
 }
