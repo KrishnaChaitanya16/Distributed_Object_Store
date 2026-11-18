@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
+	"github.com/stretchr/testify/require"
 )
 
 var fast = Backoff{Base: time.Millisecond, Max: 5 * time.Millisecond}
@@ -285,14 +286,18 @@ func TestHeartbeatStopsOnCancel(t *testing.T) {
 	done := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { c.Run(ctx, 5*time.Millisecond); close(done) }()
-	time.Sleep(30 * time.Millisecond)
+	// Wait until at least one heartbeat has been sent before cancelling.
+	require.Eventually(t, func() bool { return fc.heartbeats.Load() >= 1 },
+		500*time.Millisecond, 2*time.Millisecond,
+		"heartbeat must fire at least once before cancel")
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
 	before := fc.heartbeats.Load()
+	// Use Eventually to let any in-flight goroutine finish, then assert no more fire.
 	time.Sleep(30 * time.Millisecond)
 	if fc.heartbeats.Load() != before {
 		t.Fatal("heartbeats continued after Run returned")

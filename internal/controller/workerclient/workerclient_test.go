@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -51,6 +52,66 @@ func TestCircuitBreaker_StaysOpenBeforeTimeout(t *testing.T) {
 	for i := 0; i < failureThreshold; i++ {
 		cb.RecordFailure()
 	}
+	assert.ErrorIs(t, cb.Allow(), ErrCircuitOpen)
+}
+
+// CB5 — still OPEN 1ms before the cooldown window expires.
+func TestCircuitBreaker_StillOpen_OneMillisecondBeforeCooldown(t *testing.T) {
+	cb := newCircuitBreaker()
+	for i := 0; i < failureThreshold; i++ {
+		cb.RecordFailure()
+	}
+	cb.mu.Lock()
+	cb.lastFailureAt = cb.lastFailureAt.Add(-(halfOpenTimeout - time.Millisecond))
+	cb.mu.Unlock()
+
+	assert.ErrorIs(t, cb.Allow(), ErrCircuitOpen,
+		"CB5: breaker must remain OPEN 1ms before the cooldown expires")
+}
+
+// CB6 — transitions to HALF_OPEN exactly after the cooldown.
+func TestCircuitBreaker_TransitionsToHalfOpen_AfterCooldown(t *testing.T) {
+	cb := newCircuitBreaker()
+	for i := 0; i < failureThreshold; i++ {
+		cb.RecordFailure()
+	}
+	cb.mu.Lock()
+	cb.lastFailureAt = cb.lastFailureAt.Add(-(halfOpenTimeout + time.Millisecond))
+	cb.mu.Unlock()
+
+	assert.NoError(t, cb.Allow(), "CB6: must allow probe request after cooldown")
+	assert.Equal(t, "HALF_OPEN", cb.State())
+}
+
+// CB7 — HALF_OPEN probe succeeds → CLOSED.
+func TestCircuitBreaker_HalfOpenProbeSucceeds_ReturnsClosed(t *testing.T) {
+	cb := newCircuitBreaker()
+	for i := 0; i < failureThreshold; i++ {
+		cb.RecordFailure()
+	}
+	cb.mu.Lock()
+	cb.lastFailureAt = cb.lastFailureAt.Add(-(halfOpenTimeout + time.Millisecond))
+	cb.mu.Unlock()
+	cb.Allow() //nolint:errcheck // enter HALF_OPEN
+
+	cb.RecordSuccess()
+	assert.Equal(t, "CLOSED", cb.State(), "CB7: successful probe must close the breaker")
+	assert.NoError(t, cb.Allow())
+}
+
+// CB8 — HALF_OPEN probe fails → back to OPEN.
+func TestCircuitBreaker_HalfOpenProbeFails_ReopensBreaker(t *testing.T) {
+	cb := newCircuitBreaker()
+	for i := 0; i < failureThreshold; i++ {
+		cb.RecordFailure()
+	}
+	cb.mu.Lock()
+	cb.lastFailureAt = cb.lastFailureAt.Add(-(halfOpenTimeout + time.Millisecond))
+	cb.mu.Unlock()
+	cb.Allow() //nolint:errcheck // enter HALF_OPEN
+
+	cb.RecordFailure()
+	assert.Equal(t, "OPEN", cb.State(), "CB8: failed probe must re-open the breaker")
 	assert.ErrorIs(t, cb.Allow(), ErrCircuitOpen)
 }
 
