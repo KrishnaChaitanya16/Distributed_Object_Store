@@ -110,3 +110,47 @@ BENCH_OUT=/some/dir go test ... -bench 'Dedup_'       # also writes the full per
 ```
 
 The workload benchmarks skip with a clear message when the layers have not been fetched.
+
+---
+
+## 2. RF=2 availability during worker failure
+
+### Workload
+Small single-chunk objects of 64 KiB of random bytes on a 4-worker cluster, then workers are killed (the server is closed, so connections are refused) and **every object is downloaded again**. A download counts as *served* only if the body's SHA-256 equals what was uploaded; a 200 with the wrong bytes would be counted as *corrupt*. Two replication modes: RF=2 (normal) and RF=1 (`Server.UseSingleReplica()`, only the primary stores the chunk). Run at the spec's 200 objects and at 2000 for tighter statistics.
+
+### Results
+
+| Scenario | Objects | Served correctly | Unavailable | Corrupt bytes | Status of unavailable |
+|---|---|---|---|---|---|
+| **RF=2, 1 worker down** | 200 / 2000 | **100% / 100%** | 0 / 0 | **0** | n/a |
+| RF=1, 1 worker down | 200 / 2000 | 77.5% / 77.3% | 45 / 455 | 0 | 503 |
+| **RF=2, 2 workers down** | 200 / 2000 | 89.5% / 90.8% | 21 / 184 | **0** | 503 |
+| RF=1, 2 workers down | 200 / 2000 | 55.5% / 55.3% | 89 / 895 | 0 | 503 |
+
+| Latency (200 objects, RF=2, 1 worker down) | Before failure | After failure |
+|---|---|---|
+| P50 | 0.38 ms | 0.40 ms |
+| P99 | 0.97 ms | 1.02 ms |
+| Objects that had to be served from their secondary | | 48 |
+
+**Detection time.** With real heartbeats (every 2 s) and the health monitor, a killed worker was declared OFFLINE after **5.3, 5.3 and 6.5 seconds** (lease 6 s, monitor tick 1 s).
+
+### What the data says
+1. **With RF=2 every object survives one worker failure: 100% served, 0 corrupt, no measurable latency penalty.** About a fifth of the objects (48 of 200, 476 of 2000) had their primary on the dead worker and were served from the secondary.
+2. **RF=1 loses exactly the dead worker's share: 22.8% of 2000 objects** (the spec said ~25%). The share is not exactly 1/4 because placement follows the consistent-hash ring, where worker2 owns 22.4% of the hash space (see the ring view). The first 200-object run lost only 16.5%; that was sampling noise (it is 200 draws from a 22% chance), which is why the 2000-object run exists.
+3. **RF=2 tolerates one failure, not two, and fails honestly.** With two workers down, the objects whose two copies were *both* on those workers (9.2% of 2000) are unavailable and answer **503**, never wrong bytes. In every run the number of unavailable objects equals exactly the number whose every copy was on a dead worker; the benchmark fails if it does not.
+4. **The post-failure latency penalty is nil here because the failure is the cheap kind.** A refused connection fails in microseconds, so falling back to the secondary costs nothing visible. A worker that *hangs* instead of refusing is the case hedged reads exist for (benchmark 4).
+
+### A defect this benchmark found and fixed
+For the first ~6 seconds after a worker died (until its lease expires), a download of an object with both copies on dead workers answered **502 Bad Gateway** instead of the spec's **503 Service Unavailable**, because the controller chose the status from the health table, which had not noticed yet. It now classifies by what actually happened: if both replicas failed because the worker could not be reached (connection refused, timeout, or an open circuit breaker), the answer is 503 at once. Workers that answer but hold no valid data still give 502. Before the fix the RF=1 run returned 502 for 455 of 457 unavailable objects; after it, 503 for all.
+
+### Honest limits
+* Failure here means "connection refused", the fastest way to fail. Slow failures are measured in benchmark 4.
+* A worker is killed once and not restored; recovery is benchmark 5.
+* One machine, loopback network, so latencies are lower than a real network. The availability percentages do not depend on that.
+
+### Reproduce
+```bash
+go test ./test/benchmarks/ -run '^$' -bench 'Availability_' -benchtime=1x
+BENCH_OBJECTS=2000 go test ./test/benchmarks/ -run '^$' -bench 'Availability_RF' -benchtime=1x
+```
