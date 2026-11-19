@@ -239,3 +239,30 @@ func TestPool_CircuitBreaker_OpensOnRepeatedFailures(t *testing.T) {
 	err := pool.PutChunk(context.Background(), addr, "x", strings.NewReader(""), 0)
 	assert.ErrorIs(t, err, ErrCircuitOpen)
 }
+
+func TestPool_CancelledCallsDoNotOpenTheBreaker(t *testing.T) {
+	srv, pool := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		_, _ = w.Write([]byte("x"))
+	})
+	defer srv.Close()
+	for i := 0; i < failureThreshold*2; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { time.Sleep(5 * time.Millisecond); cancel() }()
+		_, err := pool.GetChunk(ctx, workerAddr(srv), "abc")
+		require.ErrorIs(t, err, context.Canceled)
+	}
+	assert.Equal(t, "CLOSED", pool.breaker(workerAddr(srv)).State(), "cancelled reads are not worker failures")
+	rc, err := pool.GetChunk(context.Background(), workerAddr(srv), "abc")
+	require.NoError(t, err)
+	rc.Close()
+}
+
+func TestPool_RealFailuresStillOpenTheBreaker(t *testing.T) {
+	srv, pool := newTestServer(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) })
+	defer srv.Close()
+	for i := 0; i < failureThreshold; i++ {
+		_, _ = pool.GetChunk(context.Background(), workerAddr(srv), "abc")
+	}
+	assert.Equal(t, "OPEN", pool.breaker(workerAddr(srv)).State())
+}

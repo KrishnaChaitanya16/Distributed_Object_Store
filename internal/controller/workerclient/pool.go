@@ -57,6 +57,9 @@ func (p *Pool) call(workerAddr string, fn func(*workerClient) error) error {
 	}
 	c := newWorkerClient("http://"+workerAddr, p.http)
 	err := fn(c)
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
 	if err != nil {
 		cb.RecordFailure()
 		slog.Debug("worker call failed", "worker_addr", workerAddr, "failures", cb.failures, "state", cb.State(), "err", err)
