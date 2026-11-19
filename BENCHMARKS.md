@@ -154,3 +154,54 @@ For the first ~6 seconds after a worker died (until its lease expires), a downlo
 go test ./test/benchmarks/ -run '^$' -bench 'Availability_' -benchtime=1x
 BENCH_OBJECTS=2000 go test ./test/benchmarks/ -run '^$' -bench 'Availability_RF' -benchtime=1x
 ```
+
+---
+
+## 3. Scrubber: corruption caught before a user reads it
+
+### Workload
+50 objects of 2 MiB (100 chunks, 200 copies on 4 workers). **10 distinct chunks** each lose one copy to corruption, chosen with a fixed seed so every run damages the same copies. Two kinds of damage:
+
+* **Footer:** the 4-byte CRC32C footer of the chunk file is overwritten with `0xFF` (the spec's scenario). The data bytes are untouched.
+* **Data (bit rot):** one byte inside the chunk's data is inverted.
+
+Each is run without a scrubber and with one scrubber pass on every worker before reading. "Direct reads" fetch every chunk straight from the workers (what a store with no end-to-end check would deliver); "controller" downloads go through MiniDFS, which verifies the SHA-256 of every chunk.
+
+### Results
+
+| | Footer, no scrubber | Footer, scrubber | Data, no scrubber | Data, scrubber |
+|---|---|---|---|---|
+| Corrupt copies injected | 10 | 10 | 10 | 10 |
+| Direct worker reads returning wrong bytes (of 200) | 0 | 0 | **10** | **10** (measured before the pass) |
+| **Objects the controller served with wrong bytes** | **0** | **0** | **0** | **0** |
+| Objects served correctly (of 50) | 50 | 50 | 50 | 50 |
+| SHA-256 mismatches hit by readers (each a wasted fetch + fallback) | 0 | 0 | **6** | **0** |
+| Copies quarantined by the scrubber | 0 | **10** | 0 | **10** |
+| Corrupt copies still on disk after the run | 10 | **0** | 4 | **0** |
+| Slowest scrubber pass | n/a | 34 ms | n/a | 37 ms |
+
+**Scrubber pass duration** (one worker, 1000 chunks of 1 MiB, 10 corrupted, all 10 found):
+
+| Pause between chunks | Time for 1000 chunks | Throughput |
+|---|---|---|
+| none | **0.57 s** | 1741 chunks/s (~1.7 GiB/s) |
+| 10 ms (the default) | **13.6 s** | 73 chunks/s |
+
+### What the data says
+1. **The failure the spec worries about, wrong bytes delivered to a user, never happens in either configuration, and the scrubber is not what prevents it.** The controller checks the SHA-256 of every chunk it reads, so it served 0 wrong objects even with no scrubber and real bit rot. Without that check, 10 of the 200 chunk reads from workers would have returned corrupt data silently.
+2. **What the scrubber adds is finding damage that no read would ever surface.**
+   * **Footer damage is invisible to readers:** the data is fine, so every read succeeds and nothing complains; the corrupt footer stays forever. Only the scrubber finds it (10 of 10).
+   * **Bit rot on a copy that is never read stays hidden.** Without a scrubber, 4 of the 10 damaged copies were still on disk after all 50 objects were downloaded: they were the secondary copies, which reads never touch. The other 6 were primaries, hit by a read and healed by read-repair. A damaged secondary is a latent single point of failure: lose the other copy and the data is gone.
+   * **It removes the cost of discovering damage on the read path.** Without a scrubber 6 readers each fetched a corrupt 1 MiB chunk, failed the hash check and fell back; with the scrubber 0 did.
+3. **The scrubber quarantines but does not restore.** After the pass, 10 chunks had fewer than 2 good copies. Bringing them back to 2 is the reconciler's job (benchmark 5); the two together close the window.
+4. **A scrubber pass is cheap but deliberately paced.** CRC32C verification runs at ~1.7 GiB/s on this machine, so 1000 chunks take 0.57 s flat out. The default 10 ms pause between chunks (to avoid competing with reads) turns that into 13.6 s per 1000 chunks, about 73 chunks/s. It is a setting (`SCRUB_PAUSE_MS`), so the trade between background load and time-to-detect is explicit.
+
+### Honest limits
+* The spec's expected "silent corrupt data returned: possible" applies only to a system without end-to-end verification. MiniDFS has one, so that column reads 0 everywhere. The direct-read row shows what would have happened without it.
+* The scrub passes ran on a quiet cluster with the OS page cache warm; a cold disk is slower.
+* Corruption was injected into one copy per chunk. If both copies of a chunk are corrupted before anyone notices, the data is lost, and the system reports it as unavailable instead of returning bad bytes (benchmark 2).
+
+### Reproduce
+```bash
+go test ./test/benchmarks/ -run '^$' -bench 'Scrubber_' -benchtime=1x
+```
