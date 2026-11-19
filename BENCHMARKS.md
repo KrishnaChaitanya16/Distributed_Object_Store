@@ -57,6 +57,38 @@ Each result says what workload produced it. The method and the questions come fr
    The ~2 ms the spec expected is the cost of recording the chunk reference, which an upload needs whether or not dedup is on, so it is not dedup overhead.
 5. **Bloom false-positive rate: 0 of 633 questions** (0 of 625 for random media). The filter is sized for 1 M chunks at 1%, and these runs fill about 0.05% of it, so the expected rate at this fill is about 1e-24. "Below 1%" holds trivially; this run says nothing about the filter near capacity.
 
+### Follow-up: do images that really share a base reach the expected savings?
+
+A reviewer pointed out that the first result came from a poor workload and suggested three Python versions (`python:3.11-slim`, `3.10-slim`, `3.9-slim`) on the assumption that they "all share the same Debian base layer". That assumption was **checked before running anything, and it is false**: the three images have no layer in common (every layer ID and every layer SHA-256 differs), because they were built on different dates (2025-10-31, 2026-10-06, 2026-11-05) from different Debian snapshots. The measurement was run anyway, together with a workload that does share a base by construction.
+
+**Workload C, Python versions** (`BenchmarkDedup_PythonVersions`): the layers of 3.11, 3.10 and 3.9 slim, in that order (365 MiB, 372 chunks).
+
+**Workload D, shared base, constructed** (`BenchmarkDedup_SharedBase`): three application images built `FROM python:3.11-slim`, each adding one layer with `pip install` of `requests`, `flask` and `numpy` (481 MiB, 488 chunks). This is how many images in a real registry relate to each other; it is built by `build_app_images.sh`, not pulled.
+
+| Metric | C: Python versions, dedup on | C: dedup off | D: shared base, dedup on | D: dedup off |
+|---|---|---|---|---|
+| Chunks deduplicated | **54 of 372 (14.5%)** | 0 | **252 of 488 (51.6%)** | 0 |
+| Bytes sent to workers | 623 MiB | 731 MiB | **467 MiB** | 961 MiB |
+| **Storage ratio** | **1.17x** | n/a | **2.06x** | n/a |
+| Upload time per chunk | 22.2 ms | 25.7 ms | **13.6 ms** | 26.7 ms |
+| Bloom false positives | 0 of 372 | n/a | 0 of 488 | n/a |
+
+| Image (dedup on / off) | Chunks written / deduplicated | Sent to workers | Upload time |
+|---|---|---|---|
+| C: python:3.11-slim | 126 / 0 | 247 / 247 MiB | 3.04 s / 3.21 s |
+| C: python:3.10-slim | 71 / **52** | **138** / 242 MiB (-43%) | **2.04 s** / 3.14 s (1.5x faster) |
+| C: python:3.9-slim | 121 / 2 | 237 / 241 MiB | 3.18 s / 3.23 s |
+| D: app-requests (first) | 140 / 0 | 275 / 275 MiB | 3.34 s / 3.62 s |
+| D: app-flask | 16 / **126** | **31** / 279 MiB (-89%) | **0.92 s** / 3.77 s (**4.1x faster**) |
+| D: app-numpy | 80 / **126** | **160** / 407 MiB (-61%) | **2.38 s** / 5.62 s (2.4x faster) |
+
+What this shows:
+
+1. **No whole layer is shared between the Python versions, yet 14.5% of their chunks still deduplicate.** The 3.10 and 3.11 base layers are different layers but come from two nearby Debian snapshots, so their tar archives contain mostly the same files in the same order. 52 chunks line up at the same positions in both and hash identically. The 3.9 base is an older Debian and only 2 chunks line up. This is a real effect of fixed 1 MiB chunking, but it is fragile: it works only while the content before a chunk is the same length in both files.
+2. **The reviewer's expected 60 to 70% savings is not reached by real, independently built images (workload C: 14.5%).** It is reached in the sense that matters only when images truly share their base layers.
+3. **With a truly shared base (workload D), dedup removes 51.6% of chunks and uploads of the second and third image are 2.4x to 4.1x faster.** The storage ratio of 2.06x is the **maximum possible for this data**: the three images contain about 233 MiB of unique bytes (the shared 124 MiB base plus three app layers, the largest being numpy's 80 MiB), and 481 MiB / 233 MiB = 2.06. Dedup found every byte that could be found. It cannot reach 3x here because the images are not that similar.
+4. **Dedup savings depend on the workload, not only on the code.** Same system, same code: 1.00x on random data, 1.14x on five unrelated images, 1.17x on three Python versions, 2.06x on three images built from one base.
+
 ### Honest limits of this benchmark
 
 * **Latency percentiles are weak here.** Only 18 files were uploaded, so P99 is just the largest file and per-file latency mostly measures file size. Per-image throughput and per-chunk time above are the comparable numbers. (`upload_p50_ms` and `upload_p99_ms` are in the JSON output.)
@@ -69,6 +101,9 @@ Each result says what workload produced it. The method and the questions come fr
 ```bash
 test/benchmarks/fetch_layers.sh                       # once: extracts the layers into testdata/layers (git-ignored)
 go test ./test/benchmarks/ -run '^$' -bench 'Dedup_' -benchtime=1x          # the four workload runs
+go test ./test/benchmarks/ -run '^$' -bench 'PythonVersions|SharedBase' -benchtime=1x   # the follow-up workloads
+test/benchmarks/build_app_images.sh                   # once: builds the three FROM-one-base images used by SharedBase
+test/benchmarks/fetch_layers.sh minidfs-bench-app-requests:1 minidfs-bench-app-flask:1 minidfs-bench-app-numpy:1
 go test ./test/benchmarks/ -run '^$' -bench 'DedupCheck_' -benchmem         # cost of each step of the check
 go test ./test/benchmarks/ -run '^$' -bench 'RawMedia' -benchtime=1x -count=3
 BENCH_OUT=/some/dir go test ... -bench 'Dedup_'       # also writes the full per-file and per-image JSON
