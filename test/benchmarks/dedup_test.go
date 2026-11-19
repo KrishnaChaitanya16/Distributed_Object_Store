@@ -21,6 +21,12 @@ import (
 // layerImages is the upload order of benchmark 1: the two Ubuntu bases first, then three images that share Debian layers.
 var layerImages = []string{"ubuntu_20.04", "ubuntu_22.04", "nginx_latest", "node_18-slim", "python_3.11-slim"}
 
+// sharedBaseImages are three application images built FROM the same base; build_app_images.sh creates them.
+var sharedBaseImages = []string{"minidfs-bench-app-requests_1", "minidfs-bench-app-flask_1", "minidfs-bench-app-numpy_1"}
+
+// pythonImages is the variant a reviewer proposed: three Python versions that might share a base layer.
+var pythonImages = []string{"python_3.11-slim", "python_3.10-slim", "python_3.9-slim"}
+
 const workers = 4
 
 type fileStat struct {
@@ -204,9 +210,9 @@ func makeRandomMedia(tb testing.TB, dir string, n int, fileBytes int64) []workIt
 	return items
 }
 
-func layerItems(tb testing.TB) []workItem {
+func layerItems(tb testing.TB, images []string) []workItem {
 	tb.Helper()
-	files, missing := findLayers(layerDir(), layerImages)
+	files, missing := findLayers(layerDir(), images)
 	if len(missing) > 0 {
 		tb.Skipf("layers for %s are missing: run test/benchmarks/fetch_layers.sh", strings.Join(missing, ", "))
 	}
@@ -260,10 +266,10 @@ func writeJSON(path string, v any) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
-func benchDockerLayers(b *testing.B, dedupOn bool) {
-	items := layerItems(b)
+func benchDockerLayers(b *testing.B, name string, images []string, dedupOn bool) {
+	items := layerItems(b, images)
 	for i := 0; i < b.N; i++ {
-		r := runWorkload(b, "docker_layers", items, dedupOn)
+		r := runWorkload(b, name, items, dedupOn)
 		if i == b.N-1 {
 			report(b, r)
 		}
@@ -293,10 +299,34 @@ func benchRawMedia(b *testing.B, dedupOn bool) {
 }
 
 // BenchmarkDedup_DockerLayers uploads the layers of five real images with deduplication on.
-func BenchmarkDedup_DockerLayers(b *testing.B) { benchDockerLayers(b, true) }
+func BenchmarkDedup_DockerLayers(b *testing.B) {
+	benchDockerLayers(b, "docker_layers", layerImages, true)
+}
 
 // BenchmarkDedup_DockerLayers_DedupOff is the baseline: the same layers with every chunk written again.
-func BenchmarkDedup_DockerLayers_DedupOff(b *testing.B) { benchDockerLayers(b, false) }
+func BenchmarkDedup_DockerLayers_DedupOff(b *testing.B) {
+	benchDockerLayers(b, "docker_layers", layerImages, false)
+}
+
+// BenchmarkDedup_PythonVersions uploads python 3.11, 3.10 and 3.9 slim, which turn out to share no whole layer.
+func BenchmarkDedup_PythonVersions(b *testing.B) {
+	benchDockerLayers(b, "python_versions", pythonImages, true)
+}
+
+// BenchmarkDedup_PythonVersions_DedupOff is the baseline for the Python-versions workload.
+func BenchmarkDedup_PythonVersions_DedupOff(b *testing.B) {
+	benchDockerLayers(b, "python_versions", pythonImages, false)
+}
+
+// BenchmarkDedup_SharedBase uploads three application images built FROM python:3.11-slim, so they share its layers exactly.
+func BenchmarkDedup_SharedBase(b *testing.B) {
+	benchDockerLayers(b, "shared_base", sharedBaseImages, true)
+}
+
+// BenchmarkDedup_SharedBase_DedupOff is the baseline for the shared-base workload.
+func BenchmarkDedup_SharedBase_DedupOff(b *testing.B) {
+	benchDockerLayers(b, "shared_base", sharedBaseImages, false)
+}
 
 // BenchmarkDedup_RawMedia uploads random bytes, where no chunk repeats, with deduplication on.
 func BenchmarkDedup_RawMedia(b *testing.B) { benchRawMedia(b, true) }

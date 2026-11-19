@@ -4,7 +4,9 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 out="$root/testdata/layers"
-images=(ubuntu:20.04 ubuntu:22.04 nginx:latest node:18-slim python:3.11-slim)
+# default image set: benchmark 1 (Docker layers) and its Python-versions variant; pass image names as arguments to fetch others
+images=(ubuntu:20.04 ubuntu:22.04 nginx:latest node:18-slim python:3.11-slim python:3.10-slim python:3.9-slim)
+if [ "$#" -gt 0 ]; then images=("$@"); fi
 
 for img in "${images[@]}"; do
 	name=${img//[:\/]/_}
@@ -12,7 +14,7 @@ for img in "${images[@]}"; do
 	rm -rf "$dir"
 	mkdir -p "$dir"
 	tmp=$(mktemp -d)
-	docker pull -q "$img" > /dev/null
+	docker image inspect "$img" > /dev/null 2>&1 || docker pull -q "$img" > /dev/null
 	docker save "$img" | tar -x -C "$tmp"
 	# docker save may store layers gzip-compressed; the benchmark wants the plain tar a layer really is
 	python3 -I - "$tmp" "$dir" <<'PY'
