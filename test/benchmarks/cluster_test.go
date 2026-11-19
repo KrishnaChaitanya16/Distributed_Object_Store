@@ -29,6 +29,7 @@ import (
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/placement"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/workerclient"
 	workerapi "github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/api"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/scrubber"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/worker/storage"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
@@ -53,6 +54,8 @@ type node struct {
 	id       string
 	srv      *httptest.Server
 	dir      string
+	store    *storage.Store
+	scrub    *scrubber.Scrubber
 	alive    chan struct{}
 	killOnce sync.Once
 }
@@ -155,7 +158,13 @@ func (c *cluster) addWorker(id string) {
 	if err != nil {
 		c.tb.Fatal(err)
 	}
-	srv := httptest.NewServer(workerapi.New(st, id, "", &http.Client{Timeout: 30 * time.Second}).Handler())
+	// the scrubber only runs when a benchmark triggers it: its interval is far longer than any run
+	sc, err := scrubber.New(st, scrubber.Config{Interval: 24 * time.Hour, Logf: func(string, ...any) {}})
+	if err != nil {
+		c.tb.Fatal(err)
+	}
+	go sc.Run(c.ctx) //nolint:errcheck
+	srv := httptest.NewServer(workerapi.New(st, id, "", &http.Client{Timeout: 30 * time.Second}).WithScrubber(sc).Handler())
 	advertised := srv.URL
 	if id == c.opts.slowWorker {
 		sc := newSlowProxy(srv.URL)
@@ -175,7 +184,7 @@ func (c *cluster) addWorker(id string) {
 	if resp.StatusCode != http.StatusCreated {
 		c.tb.Fatalf("registering %s: status %d", id, resp.StatusCode)
 	}
-	n := &node{id: id, srv: srv, dir: dir, alive: make(chan struct{})}
+	n := &node{id: id, srv: srv, dir: dir, store: st, scrub: sc, alive: make(chan struct{})}
 	c.workers = append(c.workers, n)
 	if c.opts.heartbeats {
 		go c.heartbeat(n)
@@ -371,4 +380,37 @@ func (c *cluster) objectChunks(id string) []chunkInfo {
 		c.tb.Fatal(err)
 	}
 	return out.Chunks
+}
+
+// scrubNow runs one scrubber pass on the worker and waits for it to finish, returning how long the pass took.
+func (n *node) scrubNow(tb testing.TB) time.Duration {
+	tb.Helper()
+	before := n.scrub.Status().Passes
+	start := time.Now()
+	for !n.scrub.Trigger() {
+		time.Sleep(time.Millisecond)
+	}
+	for {
+		st := n.scrub.Status()
+		if st.Passes > before && !st.Running {
+			return time.Since(start)
+		}
+		if time.Since(start) > 5*time.Minute {
+			tb.Fatal("scrubber pass did not finish")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// chunkIDs lists the chunk files on the worker's disk.
+func (n *node) chunkIDs() []string {
+	entries, _ := os.ReadDir(filepath.Join(n.dir, "chunks"))
+	var ids []string
+	for _, e := range entries {
+		if name := e.Name(); strings.HasSuffix(name, ".bin") {
+			ids = append(ids, strings.TrimSuffix(name, ".bin"))
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
