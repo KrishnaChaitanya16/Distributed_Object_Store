@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -44,6 +45,7 @@ type Server struct {
 	http      *http.Server
 	hedgeMs   int // milliseconds before hedging to the secondary; 0 disables hedging
 	bloom     *dedup.Filter
+	dedupOff  atomic.Bool
 	collector *gc.Collector
 	recon     ReconcilerControl
 }
@@ -157,6 +159,9 @@ func (s *Server) handleGCRun(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]bool{"queued": s.recon.Trigger()}) //nolint:errcheck
 }
+
+// DisableDedup makes every uploaded chunk be written to its workers again even when an identical chunk is already stored, and skips the Bloom filter; it exists so benchmarks can measure what deduplication saves.
+func (s *Server) DisableDedup() { s.dedupOff.Store(true) }
 
 // HedgeMs is the hedged-read threshold in milliseconds; 0 means hedging is off.
 func (s *Server) HedgeMs() int { return s.hedgeMs }

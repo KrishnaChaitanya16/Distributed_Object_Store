@@ -228,9 +228,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 // storeChunk makes one chunk durable for this upload and returns the HTTP status and message to use on failure.
 func (s *Server) storeChunk(ctx context.Context, objectID string, ref models.ChunkRef, data []byte, log *slog.Logger) (int, string, error) {
-	maybe := s.bloom.Observe(ref.ChunkID)
+	dedupOn := !s.dedupOff.Load()
+	maybe := dedupOn && s.bloom.Observe(ref.ChunkID)
 	rec, err := s.meta.AddChunkRef(ctx, objectID, ref)
-	if err == nil {
+	if err == nil && dedupOn {
 		s.bloom.RecordOutcome(maybe, rec != nil)
 		verdict := "definitely_new"
 		if maybe {
@@ -252,7 +253,7 @@ func (s *Server) storeChunk(ctx context.Context, objectID string, ref models.Chu
 			return http.StatusServiceUnavailable, "chunk is being garbage collected, retry", err
 		}
 	}
-	if rec != nil && rec.State == models.ChunkDurable {
+	if dedupOn && rec != nil && rec.State == models.ChunkDurable {
 		log.Debug("chunk already exists (dedup) — skipping worker push", "chunk_id", ref.ChunkID)
 		metrics.ChunksDedupTotal.Inc()
 		emit(ctx, "upload.dedup", "identical chunk already stored, nothing sent to workers", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID)
@@ -275,7 +276,7 @@ func (s *Server) storeChunk(ctx context.Context, objectID string, ref models.Chu
 	if err != nil {
 		return http.StatusInternalServerError, "internal error", err
 	}
-	if rec.State == models.ChunkDurable {
+	if dedupOn && rec.State == models.ChunkDurable {
 		metrics.ChunksDedupTotal.Inc()
 		return 0, "", nil
 	}

@@ -615,3 +615,53 @@ func TestWorkerFailureMidUpload_StagedObjectIsCleanedByReconciler(t *testing.T) 
 	assert.Empty(t, failed, "FAILED manifest should be purged by reconciler")
 	assert.Empty(t, staged, "STAGED manifest should be purged by reconciler")
 }
+
+// --- dedup switch used by the benchmarks ---
+
+func putCalls(h *testHarness) int { return len(h.workers.callsFor("PUT", "")) }
+
+func TestDedupOnSkipsTheSecondPushAndOffRepeatsIt(t *testing.T) {
+	content := strings.Repeat("benchmark me ", 5000)
+
+	on := newHarness(t)
+	on.upload(t, "a", content)
+	first := putCalls(on)
+	on.upload(t, "b", content)
+	assert.Equal(t, first, putCalls(on), "with dedup on an identical chunk is not pushed again")
+
+	off := newHarness(t)
+	off.srv.DisableDedup()
+	off.upload(t, "a", content)
+	one := putCalls(off)
+	off.upload(t, "b", content)
+	assert.Equal(t, 2*one, putCalls(off), "with dedup off the same bytes are written to the workers again")
+	assert.Equal(t, uint64(0), off.srv.Bloom().Counters().Queries, "dedup off never consults the Bloom filter")
+}
+
+func TestObjectsStayReadableAndCountedWithDedupOff(t *testing.T) {
+	h := newHarness(t)
+	h.srv.DisableDedup()
+	content := strings.Repeat("same chunk ", 3000)
+	a := h.upload(t, "a", content)
+	b := h.upload(t, "b", content)
+	for _, id := range []string{a.ObjectID, b.ObjectID} {
+		code, body := h.download(t, id)
+		assert.Equal(t, http.StatusOK, code)
+		assert.Equal(t, content, string(body))
+	}
+	require.NoError(t, h.store.SyncRefCounts(context.Background()))
+	rec, err := h.store.GetChunk(context.Background(), chunkIDOf(content))
+	require.NoError(t, err)
+	assert.Equal(t, 2, rec.RefCount, "both objects reference the one chunk record")
+	assert.Equal(t, models.ChunkDurable, rec.State)
+	require.Equal(t, http.StatusNoContent, h.deleteObject(t, a.ObjectID))
+	code, body := h.download(t, b.ObjectID)
+	assert.Equal(t, http.StatusOK, code, "deleting one object keeps the chunk the other still uses")
+	assert.Equal(t, content, string(body))
+}
+
+func TestDedupIsOnByDefault(t *testing.T) {
+	h := newHarness(t)
+	h.upload(t, "a", "x")
+	assert.Equal(t, uint64(1), h.srv.Bloom().Counters().Queries)
+}
