@@ -12,10 +12,13 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -47,9 +50,11 @@ func (p *countingPool) PutChunk(ctx context.Context, addr, chunkID string, data 
 }
 
 type node struct {
-	id  string
-	srv *httptest.Server
-	dir string
+	id       string
+	srv      *httptest.Server
+	dir      string
+	alive    chan struct{}
+	killOnce sync.Once
 }
 
 type cluster struct {
@@ -57,12 +62,31 @@ type cluster struct {
 	ctrl    *httptest.Server
 	api     *controllerapi.Server
 	pool    *countingPool
+	meta    *metadata.MetadataStore
+	ring    *placement.Ring
+	table   *health.LeaseTable
 	workers []*node
 	client  *http.Client
+	ctx     context.Context
+	slow    map[string]*slowControl
+	opts    options
 }
 
-// newCluster starts a controller and n workers; dedup false switches deduplication off for the baseline runs.
+// options tunes a cluster for one benchmark.
+type options struct {
+	workers       int
+	dedupOff      bool
+	singleReplica bool
+	heartbeats    bool   // workers send heartbeats and the health monitor runs, as in production
+	slowWorker    string // this worker sits behind a proxy whose delay the benchmark controls
+}
+
 func newCluster(tb testing.TB, n int, dedup bool) *cluster {
+	return newClusterWith(tb, options{workers: n, dedupOff: !dedup})
+}
+
+// newClusterWith starts a controller and the workers described by o.
+func newClusterWith(tb testing.TB, o options) *cluster {
 	tb.Helper()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	store, err := metadata.NewMetadataStore(filepath.Join(tb.TempDir(), "meta.db"))
@@ -73,22 +97,55 @@ func newCluster(tb testing.TB, n int, dedup bool) *cluster {
 	pool := &countingPool{Pool: workerclient.New()}
 	table := health.NewLeaseTable()
 	srv := controllerapi.New(":0", store, ring, pool, table)
-	if !dedup {
+	if o.dedupOff {
 		srv.DisableDedup()
 	}
+	if o.singleReplica {
+		srv.UseSingleReplica()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	ctrl := httptest.NewServer(srv.Handler())
-	c := &cluster{tb: tb, ctrl: ctrl, api: srv, pool: pool, client: &http.Client{}}
+	c := &cluster{tb: tb, ctrl: ctrl, api: srv, pool: pool, meta: store, ring: ring, table: table, client: &http.Client{}, ctx: ctx, slow: map[string]*slowControl{}, opts: o}
+	if o.heartbeats {
+		health.NewMonitor(table).Start(ctx)
+	}
 	tb.Cleanup(func() {
+		cancel()
 		ctrl.Close()
 		for _, w := range c.workers {
 			w.srv.Close()
 		}
+		for _, s := range c.slow {
+			s.srv.Close()
+		}
 		store.Close()
 	})
-	for i := 1; i <= n; i++ {
+	for i := 1; i <= o.workers; i++ {
 		c.addWorker(fmt.Sprintf("worker%d", i))
 	}
 	return c
+}
+
+// slowControl is a proxy in front of one worker whose added delay can be changed while a benchmark runs.
+type slowControl struct {
+	srv   *httptest.Server
+	delay atomic.Int64
+}
+
+// SetDelay sets how long every chunk read from the worker is held back.
+func (s *slowControl) SetDelay(d time.Duration) { s.delay.Store(int64(d)) }
+
+func newSlowProxy(target string) *slowControl {
+	u, _ := url.Parse(target)
+	sc := &slowControl{}
+	rp := httputil.NewSingleHostReverseProxy(u)
+	sc.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/internal/chunks/") {
+			time.Sleep(time.Duration(sc.delay.Load()))
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	return sc
 }
 
 func (c *cluster) addWorker(id string) {
@@ -99,7 +156,13 @@ func (c *cluster) addWorker(id string) {
 		c.tb.Fatal(err)
 	}
 	srv := httptest.NewServer(workerapi.New(st, id, "", &http.Client{Timeout: 30 * time.Second}).Handler())
-	addr := strings.TrimPrefix(srv.URL, "http://")
+	advertised := srv.URL
+	if id == c.opts.slowWorker {
+		sc := newSlowProxy(srv.URL)
+		c.slow[id] = sc
+		advertised = sc.srv.URL
+	}
+	addr := strings.TrimPrefix(advertised, "http://")
 	i := strings.LastIndex(addr, ":")
 	var port int
 	fmt.Sscanf(addr[i+1:], "%d", &port)
@@ -112,7 +175,55 @@ func (c *cluster) addWorker(id string) {
 	if resp.StatusCode != http.StatusCreated {
 		c.tb.Fatalf("registering %s: status %d", id, resp.StatusCode)
 	}
-	c.workers = append(c.workers, &node{id: id, srv: srv, dir: dir})
+	n := &node{id: id, srv: srv, dir: dir, alive: make(chan struct{})}
+	c.workers = append(c.workers, n)
+	if c.opts.heartbeats {
+		go c.heartbeat(n)
+	}
+}
+
+// heartbeat reports the worker alive every 2 seconds until it is killed.
+func (c *cluster) heartbeat(n *node) {
+	body, _ := json.Marshal(map[string]string{"worker_id": n.id})
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.alive:
+			return
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+			if resp, err := http.Post(c.ctrl.URL+"/internal/workers/heartbeat", "application/json", bytes.NewReader(body)); err == nil {
+				resp.Body.Close()
+			}
+		}
+	}
+}
+
+func (c *cluster) node(id string) *node {
+	for _, w := range c.workers {
+		if w.id == id {
+			return w
+		}
+	}
+	c.tb.Fatalf("no worker %s", id)
+	return nil
+}
+
+// kill takes a worker off the network for good: it stops heartbeating and its server goes away.
+func (c *cluster) kill(id string) {
+	n := c.node(id)
+	n.killOnce.Do(func() {
+		close(n.alive)
+		n.srv.CloseClientConnections()
+		n.srv.Close()
+	})
+}
+
+// chunkPath is where a worker keeps a chunk file.
+func (n *node) chunkPath(chunkID string) string {
+	return filepath.Join(n.dir, "chunks", chunkID+".bin")
 }
 
 // uploadFile streams a file to the controller and returns how long the whole request took.
@@ -195,3 +306,69 @@ func percentile(samples []float64, p float64) float64 {
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
+
+// uploadBytes uploads in-memory data and returns the new object's id.
+func (c *cluster) uploadBytes(name string, data []byte) (string, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("file", name)
+	if err != nil {
+		return "", err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return "", err
+	}
+	if err := mw.Close(); err != nil {
+		return "", err
+	}
+	resp, err := c.client.Post(c.ctrl.URL+"/api/v1/objects", mw.FormDataContentType(), &buf)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("upload %s: status %d: %s", name, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		ObjectID string `json:"object_id"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", err
+	}
+	return out.ObjectID, nil
+}
+
+// download fetches an object and reports the status, the bytes received and how long it took.
+func (c *cluster) download(id string) (int, []byte, time.Duration) {
+	start := time.Now()
+	resp, err := c.client.Get(c.ctrl.URL + "/api/v1/objects/" + id)
+	if err != nil {
+		return 0, nil, time.Since(start)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, b, time.Since(start)
+}
+
+// chunkInfo is where one chunk of an object lives according to the controller.
+type chunkInfo struct {
+	ChunkID   string   `json:"chunk_id"`
+	Index     int      `json:"index"`
+	Locations []string `json:"locations"`
+}
+
+func (c *cluster) objectChunks(id string) []chunkInfo {
+	resp, err := c.client.Get(c.ctrl.URL + "/api/v1/objects/" + id + "/metadata")
+	if err != nil {
+		c.tb.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Chunks []chunkInfo `json:"chunks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		c.tb.Fatal(err)
+	}
+	return out.Chunks
+}
