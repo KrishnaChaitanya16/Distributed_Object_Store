@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	mathrand "math/rand"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -131,19 +133,42 @@ func newClusterWith(tb testing.TB, o options) *cluster {
 
 // slowControl is a proxy in front of one worker whose added delay can be changed while a benchmark runs.
 type slowControl struct {
-	srv   *httptest.Server
-	delay atomic.Int64
+	srv      *httptest.Server
+	delay    atomic.Int64
+	fraction atomic.Uint64 // math.Float64bits of the share of reads that are held back
+	mu       sync.Mutex
+	rng      *mathrand.Rand
 }
 
-// SetDelay sets how long every chunk read from the worker is held back.
-func (s *slowControl) SetDelay(d time.Duration) { s.delay.Store(int64(d)) }
+// SetDelay holds back every chunk read from the worker by d.
+func (s *slowControl) SetDelay(d time.Duration) {
+	s.delay.Store(int64(d))
+	s.fraction.Store(math.Float64bits(1))
+}
+
+// SetIntermittent holds back a random share of chunk reads by d and serves the rest at full speed.
+func (s *slowControl) SetIntermittent(d time.Duration, share float64) {
+	s.delay.Store(int64(d))
+	s.fraction.Store(math.Float64bits(share))
+}
+
+func (s *slowControl) shouldDelay() bool {
+	share := math.Float64frombits(s.fraction.Load())
+	if share >= 1 {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rng.Float64() < share
+}
 
 func newSlowProxy(target string) *slowControl {
 	u, _ := url.Parse(target)
-	sc := &slowControl{}
+	sc := &slowControl{rng: mathrand.New(mathrand.NewSource(7))}
+	sc.fraction.Store(math.Float64bits(1))
 	rp := httputil.NewSingleHostReverseProxy(u)
 	sc.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/internal/chunks/") {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/internal/chunks/") && sc.shouldDelay() {
 			time.Sleep(time.Duration(sc.delay.Load()))
 		}
 		rp.ServeHTTP(w, r)

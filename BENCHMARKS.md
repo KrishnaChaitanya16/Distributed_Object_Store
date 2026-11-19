@@ -205,3 +205,52 @@ Each is run without a scrubber and with one scrubber pass on every worker before
 ```bash
 go test ./test/benchmarks/ -run '^$' -bench 'Scrubber_' -benchtime=1x
 ```
+
+## 4. Hedged reads: tail latency when one worker is slow
+
+### Workload
+* Real in-process cluster, 4 workers, RF=2, loopback HTTP. `worker1` sits behind a proxy that holds back every chunk read by a chosen delay; writes are not delayed.
+* 100 objects of 32 KiB (one chunk each), picked so that `worker1` is the primary. Every object is read 3 times per setting (300 reads), each verified against its SHA-256.
+* Hedge threshold 25 ms (the default) versus hedging disabled (`HEDGE_THRESHOLD_MS=0`). Delay on the slow worker: 0, 10, 30, 50, 100 ms.
+
+### Results (300 reads per row, every read of every object slowed)
+
+| Slow-worker delay | Hedging off P50 | Hedging off P99 | Hedging on P50 | Hedging on P99 | Hedges fired | P99 improvement |
+|---|---|---|---|---|---|---|
+| 0 ms (all fast) | 0.4 ms | 1.0 ms | 0.4 ms | 1.1 ms | **0 of 300** | none needed |
+| 10 ms | 11.4 ms | 12.3 ms | 11.4 ms | 12.2 ms | 0 of 300 | none (under threshold) |
+| 30 ms | 31.5 ms | 32.4 ms | 26.9 ms | 27.5 ms | 300 of 300 | 1.2x |
+| 50 ms | 51.7 ms | 52.4 ms | 27.0 ms | 27.5 ms | 300 of 300 | 1.9x |
+| 100 ms | 101.7 ms | 102.5 ms | 27.0 ms | 27.7 ms | 300 of 300 | **3.7x** |
+
+### Threshold sweep: worker slow (100 ms) on a random 10% of reads, the rest fast (500 reads per row)
+
+| Threshold | P50 | P95 | P99 | Hedges fired |
+|---|---|---|---|---|
+| off | 0.5 ms | 101.4 ms | 101.7 ms | 0 |
+| 2 ms | 0.4 ms | 2.7 ms | 3.0 ms | 46 (9.2%) |
+| 5 ms | 0.4 ms | 5.9 ms | 6.2 ms | 46 (9.2%) |
+| 10 ms | 0.4 ms | 11.0 ms | 11.5 ms | 46 (9.2%) |
+| 25 ms (default) | 0.4 ms | 26.5 ms | 27.1 ms | 46 (9.2%) |
+| 50 ms | 0.4 ms | 51.8 ms | 52.1 ms | 46 (9.2%) |
+| 100 ms | 0.4 ms | 101.4 ms | 101.7 ms | 46 (9.2%) |
+
+### What the data says
+1. **A slow worker costs a read at most the threshold plus a fast read.** With hedging on, P99 is 27.5 ms whether the slow worker adds 30 ms or 100 ms; with it off, P99 follows the slow worker (102.5 ms at 100 ms). The benefit grows with how slow the worker is.
+2. **Hedging never fires when nothing is slow.** All-fast: 0 hedges in 300 reads, so the unnecessary-hedge rate is 0%, and P50/P99 are the same as with hedging off (the 0.1 ms difference is noise).
+3. **It does nothing below the threshold.** At 10 ms the primary answers before the 25 ms timer, no hedge starts, and the result matches hedging off. That is the design: the secondary is not asked unless the primary is late.
+4. **When the worker is slow only some of the time, hedging is what removes the tail.** At 10% slow reads, P95 falls from 101 ms to 26.5 ms, and P50 does not move because fast reads never hedge.
+5. **Cost: extra load only on the reads that were slow.** 46 of 500 reads (9.2%, matching the 10% injected) fired one extra chunk fetch each. The rest sent none.
+
+### What this does not prove
+* **The 25 ms threshold is a margin, not an optimum.** On loopback a normal read takes 0.4 ms, so even a 2 ms threshold hedged only the slow reads (the sweep shows the same 46 hedges at every threshold), and a lower threshold would have cut P99 further here. On a real network the normal P99 is larger and a threshold under it would hedge healthy reads and double the read load. 25 ms is chosen to sit well above a normal chunk read; it should be set from the P99 of real traffic.
+* The slowness is injected as a fixed delay on one worker. A worker that is slow because it is overloaded would also slow the extra hedge requests sent to it for other chunks.
+* Each object is one 32 KiB chunk, so the numbers are per-chunk. A multi-chunk object hedges each chunk separately.
+
+### A defect this benchmark found and fixed
+At 30 ms and above, the first run showed hedges stopping after 5 reads: from the sixth read on, the slow worker was never asked at all. Cause: when the secondary wins, the slow primary's request is cancelled, and the worker client counted that cancellation as a worker failure. Five hedged reads in a row opened the circuit breaker on a healthy but slow worker. A cancelled call is not a failure of the worker and is no longer counted (commit 3942b64), with tests for both cases: cancellations leave the breaker closed, and real errors still open it.
+
+### Reproduce
+```bash
+go test ./test/benchmarks/ -run '^$' -bench 'Hedge_' -benchtime=1x
+```
