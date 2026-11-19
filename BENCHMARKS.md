@@ -254,3 +254,37 @@ At 30 ms and above, the first run showed hedges stopping after 5 reads: from the
 ```bash
 go test ./test/benchmarks/ -run '^$' -bench 'Hedge_' -benchtime=1x
 ```
+
+## 5. Reconciler: time to restore redundancy after a worker comes back empty
+
+### Workload
+* Real in-process cluster, 4 workers, RF=2, bbolt metadata, loopback HTTP, real files with fsync.
+* Single-chunk objects are uploaded until `worker2` holds exactly N chunks (N = 10, 100, 500). Then `worker2` is "restarted with an empty disk": its chunk files are deleted while it stays online and registered. Every one of those N chunks now has one copy instead of two.
+* Without a reconciler: wait 3 s and count the chunks that still have one copy. With it: time one `Reconciler.Pass`, which scans every worker, finds the missing copies and copies each back from the surviving holder (worker to worker). Afterwards every copy is counted on disk and every object is downloaded and checked against its SHA-256.
+* 64 KiB chunks for 10/100/500; a fourth run uses 100 chunks of 1 MiB to get a byte rate.
+
+### Results
+
+| Chunks lost | Chunk size | One-copy chunks after 3 s, no reconciler | Pass time | Chunks/s | MiB/s | Two copies after | Objects unreadable |
+|---|---|---|---|---|---|---|---|
+| 10 | 64 KiB | 10 of 10 | 75 ms | 134 | 8.4 | 10 of 10 | 0 |
+| 100 | 64 KiB | 100 of 100 | 405 ms | 247 | 15.4 | 100 of 100 | 0 |
+| 500 | 64 KiB | 500 of 500 | 2.01 s | 248 | 15.5 | 500 of 500 | 0 |
+| 100 | 1 MiB | 100 of 100 | 856 ms | 117 | 117 | 100 of 100 | 0 |
+
+### What the data says
+1. **Without the reconciler nothing heals.** After 3 s all lost chunks still have one copy, and they stay that way: a second failure of the one worker that holds them would lose the data. This is the exposure the reconciler closes.
+2. **With it, redundancy is fully restored in one pass.** In every run each lost chunk was copied back (restored count equals lost count), two copies exist on disk, no object is unreadable, and the pass reports 0 lost chunks. A second pass restores nothing.
+3. **Time grows linearly with the number of chunks.** 100 and 500 chunks both run at about 248 chunks/s (about 4 ms per chunk). The 10-chunk run looks slower per chunk (134/s) because the fixed cost of scanning all workers and metadata (about 35 ms) is a large share of a 75 ms pass.
+4. **For large chunks the rate is bytes, not chunks.** 1 MiB chunks restore at 117 MiB/s, so the 4 ms per 64 KiB chunk is mostly per-chunk overhead (fsync, two HTTP calls, a metadata update), not copying. For a worker that lost 100 GiB of 1 MiB chunks that extrapolates to about 15 minutes (100 GiB at 117 MiB/s), and that is how long the data stays single-copy: the window of exposure is set by this rate.
+
+### Honest limits
+* The reconciler restores chunks one at a time inside a pass. The numbers above are that sequential rate; copying several chunks at once would be faster and is the obvious improvement if recovery time matters.
+* Everything runs on one machine over loopback, so there is no network transfer cost between workers. A real network at 1 Gbit/s (about 119 MiB/s) would cap the 1 MiB rate at about the same figure; at 64 KiB the per-chunk overhead would be higher with real latency.
+* The 3 s wait stands in for "no reconciler running"; the point is that the count does not change, not the length of the wait.
+* The pass time includes the scan of every online worker's chunk list, so a cluster with many more chunks on healthy workers would add to the fixed cost.
+
+### Reproduce
+```bash
+go test ./test/benchmarks/ -run '^$' -bench 'Reconciler_' -benchtime=1x
+```
