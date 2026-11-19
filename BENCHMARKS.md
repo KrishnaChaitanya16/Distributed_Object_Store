@@ -288,3 +288,98 @@ go test ./test/benchmarks/ -run '^$' -bench 'Hedge_' -benchtime=1x
 ```bash
 go test ./test/benchmarks/ -run '^$' -bench 'Reconciler_' -benchtime=1x
 ```
+
+## 6. Upload throughput: how dedup compounds over repeated image pushes
+
+### Workload
+* Real in-process cluster, 4 workers, RF=2, loopback HTTP, real files with fsync.
+* 10 images pushed one after another. Each image is 10 chunks of 1 MiB: the same 7 chunks (a shared base) followed by 3 chunks that are unique to that image. The chunk contents are deterministic pseudo-random bytes, so nothing else in them repeats.
+* Dedup on versus the same uploads with `Server.DisableDedup()`. Each configuration ran 3 times on a fresh cluster; the table shows the median time per push.
+
+### Results
+
+| Push | Dedup on: time | Dedup on: bytes sent to workers | Dedup off: time | Dedup off: bytes sent |
+|---|---|---|---|---|
+| 1 | 264 ms | 20 MiB | 257 ms | 20 MiB |
+| 2 | 124 ms | 6 MiB | 256 ms | 20 MiB |
+| 3 | 117 ms | 6 MiB | 256 ms | 20 MiB |
+| 5 | 118 ms | 6 MiB | 249 ms | 20 MiB |
+| 8 | 107 ms | 6 MiB | 233 ms | 20 MiB |
+| 10 | 110 ms | 6 MiB | 254 ms | 20 MiB |
+| **All 10** | **1435 ms** | **74 MiB** | **2435 ms** | **200 MiB** |
+
+### What the data says
+1. **The first push gains nothing** (264 vs 257 ms, same 20 MiB): there is nothing to deduplicate yet.
+2. **Every later push sends 6 MiB instead of 20 MiB** (the 3 unique chunks x 2 replicas), and takes about 110 ms instead of about 250 ms, 2.2x faster.
+3. **The gain compounds with the number of pushes.** After 10 pushes 74 MiB was sent instead of 200 MiB (2.7x less) and the total time was 1.7x shorter (1435 vs 2435 ms). The longer the series, the closer the bytes ratio gets to its limit for this workload: 3 of 10 chunks (30%) are always new, so bytes tend to 3.3x less.
+4. **Time falls less than bytes.** A push with 70% of its chunks already stored still takes about 110 ms, not 30% of 250 ms: for each deduplicated chunk the controller still checks the Bloom filter, looks the chunk up in bbolt and writes the reference, and the metadata for the whole object is committed regardless.
+
+### Honest limits
+* This is a constructed workload with an assumed 70% shared share, matching the spec's 7 shared and 3 unique. Real images share what benchmark 1 measured (1.14x for unrelated images, 2.06x for images that share a base layer).
+* Disk use is the same with dedup on or off here (74 MiB after 10 pushes either way): chunks are content-addressed, so identical chunks overwrite the same file. What dedup saves is network transfer, worker writes and time, which is what the table shows.
+* Loopback transfers are fast; on a real network the 14 MiB saved per push would count for more than it does here.
+
+### Reproduce
+```bash
+go test ./test/benchmarks/ -run '^$' -bench 'Compounding_' -benchtime=1x
+```
+
+## 7. Random media: what dedup costs when it cannot help
+
+### Workload
+* 4 workers, RF=2. 10 files of 5 MiB from `crypto/rand` (50 chunks, 100 MiB), uploaded back to back. No two chunks can match, so dedup has nothing to find.
+* Dedup on versus off, 7 runs each on a fresh cluster, alternating which goes first to cancel warm-up and drift.
+
+### Results
+
+| | Dedup on | Dedup off |
+|---|---|---|
+| Median upload time per chunk | **23.8 ms** | **24.4 ms** |
+| Per-chunk time, all 7 runs | 23.5 to 27.3 ms | 23.2 to 38.1 ms (first run an outlier) |
+| Storage on worker disks | 100 MiB x 2 replicas | same |
+| Storage ratio | **1.00x** | 1.00x |
+
+### What the data says
+1. **No storage is saved and none was promised: the ratio is 1.00x.**
+2. **The dedup path costs nothing measurable.** The median per-chunk time with dedup on is not higher than with it off (23.8 vs 24.4 ms, a 2% difference inside the run-to-run spread of 23 to 27 ms). The work dedup adds per chunk is a Bloom filter check (45 ns), a Bloom add (93 ns) and, when the filter says "maybe", a bbolt lookup (2.0 µs, measured in benchmark 1); for new random chunks the filter answers "no", so that cost is about 140 ns against a 24 ms upload.
+3. **The spec's expected ~2 ms of overhead per chunk is not what this system shows.** The cost the spec had in mind is a metadata lookup per chunk. Here the lookup is skipped by the Bloom filter for chunks that are new, and the one write a new chunk always needs is paid with dedup on or off.
+
+### Honest limits
+* The comparison rests on medians of 7 runs with 2 to 5% spread; a real difference below a few percent would not show.
+* Both modes write each chunk's reference to bbolt, so that cost (about 1.7 ms) is in both columns and is not part of the difference.
+* Hard evidence that Bloom false positives stay low on random data is in benchmark 1 (0 of 625).
+
+### Reproduce
+```bash
+go test ./test/benchmarks/ -run '^$' -bench 'RandomMedia_' -benchtime=1x
+```
+
+## 8. Consistent hashing: how many chunks move when a worker is added
+
+### Workload
+* 10,000 chunk ids (SHA-256 of `chunk-0` to `chunk-9999`, as lowercase hex), placed with the real `placement.Ring` (50 virtual nodes per worker). Pure computation, no cluster.
+* Baseline: modulo placement, `owner = first 8 bytes of the chunk hash mod worker count`.
+* For each cluster size, the share of chunks whose **primary** worker changes when one worker is added. Measured directly at 4 to 5, 9 to 10, 19 to 20 and 39 to 40 workers.
+
+### Results
+
+| Workers | Ideal (1/new count) | Consistent hashing | Modulo |
+|---|---|---|---|
+| 4 to 5 | 20.0% | **19.0%** (1895 chunks) | 79.9% (7986 chunks) |
+| 9 to 10 | 10.0% | **10.3%** (1025 chunks) | 89.9% (8987 chunks) |
+| 19 to 20 | 5.0% | **5.7%** (568 chunks) | 95.2% (9520 chunks) |
+| 39 to 40 | 2.5% | **2.9%** (288 chunks) | 97.8% (9778 chunks) |
+
+### What the data says
+1. **Adding a worker moves close to the minimum possible.** With consistent hashing the share that moves is within a point of the ideal 1/(N+1) at every size, and it only moves onto the new worker (checked by a test). Modulo placement moves 80% to 98%, which at 20 workers would mean re-copying nearly every chunk to add one machine.
+2. **The gap widens with scale.** Moved chunks per added worker fall as the cluster grows (19.0%, 10.3%, 5.7%, 2.9%) while modulo's rise towards 100%.
+
+### Where it is less good than it looks
+* **Balance is uneven.** With 50 virtual nodes, a worker's share of primaries varied from 21.9% to 29.6% at 4 workers (fair share 25%), 8.1% to 12.5% at 10 and 3.9% to 6.4% at 20; the standard deviation is 12 to 16% of the fair share. The busiest worker holds about 1.3x its fair share. More virtual nodes would even this out; the number is fixed at 50 in the code and was not varied here.
+* **RF=2 moves more than the primary alone.** The numbers above are primaries only. Counting chunks whose primary *or* secondary changed: 44% at 4 to 5, 19% at 9 to 10, 10.7% at 19 to 20, 5.5% at 39 to 40, roughly double, because each chunk's second copy can shift too.
+* **Chunk ids are SHA-256 hashes of generated names, so the input is uniformly distributed** by construction. Real chunk hashes are too, since they are hashes of content.
+
+### Reproduce
+```bash
+go test ./test/benchmarks/ -run '^$' -bench 'Ring_' -benchtime=1x
+```
