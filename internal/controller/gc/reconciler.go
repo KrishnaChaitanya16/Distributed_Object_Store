@@ -19,6 +19,20 @@ import (
 // replicationFactor is the number of healthy listed copies every live chunk should have.
 const replicationFactor = 2
 
+// restoreParallelism caps the number of concurrent peer-replication RPCs during a pass.
+const restoreParallelism = 4
+
+type restoreJob struct {
+	chunkID string
+	src     models.Replica
+	target  string
+}
+
+type excessJob struct {
+	chunkID  string
+	workerID string
+}
+
 var ErrAlreadyRunning = errors.New("reconciler is already running")
 
 type Config struct {
@@ -218,6 +232,7 @@ func (r *Reconciler) update(f func(*Status)) {
 type pass struct {
 	r       *Reconciler
 	ctx     context.Context
+	mu      sync.Mutex // guards rep, inv, and holders during parallel restores
 	rep     Report
 	online  map[string]bool
 	addrs   map[string]string
@@ -226,8 +241,10 @@ type pass struct {
 }
 
 func (p *pass) fail(op string, err error) {
+	p.mu.Lock()
 	p.rep.Errors++
 	p.rep.LastError = op + ": " + err.Error()
+	p.mu.Unlock()
 	slog.Warn("gc: "+op, "err", err)
 }
 
@@ -294,11 +311,18 @@ func (p *pass) run() {
 		p.fail("collect garbage", err)
 	}
 
+	var jobs []restoreJob
+	var excess []excessJob
 	lost := 0
 	for _, rec := range records {
-		if rec.State == models.ChunkDurable && live[rec.ChunkID] > 0 && !p.reconcile(rec) {
+		if rec.State == models.ChunkDurable && live[rec.ChunkID] > 0 && !p.reconcile(rec, &jobs, &excess) {
 			lost++
 		}
+	}
+	p.restoreAll(jobs)
+	// Run excess cleanup after restores so p.inv reflects restored replicas when checking RF.
+	for _, e := range excess {
+		p.removeExcess(e.chunkID, e.workerID)
 	}
 	for id := range live {
 		if !recorded[id] && len(p.holders[id]) == 0 {
@@ -372,8 +396,11 @@ func (p *pass) has(workerID, chunkID string) (has, known bool) {
 	return set[chunkID], true
 }
 
-// reconcile restores missing listed copies, tops up under-replicated records and removes unlisted copies; it returns false if the chunk is lost.
-func (p *pass) reconcile(rec *models.ChunkRecord) bool {
+// reconcile collects restore and excess-deletion jobs for a chunk; it returns false if the chunk is lost.
+// Restore jobs are deferred to restoreAll so they can be fanned out in parallel.
+// Excess-deletion jobs are deferred until after restoreAll so p.inv reflects restored replicas when
+// checking whether RF is met before deleting.
+func (p *pass) reconcile(rec *models.ChunkRecord, jobs *[]restoreJob, excess *[]excessJob) bool {
 	id := rec.ChunkID
 	var sources []models.Replica
 	listed := make(map[string]bool, len(rec.Replicas))
@@ -399,7 +426,7 @@ func (p *pass) reconcile(rec *models.ChunkRecord) bool {
 
 	for _, r := range rec.Replicas {
 		if has, known := p.has(r.WorkerID, id); known && !has {
-			p.restore(id, sources[0], r.WorkerID)
+			*jobs = append(*jobs, restoreJob{chunkID: id, src: sources[0], target: r.WorkerID})
 		}
 	}
 	if len(rec.Replicas) < replicationFactor {
@@ -407,10 +434,29 @@ func (p *pass) reconcile(rec *models.ChunkRecord) bool {
 	}
 	for _, h := range p.holders[id] {
 		if !listed[h.WorkerID] {
-			p.removeExcess(id, h.WorkerID)
+			*excess = append(*excess, excessJob{chunkID: id, workerID: h.WorkerID})
 		}
 	}
 	return true
+}
+
+// restoreAll fans out restore jobs with up to restoreParallelism concurrent RPCs.
+func (p *pass) restoreAll(jobs []restoreJob) {
+	if len(jobs) == 0 {
+		return
+	}
+	sem := make(chan struct{}, restoreParallelism)
+	var wg sync.WaitGroup
+	for _, job := range jobs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(j restoreJob) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			p.restore(j.chunkID, j.src, j.target)
+		}(job)
+	}
+	wg.Wait()
 }
 
 // restore copies a chunk back onto a listed replica that lost it, for example after the scrubber quarantined it.
@@ -425,9 +471,11 @@ func (p *pass) restore(chunkID string, src models.Replica, target string) {
 		p.fail("restore "+chunkID+" on "+target, err)
 		return
 	}
+	p.mu.Lock()
 	p.inv[target][chunkID] = true
 	p.holders[chunkID] = append(p.holders[chunkID], models.Replica{WorkerID: target, WorkerAddr: p.addrs[target]})
 	p.rep.ReplicasRestored++
+	p.mu.Unlock()
 	metrics.ReconcileReplicasRestoredTotal.Inc()
 	slog.Info("gc: missing replica restored", "chunk_id", chunkID, "source", src.WorkerID, "target", target)
 	events.Emit("gc.restore", "a listed replica was missing, copied back", "chunk_id", chunkID, "from", src.WorkerID, "to", target)

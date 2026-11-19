@@ -59,8 +59,9 @@ func (p *Pool) call(workerAddr string, fn func(*workerClient) error) error {
 	err := fn(c)
 	if err != nil {
 		cb.RecordFailure()
-		slog.Debug("worker call failed", "worker_addr", workerAddr, "failures", cb.failures, "state", cb.State(), "err", err)
-		if cb.State() == "OPEN" {
+		state := cb.State()
+		slog.Debug("worker call failed", "worker_addr", workerAddr, "state", state, "err", err)
+		if state == "OPEN" {
 			slog.Warn("circuit breaker opened", "worker_addr", workerAddr)
 		}
 		return err
