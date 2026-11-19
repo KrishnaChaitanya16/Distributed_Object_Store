@@ -33,7 +33,7 @@ type bothOfflineHealth struct{}
 func (bothOfflineHealth) RecordHeartbeat(_ string)                     {}
 func (bothOfflineHealth) GetWorkerStatus(_ string) models.WorkerStatus { return models.WorkerOffline }
 func (bothOfflineHealth) ListOnlineWorkers() []string                  { return []string{"w1", "w2"} }
-func (bothOfflineHealth) Subscribe() <-chan models.WorkerOfflineEvent   { return nil }
+func (bothOfflineHealth) Subscribe() <-chan models.WorkerOfflineEvent  { return nil }
 
 // uploadObjectForTest uploads a small file through the full HTTP stack and
 // returns the object ID. Requires at least 2 workers in the fake pool.
