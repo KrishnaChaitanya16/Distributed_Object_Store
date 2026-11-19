@@ -271,6 +271,9 @@ func (s *Server) storeChunk(ctx context.Context, objectID string, ref models.Chu
 		},
 		CreatedAt: time.Now().UTC(),
 	}
+	if s.oneCopy.Load() {
+		want.Replicas = want.Replicas[:1]
+	}
 	replace := rec != nil && !s.allOnline(rec.Replicas)
 	rec, err = s.meta.PrepareChunk(ctx, want, replace)
 	if err != nil {

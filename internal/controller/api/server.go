@@ -46,6 +46,7 @@ type Server struct {
 	hedgeMs   int // milliseconds before hedging to the secondary; 0 disables hedging
 	bloom     *dedup.Filter
 	dedupOff  atomic.Bool
+	oneCopy   atomic.Bool
 	collector *gc.Collector
 	recon     ReconcilerControl
 }
@@ -162,6 +163,9 @@ func (s *Server) handleGCRun(w http.ResponseWriter, _ *http.Request) {
 
 // DisableDedup makes every uploaded chunk be written to its workers again even when an identical chunk is already stored, and skips the Bloom filter; it exists so benchmarks can measure what deduplication saves.
 func (s *Server) DisableDedup() { s.dedupOff.Store(true) }
+
+// UseSingleReplica makes new chunks be stored on their primary worker only, which is replication factor 1; it exists so benchmarks can measure what the second copy buys.
+func (s *Server) UseSingleReplica() { s.oneCopy.Store(true) }
 
 // HedgeMs is the hedged-read threshold in milliseconds; 0 means hedging is off.
 func (s *Server) HedgeMs() int { return s.hedgeMs }

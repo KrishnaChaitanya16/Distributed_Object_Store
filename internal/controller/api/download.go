@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/workerclient"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
@@ -21,6 +23,29 @@ import (
 type hashMismatchError struct{ got string }
 
 func (e *hashMismatchError) Error() string { return "hash mismatch: got " + e.got }
+
+// bothFailedError is returned when neither replica of a chunk could be read; it remembers why each one failed.
+type bothFailedError struct {
+	chunkID            string
+	primary, secondary error
+}
+
+func (e *bothFailedError) Error() string {
+	return fmt.Sprintf("chunk %s: both replicas failed (primary: %v; secondary: %v)", e.chunkID, e.primary, e.secondary)
+}
+
+func (e *bothFailedError) Unwrap() []error { return []error{e.primary, e.secondary} }
+
+// unreachable reports whether both replicas failed because the workers could not be reached at all, as opposed to answering with missing or corrupt data.
+func (e *bothFailedError) unreachable() bool {
+	return isNetworkError(e.primary) && isNetworkError(e.secondary)
+}
+
+// isNetworkError is true for a worker that cannot be reached: a failed connection, a timeout, or a circuit breaker that stopped calling it after repeated failures.
+func isNetworkError(err error) bool {
+	var ne net.Error
+	return err != nil && (errors.As(err, &ne) || errors.Is(err, workerclient.ErrCircuitOpen))
+}
 
 // fetchVerified GETs a chunk from addr, checks its byte count and SHA-256.
 // Returns *hashMismatchError on integrity failure so callers can distinguish
@@ -150,18 +175,20 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 			}
 			// Secondary failed — wait for primary
 			secErr := r.err
+			var primErr error
 			select {
 			case pr := <-primaryCh:
 				if pr.err == nil {
 					log.Debug("chunk fetched from primary (hedge)", "chunk_id", ref.ChunkID, "worker_id", ref.PrimaryID)
 					return pr.buf, nil, nil
 				}
+				primErr = pr.err
 				logFetchErr(log, ref.ChunkID, ref.PrimaryID, pr.err)
 			case <-ctx.Done():
 				return nil, nil, ctx.Err()
 			}
 			logFetchErr(log, ref.ChunkID, ref.SecondaryID, secErr)
-			return nil, nil, fmt.Errorf("chunk %s: both replicas failed", ref.ChunkID)
+			return nil, nil, &bothFailedError{chunkID: ref.ChunkID, primary: primErr, secondary: secErr}
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
 		}
@@ -185,7 +212,7 @@ func (s *Server) fetchWithFallback(ctx context.Context, ref models.ChunkRef, log
 	case sr := <-secondaryCh:
 		if sr.err != nil {
 			logFetchErr(log, ref.ChunkID, ref.SecondaryID, sr.err)
-			return nil, nil, fmt.Errorf("chunk %s: both replicas failed", ref.ChunkID)
+			return nil, nil, &bothFailedError{chunkID: ref.ChunkID, primary: primaryRes.err, secondary: sr.err}
 		}
 		log.Debug("chunk fetched from secondary", "chunk_id", ref.ChunkID, "worker_id", ref.SecondaryID)
 		// Trigger repair only on primary hash mismatch
@@ -308,8 +335,11 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 			log.Error("first chunk unrecoverable", "object_id", objectID, "err", err)
 			// Both-offline means the data may still exist — return 503 (retryable)
 			// rather than 502 (bad gateway / data corruption).
-			if s.health.GetWorkerStatus(refs[0].PrimaryID) != models.WorkerOnline &&
-				s.health.GetWorkerStatus(refs[0].SecondaryID) != models.WorkerOnline {
+			var both *bothFailedError
+			// Workers that refuse connections are unavailable storage even before the health lease has noticed.
+			if (errors.As(err, &both) && both.unreachable()) ||
+				(s.health.GetWorkerStatus(refs[0].PrimaryID) != models.WorkerOnline &&
+					s.health.GetWorkerStatus(refs[0].SecondaryID) != models.WorkerOnline) {
 				writeError(w, r, http.StatusServiceUnavailable, "both replica workers offline — try again later")
 			} else {
 				writeError(w, r, http.StatusBadGateway, "no valid replica")

@@ -7,13 +7,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/gc"
+	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/workerclient"
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/pkg/models"
 )
 
@@ -664,4 +668,84 @@ func TestDedupIsOnByDefault(t *testing.T) {
 	h := newHarness(t)
 	h.upload(t, "a", "x")
 	assert.Equal(t, uint64(1), h.srv.Bloom().Counters().Queries)
+}
+
+// --- single-replica switch used by the benchmarks ---
+
+func TestSingleReplicaWritesOneCopyAndLosesItWithTheWorker(t *testing.T) {
+	h := newHarness(t)
+	h.srv.UseSingleReplica()
+	content := strings.Repeat("only one copy ", 4000)
+	r := h.upload(t, "a", content)
+	assert.Len(t, h.workers.callsFor("PUT", ""), 1, "one write instead of two")
+	rec, err := h.store.GetChunk(context.Background(), chunkIDOf(content))
+	require.NoError(t, err)
+	require.Len(t, rec.Replicas, 1)
+	code, body := h.download(t, r.ObjectID)
+	assert.Equal(t, http.StatusOK, code)
+	assert.Equal(t, content, string(body))
+
+	h.workers.mu.Lock()
+	delete(h.workers.chunks, h.workers.key(rec.Replicas[0].WorkerAddr, chunkIDOf(content)))
+	h.workers.mu.Unlock()
+	code, _ = h.download(t, r.ObjectID)
+	assert.NotEqual(t, http.StatusOK, code, "with one copy gone there is nothing to fall back to")
+}
+
+func TestTwoReplicasIsTheDefault(t *testing.T) {
+	h := newHarness(t)
+	h.upload(t, "a", "two copies")
+	assert.Len(t, h.workers.callsFor("PUT", ""), 2)
+}
+
+// --- unavailable storage is a 503 even before the health lease notices ---
+
+type refusingPool struct{ *chunkStore }
+
+func (p refusingPool) GetChunk(_ context.Context, addr, _ string) (io.ReadCloser, error) {
+	return nil, &net.OpError{Op: "dial", Net: "tcp", Addr: stubAddr(addr), Err: syscall.ECONNREFUSED}
+}
+
+type stubAddr string
+
+func (a stubAddr) Network() string { return "tcp" }
+func (a stubAddr) String() string  { return string(a) }
+
+func TestDownloadIs503WhenBothWorkersRefuseConnectionsEvenIfHealthSaysOnline(t *testing.T) {
+	h := newHarness(t)
+	r := h.upload(t, "a", "both copies are unreachable")
+	srv := New(":0", h.store, h.ring, refusingPool{h.workers}, &fakeHealth{})
+	rec := tracedRequest(t, srv, http.MethodGet, "/api/v1/objects/"+r.ObjectID, "", nil, "")
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "storage that cannot be reached is unavailable, not a bad gateway")
+	assert.NotContains(t, rec.Body.String(), "unreachable but", "no bytes of the object are leaked")
+	assert.Contains(t, rec.Body.String(), "error")
+}
+
+func TestDownloadStays502WhenWorkersAnswerButHoldNoValidData(t *testing.T) {
+	h := newHarness(t)
+	r := h.upload(t, "a", "gone from disk")
+	cid := chunkIDOf("gone from disk")
+	h.workers.mu.Lock()
+	for k := range h.workers.chunks {
+		if strings.HasSuffix(k, "|"+cid) {
+			delete(h.workers.chunks, k)
+		}
+	}
+	h.workers.mu.Unlock()
+	code, _ := h.download(t, r.ObjectID)
+	assert.Equal(t, http.StatusBadGateway, code, "workers reachable but the chunk is missing is not an availability problem")
+}
+
+type breakerOpenPool struct{ *chunkStore }
+
+func (p breakerOpenPool) GetChunk(context.Context, string, string) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("get chunk: %w", workerclient.ErrCircuitOpen)
+}
+
+func TestDownloadIs503WhenBothWorkersHaveAnOpenCircuitBreaker(t *testing.T) {
+	h := newHarness(t)
+	r := h.upload(t, "a", "breakers are open on both workers")
+	srv := New(":0", h.store, h.ring, breakerOpenPool{h.workers}, &fakeHealth{})
+	rec := tracedRequest(t, srv, http.MethodGet, "/api/v1/objects/"+r.ObjectID, "", nil, "")
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }
