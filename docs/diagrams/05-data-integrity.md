@@ -15,10 +15,12 @@ sequenceDiagram
     alt CRC32C matches sidecar
       Note over SCRUB: Clean — no action
     else Mismatch — silent bitrot
-      SCRUB->>CTL: Alert chunk_id corrupted on this worker
+      Note over SCRUB: Quarantine chunk locally (rename to .quarantine)
+      Note over CTL: GC Reconciler scans inventory — quarantined chunk missing
       CTL->>WS: POST /replicate-peer {chunk_id, target: this_worker}
       WS->>DISK: PUT /internal/chunks/{chunk_id} overwrite
       DISK-->>WS: 201 OK
+      CTL->>CTL: Mark replica restored in bbolt
     end
   end
 

@@ -4,22 +4,27 @@
 flowchart TB
   subgraph CL["Client Layer"]
     C["Client\nHTTP consumer"]
+    B["Browser\nWeb UI"]
   end
 
-  subgraph CTRL["Controller  port 8080"]
+  subgraph CTRL["Controller  port 8080 · UI port 8081"]
     direction LR
     API["REST API Handler\nPOST · GET · PATCH · DELETE"]
-    CH["Consistent Hash Ring\n50 vnodes x 4 workers"]
+    UI["Web UI Server\nSSE event stream"]
+    CH["Consistent Hash Ring\n50 vnodes × 4 workers"]
+    BF["Bloom Filter\nCAS dedup fast-path"]
     MD["bbolt Metadata\nB+Tree · ACID · embedded"]
     WAL["WAL Manifests\nSTAGED → COMMITTED"]
     HL["Heartbeat Leases\n2s interval · 6s timeout"]
-    SH["Self-Healing Loop\nDEGRADED chunk scanner"]
-    CR["Crash Reconciler\nboot-time STAGED cleanup"]
+    CB["Circuit Breaker\nper-worker CLOSED/OPEN/HALF_OPEN"]
+    GC["GC Reconciler\nperiodic · stale expiry · restore · top-up"]
     API --> CH
+    API --> BF
     API --> MD
     API --> WAL
-    HL --> SH
-    CR --> MD
+    API --> CB
+    HL --> GC
+    GC --> MD
   end
 
   subgraph OBS["Observability"]
@@ -45,10 +50,12 @@ flowchart TB
     SC4["CRC32C Scrubber 30s"]
   end
 
-  C -->|"Client REST API"| API
-  CH -->|"PUT chunk fan-out R=2"| W1 & W2 & W3 & W4
-  SH -->|"POST /replicate-peer"| W1 & W2 & W3 & W4
+  C -->|"REST API"| API
+  B -->|"UI + SSE"| UI
+  CB -->|"PUT chunk parallel fan-out R=2"| W1 & W2 & W3 & W4
+  GC -->|"POST /replicate-peer"| W1 & W2 & W3 & W4
   W1 & W2 & W3 & W4 -->|"Heartbeat every 2s"| HL
+  W1 & W2 & W3 & W4 -->|"inventory scan"| GC
   CTRL -->|"/metrics"| PROM
   W1 & W2 & W3 & W4 -->|"/metrics"| PROM
 ```
