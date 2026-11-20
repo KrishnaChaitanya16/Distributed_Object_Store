@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,6 +21,7 @@ import (
 // --- fakes ---
 
 type fakeWorkerPool struct {
+	mu     sync.Mutex
 	chunks map[string][]byte // workerAddr+chunkID → data
 }
 
@@ -31,11 +33,15 @@ func key(addr, id string) string { return addr + "|" + id }
 
 func (f *fakeWorkerPool) PutChunk(_ context.Context, workerAddr, chunkID string, data io.Reader, _ int64) error {
 	b, _ := io.ReadAll(data)
+	f.mu.Lock()
 	f.chunks[key(workerAddr, chunkID)] = b
+	f.mu.Unlock()
 	return nil
 }
 func (f *fakeWorkerPool) GetChunk(_ context.Context, workerAddr, chunkID string) (io.ReadCloser, error) {
+	f.mu.Lock()
 	b, ok := f.chunks[key(workerAddr, chunkID)]
+	f.mu.Unlock()
 	if !ok {
 		return nil, models.ErrNotFound
 	}

@@ -213,8 +213,7 @@ func TestNP2_SecondaryWorkerDown_Returns502_ObjectRolledBack(t *testing.T) {
 
 	// Primary ("") succeeds, secondary ("") also resolves to "" in fake.
 	// Simulate: primary succeeds, secondary fails.
-	callCount := 0
-	failingPool := &secondFailPool{inner: pool, failAfter: 1, callCount: &callCount}
+	failingPool := &secondFailPool{inner: pool, failAfter: 1}
 
 	srv := New(":0", store, pl, failingPool, &fakeHealth{online: []string{"w1", "w2"}})
 	rec := doUpload(t, srv, "f.txt", "data", nil)
@@ -225,12 +224,16 @@ func TestNP2_SecondaryWorkerDown_Returns502_ObjectRolledBack(t *testing.T) {
 type secondFailPool struct {
 	inner     *partitionPool
 	failAfter int
-	callCount *int
+	mu        sync.Mutex
+	callCount int
 }
 
 func (p *secondFailPool) PutChunk(ctx context.Context, addr, id string, data io.Reader, size int64) error {
-	*p.callCount++
-	if *p.callCount > p.failAfter {
+	p.mu.Lock()
+	p.callCount++
+	n := p.callCount
+	p.mu.Unlock()
+	if n > p.failAfter {
 		return fmt.Errorf("worker %s: network partition", addr)
 	}
 	return p.inner.PutChunk(ctx, addr, id, data, size)
@@ -267,11 +270,10 @@ func TestNP3_BothWorkersDown_Returns503_NoChunksWritten(t *testing.T) {
 
 func TestNP4_MultiChunkFile_FailsOnChunk2_RollsBack(t *testing.T) {
 	store := mustOpenStore(t, t.TempDir())
-	callCount := 0
 	pool := newPartitionPool()
 	pl := &fakePlacement{workers: []string{"w1", "w2"}}
 	// Fail after 2 successful PutChunk calls (chunk0 primary+secondary succeed, chunk1 primary fails).
-	failingPool := &secondFailPool{inner: pool, failAfter: 2, callCount: &callCount}
+	failingPool := &secondFailPool{inner: pool, failAfter: 2}
 	srv := New(":0", store, pl, failingPool, &fakeHealth{online: []string{"w1", "w2"}})
 
 	// Need content > 1 MB to get 2 chunks (chunkSize = 1 MB).
