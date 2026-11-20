@@ -1,10 +1,10 @@
-# MiniDFS — Self-Healing (P2P Replication + Worker Restart Reconciliation)
+# MiniDFS — Self-Healing (P2P Replication + GC Reconciler)
 
 ```mermaid
 sequenceDiagram
   participant W2 as Worker 2 failing
   participant LT as Lease Table
-  participant CTL as Controller
+  participant CTL as Controller (GC Reconciler)
   participant DB as bbolt
   participant WS as Surviving Worker
   participant WN as Replacement Worker
@@ -17,11 +17,13 @@ sequenceDiagram
   LT->>CTL: Declare worker2 OFFLINE
   CTL->>CTL: Remove worker2 vnodes from hash ring
 
-  CTL->>DB: Scan all chunks — replica_count less than 2
-  DB-->>CTL: List of DEGRADED chunks
+  Note over CTL: GC Reconciler fires (interval or triggered)
+  CTL->>WS: GET /internal/workers/{id}/chunks — scan inventory
+  WS-->>CTL: Current chunk list
+  CTL->>DB: Compare inventory vs replica records
+  DB-->>CTL: Chunks where a listed replica is missing
 
-  loop For each degraded chunk
-    CTL->>CTL: Select replacement via ring — next healthy vnode
+  loop For each chunk with missing replica (parallel, up to 4 concurrent)
     CTL->>WS: POST /replicate-peer {chunk_id, target: WN.addr}
     Note over WS,WN: P2P direct stream — controller not in data path
     WS->>WN: PUT /internal/chunks/{chunk_id}
@@ -35,6 +37,7 @@ sequenceDiagram
   Note over W2,CTL: Later — docker start worker2
   W2->>CTL: POST /internal/workers/register
   CTL->>CTL: Re-add worker2 vnodes to hash ring
+  Note over CTL: Next reconciler pass detects worker2 rejoined
   CTL->>W2: GET /internal/workers/worker2/chunks
   W2-->>CTL: Current chunk inventory
   CTL->>CTL: Reconcile — skip already-healed, repair still-degraded only

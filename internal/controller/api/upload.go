@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/KrishnaChaitanya16/Distributed_Object_Store/internal/controller/metrics"
@@ -284,19 +285,37 @@ func (s *Server) storeChunk(ctx context.Context, objectID string, ref models.Chu
 		return 0, "", nil
 	}
 	log.Debug("chunk saved to bbolt", "chunk_id", ref.ChunkID, "state", "PENDING")
+	type pushResult struct {
+		role  string
+		repID string
+		ms    int64
+		err   error
+	}
+	results := make([]pushResult, len(rec.Replicas))
+	pushStart := time.Now()
+	var wg sync.WaitGroup
 	for i, rep := range rec.Replicas {
-		role := "secondary"
-		if i == 0 {
-			role = "primary"
+		wg.Add(1)
+		go func(i int, rep models.Replica) {
+			defer wg.Done()
+			role := "secondary"
+			if i == 0 {
+				role = "primary"
+			}
+			t := time.Now()
+			err := s.workers.PutChunk(ctx, s.workerAddr(rep.WorkerID), ref.ChunkID, newBytesReader(data), int64(len(data)))
+			results[i] = pushResult{role: role, repID: rep.WorkerID, ms: time.Since(t).Milliseconds(), err: err}
+		}(i, rep)
+	}
+	wg.Wait()
+	_ = pushStart
+	for _, res := range results {
+		if res.err != nil {
+			emit(ctx, "upload.push", "pushing the chunk to a worker failed", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID, "worker", res.repID, "role", res.role, "ok", false, "error", res.err.Error())
+			return http.StatusBadGateway, "worker error", fmt.Errorf("put chunk on %s %s: %w", res.role, res.repID, res.err)
 		}
-		log.Debug("pushing chunk to "+role+" worker", "chunk_id", ref.ChunkID, "worker_id", rep.WorkerID, "addr", s.workerAddr(rep.WorkerID))
-		pushStart := time.Now()
-		if err := s.workers.PutChunk(ctx, s.workerAddr(rep.WorkerID), ref.ChunkID, newBytesReader(data), int64(len(data))); err != nil {
-			emit(ctx, "upload.push", "pushing the chunk to a worker failed", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID, "worker", rep.WorkerID, "role", role, "ok", false, "error", err.Error())
-			return http.StatusBadGateway, "worker error", fmt.Errorf("put chunk on %s %s: %w", role, rep.WorkerID, err)
-		}
-		emit(ctx, "upload.push", "chunk stored on a worker", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID, "worker", rep.WorkerID, "role", role, "ok", true, "ms", time.Since(pushStart).Milliseconds())
-		log.Debug("chunk stored on "+role, "chunk_id", ref.ChunkID, "worker_id", rep.WorkerID)
+		emit(ctx, "upload.push", "chunk stored on a worker", "object_id", objectID, "index", ref.Index, "chunk_id", ref.ChunkID, "worker", res.repID, "role", res.role, "ok", true, "ms", res.ms)
+		log.Debug("chunk stored on "+res.role, "chunk_id", ref.ChunkID, "worker_id", res.repID)
 	}
 	if err := s.meta.MarkChunkDurable(ctx, ref.ChunkID); err != nil {
 		return http.StatusInternalServerError, "internal error", err
