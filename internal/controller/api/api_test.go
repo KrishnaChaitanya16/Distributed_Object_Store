@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -269,4 +270,39 @@ func TestUpload_NoWorkers_Returns503(t *testing.T) {
 	srv.http.Handler.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
+func TestUpload_LargeFileLeavesNoTempFilesBehind(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	srv, _ := newTestServer(t)
+	body, ct := multipartBody(t, "big.bin", strings.Repeat("x", 33<<20))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	left, err := os.ReadDir(tmp)
+	require.NoError(t, err)
+	assert.Empty(t, left, "a file over 32 MiB is spooled to disk and must be removed when the request ends")
+}
+
+func TestUpload_RejectedLargeFileLeavesNoTempFilesBehind(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	srv, _ := newTestServer(t)
+	body, ct := multipartBody(t, "big.bin", strings.Repeat("x", 33<<20))
+	srv.health = &fakeHealth{online: []string{}}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/objects", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+
+	left, err := os.ReadDir(tmp)
+	require.NoError(t, err)
+	assert.Empty(t, left, "an upload turned away after parsing must not leave its spooled file")
 }

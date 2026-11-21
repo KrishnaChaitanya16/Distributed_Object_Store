@@ -74,6 +74,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "expected multipart/form-data with field 'file'")
 		return
 	}
+	// the handler works on a copy of the request, so net/http never sees the form and would leave files over 32 MiB in the temp directory
+	defer func() { _ = r.MultipartForm.RemoveAll() }()
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "missing 'file' field")
