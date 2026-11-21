@@ -1,385 +1,449 @@
 # MiniDFS Benchmarks
 
-Each result says what workload produced it. The method and the questions come from [docs/BENCHMARKS_SPEC.md](docs/BENCHMARKS_SPEC.md); the code is in [test/benchmarks](test/benchmarks).
+Every result says what workload produced it. The questions come from [docs/BENCHMARKS_SPEC.md](docs/BENCHMARKS_SPEC.md); the code is in [test/benchmarks](test/benchmarks) and the tables below are generated from its JSON output by [test/benchmarks/report.py](test/benchmarks/report.py), so nothing was copied by hand.
 
-**Environment for every number below:** AMD Ryzen AI 5 340 (12 threads), NVMe SSD, Go 1.27, Linux. The cluster is real but in one process on one machine: a controller with bbolt, 4 workers that write chunk files with fsync, replication factor 2, 1 MiB chunks, and chunks travelling over loopback HTTP. Absolute throughput is therefore bound by one disk and one CPU; the **ratios and counts** are what carry over to a real cluster.
+Machine: AMD Ryzen AI 5 340 w/ Radeon 840M (12 threads), kernel 7.0.0-43-generic, go1.27.4, commit 4c5725f, run on 2026-11-21; 1 warm-up and 7 measured repetitions per benchmark.
+
+## How every number was produced
+
+All eight benchmarks use the same protocol, on the same commit and the same machine, in one run.
+
+* **System under test.** A real cluster in one process: a controller with bbolt, 4 workers that write chunk files with fsync, replication factor 2, 1 MiB chunks, chunks travelling over loopback HTTP. Absolute throughput is therefore bound by one disk and one CPU (other idle containers were also running on the machine); the **ratios and counts** carry over to a real cluster, the absolute milliseconds do not.
+* **Repetitions.** One warm-up repetition, discarded, then 7 measured repetitions, each on a freshly built cluster. Where two configurations are compared (dedup on and off, hedging on and off) they alternate which goes first in each repetition.
+* **Latency is reported as P50, P95, P99 and max, never as an average.** The samples from all 7 repetitions are pooled, and the sample count `n` is printed next to each table. With `n` below about 100, P99 is the largest or second-largest sample, so it is a tail indicator, not a stable estimate; the per-repetition P99 spread is shown where it matters (benchmark 4).
+* **Every other measurement** (bytes, counts, durations that occur once per repetition) is the median of the 7 repetitions with the min to max range in brackets. A number without a range was identical in all 7.
+* **Comparisons** are the ratio of medians with a bootstrap 95% confidence interval (2000 resamples, fixed seed). If the interval contains 1.00, the two configurations are **not distinguishable** in this data, and the text says so.
+* **Closed loop.** One request is in flight at a time per client. These numbers show latency without queueing and do not include a throughput-versus-load curve; the effect of many concurrent clients was not measured.
+* **Benchmark 8 is pure computation.** A repetition there is a different set of 10,000 chunk ids, not a re-run of the same one, and there is no warm-up.
+* Benchmarks 2 and 3 enforce two invariants in every repetition and stop if either breaks: no object is ever served with wrong bytes, and (benchmark 2) exactly the objects whose copies were all on dead workers are the unavailable ones.
+
+### Headline results
+
+| # | Question | Result |
+|---|---|---|
+| 1 | Does dedup save storage and time? | Depends on content: 1.00x random media, 1.14x unrelated images, 2.06x images on a shared base. Upload time 1.56x faster on the shared base (CI 1.48-1.68), 1.10x on unrelated images (CI 1.05-1.21), not distinguishable on random media |
+| 2 | Does RF=2 keep data available? | One worker down: 200 of 200 served in all 7 repetitions, 0 wrong, no read slowdown. Two down: 9.5% unavailable, all 503. RF=1 one down: 22.0% unavailable |
+| 3 | What does the scrubber add? | 0 wrong bytes with or without it (the controller verifies SHA-256). It finds the 10 of 10 damaged copies that reads never see; without it 4 corrupt copies stay on disk |
+| 4 | Do hedged reads cut tail latency? | 100 ms slow worker: P99 28.0 ms with hedging vs 103.5 ms without (3.7x). 0 hedges in 700 reads when nothing is slow |
+| 5 | How fast does redundancy come back? | 521 chunks/s (500 x 64 KiB), 288 MiB/s (100 x 1 MiB); no reconciler: 100% of lost copies stay missing |
+| 6 | Does dedup compound over repeated pushes? | 10 pushes: 74 MiB sent instead of 200 (2.70x), total time 1.55x shorter (CI 1.39-2.09) |
+| 7 | What does dedup cost when it cannot help? | Nothing distinguishable: per-chunk time ratio 1.03 (CI 0.91-1.45) |
+| 8 | How many chunks move when a worker is added? | 18.8% of chunks at 4 to 5 workers vs 79.9% with modulo; 2.7% vs 97.4% at 39 to 40 |
+
+Defects found and fixed while benchmarking: the download returned 502 instead of 503 when no replica was reachable (benchmark 2); a cancelled read, which every winning hedge causes, was counted as a worker failure and opened the circuit breaker on a healthy worker (benchmark 4); and the upload handler left a temp file on disk for every upload over 32 MiB, which filled the disk during benchmark 7 (see the end).
 
 ---
 
-## 1. Dedup storage savings: Docker layers vs random media
+## 1. Dedup: storage and upload time
 
-### Workloads
-
-* **A, Docker layers.** The layer tarballs of five real images, uploaded in this order: `ubuntu:20.04`, `ubuntu:22.04`, `nginx:latest`, `node:18-slim`, `python:3.11-slim` (18 layer files, 620 MiB, 633 chunks). Extracted by `test/benchmarks/fetch_layers.sh` from `docker save`.
-* **B, random media.** 5 files of 124 MiB from `crypto/rand` (620 MiB, 625 chunks), so no two chunks can be alike.
+### Workload
+* **A, Docker layers.** The layer tarballs of five real images, uploaded in this order: `ubuntu:20.04`, `ubuntu:22.04`, `nginx:latest`, `node:18-slim`, `python:3.11-slim` (18 files, 620 MiB, 633 chunks), extracted by `test/benchmarks/fetch_layers.sh`.
+* **C, Python versions.** `python:3.11-slim`, `3.10-slim`, `3.9-slim` (12 files, 365 MiB, 372 chunks). They share no whole layer, but some chunks are alike.
+* **D, shared base.** Three application images (requests, flask, numpy) built `FROM python:3.11-slim` by `build_app_images.sh`, so they share the base layers exactly (15 files, 481 MiB, 488 chunks).
+* **B, random media.** 5 files of 124 MiB from `crypto/rand` (620 MiB, 625 chunks); no two chunks can match.
 * **Baseline, dedup off.** The same uploads through the same code with `Server.DisableDedup()`: every chunk is written to its workers again and the Bloom filter is skipped.
-
-"Storage ratio" is what a replicated store *without* dedup would write (`uploaded x 2`) divided by what is actually on the workers' disks.
+* "Upload ms per chunk" is one sample per uploaded file: the time of the whole request divided by its number of chunks (files differ in size, so raw per-file time would mostly measure file size). "Storage ratio" is what a replicated store without dedup would write (`uploaded x 2`) divided by what is on the workers' disks.
 
 ### Results
+**A. Docker layers** (18 files, 620 MiB, 633 chunks)
 
-| Metric | A: Docker layers, dedup on | A: dedup off | B: random media, dedup on | B: dedup off |
-|---|---|---|---|---|
-| Uploaded | 620 MiB | 620 MiB | 620 MiB | 620 MiB |
-| Chunks / chunks deduplicated | 633 / **78** | 633 / 0 | 625 / 0 | 625 / 0 |
-| Bytes sent to workers | **1085 MiB** | 1240 MiB | 1240 MiB | 1240 MiB |
-| Bytes on worker disks | **1085 MiB** | 1085 MiB * | 1240 MiB | 1240 MiB |
-| **Storage ratio** | **1.14x** | n/a (see below) | **1.00x** | 1.00x |
-| Upload time per chunk | **21.3 ms** | 25.9 ms | 25.0 / 26.2 / 25.2 ms (3 runs) | 26.0 / 26.0 / 26.1 ms (3 runs) |
-| Bloom filter false positives | 0 of 633 | n/a | 0 of 625 | n/a |
+| Metric (median over reps, min-max) | Dedup on | Dedup off |
+|---|---|---|
+| Chunks deduplicated | 78 | 0 |
+| Bytes sent to workers (MiB) | 1,085 | 1,240 |
+| Bytes on worker disks (MiB) | 1,085 | 1,085 |
+| Storage ratio | 1.14 | n/a |
+| Bloom false positives (% of checks) | 0.00 | n/a |
+| Upload ms per chunk, P50 (n=126 files) | 19.4 | 19.3 |
+| Upload ms per chunk, P95 (n=126 files) | 33.2 | 33.2 |
+| Upload ms per chunk, P99 (n=126 files) | 63.8 | 58.2 |
+| Upload ms per chunk, max (n=126 files) | 140.3 | 95.3 |
+| Whole upload, seconds | 13.2 (12.0-13.9) | 14.6 (13.3-15.8) |
+| Throughput, MiB/s | 46.8 (44.7-51.6) | 42.4 (39.2-46.6) |
 
-\* With content-addressed chunks, writing an identical chunk again replaces the same file, so "dedup off" does not use more disk here. What dedup saves is **network and worker writes** (row above), and the storage ratio is measured against the no-dedup size.
+Upload time off / on: 1.10x (95% CI 1.05-1.21)
 
-### Per image (Docker layers)
+**C. Python 3.11 / 3.10 / 3.9** (12 files, 365 MiB, 372 chunks)
 
-| Image | Size | Chunks written / deduplicated | Sent to workers, dedup on / off | Upload time, dedup on / off | Throughput on / off |
-|---|---|---|---|---|---|
-| ubuntu:20.04 | 71.7 MiB | 72 / 0 | 143 / 143 MiB | 1.71 s / 1.95 s | 41.8 / 36.7 MiB/s |
-| ubuntu:22.04 | 77.2 MiB | 78 / 0 | 154 / 154 MiB | 1.82 s / 2.46 s | 42.5 / 31.4 MiB/s |
-| nginx:latest | 159.2 MiB | 165 / 0 | 318 / 318 MiB | 4.00 s / 3.89 s | 39.8 / 41.0 MiB/s |
-| node:18-slim | 188.2 MiB | 192 / 0 | 377 / 377 MiB | 4.42 s / 4.88 s | 42.6 / 38.6 MiB/s |
-| **python:3.11-slim** | 123.7 MiB | **48 / 78** | **92 / 247 MiB (-63%)** | **1.53 s / 3.20 s (2.1x faster)** | **80.6 / 38.7 MiB/s** |
+| Metric (median over reps, min-max) | Dedup on | Dedup off |
+|---|---|---|
+| Chunks deduplicated | 54 | 0 |
+| Bytes sent to workers (MiB) | 623 | 731 |
+| Bytes on worker disks (MiB) | 623 | 623 |
+| Storage ratio | 1.17 | n/a |
+| Bloom false positives (% of checks) | 0.00 | n/a |
+| Upload ms per chunk, P50 (n=84 files) | 21.3 | 21.9 |
+| Upload ms per chunk, P95 (n=84 files) | 32.7 | 33.5 |
+| Upload ms per chunk, P99 (n=84 files) | 48.2 | 66.7 |
+| Upload ms per chunk, max (n=84 files) | 48.2 | 66.7 |
+| Whole upload, seconds | 8.5 (7.2-9.6) | 9.4 (7.7-10.1) |
+| Throughput, MiB/s | 43.2 (38.2-51.0) | 39.0 (36.1-47.7) |
+
+Upload time off / on: 1.11x (95% CI 0.98-1.24)
+
+**D. Three apps on one base image** (15 files, 481 MiB, 488 chunks)
+
+| Metric (median over reps, min-max) | Dedup on | Dedup off |
+|---|---|---|
+| Chunks deduplicated | 252 | 0 |
+| Bytes sent to workers (MiB) | 467 | 961 |
+| Bytes on worker disks (MiB) | 467 | 467 |
+| Storage ratio | 2.06 | n/a |
+| Bloom false positives (% of checks) | 0.00 | n/a |
+| Upload ms per chunk, P50 (n=105 files) | 6.8 | 19.1 |
+| Upload ms per chunk, P95 (n=105 files) | 25.3 | 29.4 |
+| Upload ms per chunk, P99 (n=105 files) | 33.0 | 43.7 |
+| Upload ms per chunk, max (n=105 files) | 41.8 | 77.2 |
+| Whole upload, seconds | 6.6 (6.3-7.2) | 10.3 (9.9-11.2) |
+| Throughput, MiB/s | 73.1 (67.2-76.1) | 46.8 (43.0-48.7) |
+
+Upload time off / on: 1.56x (95% CI 1.48-1.68)
+
+**B. Random media** (5 files, 620 MiB, 625 chunks)
+
+| Metric (median over reps, min-max) | Dedup on | Dedup off |
+|---|---|---|
+| Chunks deduplicated | 0 | 0 |
+| Bytes sent to workers (MiB) | 1,240 | 1,240 |
+| Bytes on worker disks (MiB) | 1,240 | 1,240 |
+| Storage ratio | 1.00 | n/a |
+| Bloom false positives (% of checks) | 0.00 | n/a |
+| Upload ms per chunk, P50 (n=35 files) | 20.1 | 21.7 |
+| Upload ms per chunk, P95 (n=35 files) | 27.2 | 27.3 |
+| Upload ms per chunk, P99 (n=35 files) | 32.1 | 29.2 |
+| Upload ms per chunk, max (n=35 files) | 32.1 | 29.2 |
+| Whole upload, seconds | 13.1 (12.7-14.2) | 13.8 (12.5-14.4) |
+| Throughput, MiB/s | 47.2 (43.6-48.8) | 45.0 (42.9-49.4) |
+
+Upload time off / on: 1.05x (95% CI 0.95-1.08)
+
+**The cost of the dedup check itself** (Go microbenchmark, `-count=7`, median and range over 7 runs of 1 s each):
+
+| Operation | Per call |
+|---|---|
+| Bloom filter lookup, chunk never seen | 46.1 ns (45.0-46.9) |
+| Bloom filter insert after storing a chunk | 93.2 ns (92.7-94.1) |
+| bbolt chunk lookup, when the Bloom filter says "maybe" | 2.37 µs (2.30-2.44) |
+| bbolt transaction recording a chunk reference (paid by both modes) | 1.64 ms (1.52-2.17) |
 
 ### What the data says
+1. **Savings depend entirely on what is uploaded, and they are exact.** Storage ratio 1.14x for unrelated images, 1.17x for three Python versions, 2.06x for three images on one base, 1.00x for random media. The counts were identical in all 7 repetitions. 2.06x is the theoretical limit for the shared-base workload (two of the three images are almost entirely duplicates of the first).
+2. **Sending less is faster only when a lot is saved.** Shared base: 1.56x less upload time (CI 1.48-1.68), per-chunk P50 6.8 ms against 19.1 ms, throughput 73 against 47 MiB/s. Unrelated images: 1.10x (CI 1.05-1.21), small but distinguishable. Python versions: 1.11x but the interval (0.98-1.24) contains 1.00, so not distinguishable.
+3. **When nothing repeats, dedup costs nothing measurable.** Random media: 1.05x (CI 0.95-1.08), P50 per chunk 20.1 against 21.7 ms, 0 Bloom false positives. The per-chunk work dedup adds is a 46 ns Bloom lookup and a 93 ns insert against a 20 ms upload. The spec expected about 2 ms of overhead per chunk; the cost it had in mind is a metadata lookup, which the Bloom filter avoids for new chunks, and the one write a new chunk needs (1.64 ms) is paid with dedup on or off.
+4. **Disk use is the same with dedup on or off.** Chunks are content-addressed, so writing an identical chunk again replaces the same file. What dedup saves is network transfer and worker writes (the "bytes sent" row), and the storage ratio is measured against the no-dedup size.
 
-1. **The spec's ~3x expectation was not met on these images: the measured saving is 1.14x (78 of 633 chunks, 12.5% fewer bytes on disk).** The spec assumed an Ubuntu base layer shared by nginx, node and python. In reality `nginx:latest` and `python:3.11-slim` share one 77.5 MiB **Debian** layer (`37fb86c2a767`), `node:18-slim` has a different Debian layer, and the two Ubuntu images share nothing. Only the one overlap shows up, which is exactly the 78 deduplicated chunks. The finding is about the workload, not about the dedup code.
-2. **Where there is overlap, the benefit is real and large.** The python image found its 78 shared chunks and sent 63% less data to the workers and uploaded 2.1x faster than the same upload with dedup off.
-3. **Random media gets no savings (1.00x) and dedup costs nothing measurable.** Per-chunk upload time with dedup on (25.0 to 26.2 ms) overlaps dedup off (26.0 to 26.1 ms): the difference is inside run-to-run noise. The spec's expected "+2 ms per chunk" is **not reproduced**.
-4. **Why the check is so cheap.** Measured in isolation (`BenchmarkDedupCheck_*`):
-
-   | Step | Cost |
-   |---|---|
-   | Bloom filter lookup of a new chunk | 45 ns |
-   | Bloom filter insert | 93 ns |
-   | bbolt lookup that confirms a "maybe" | 2.0 us |
-   | bbolt transaction that records the chunk reference (**both modes pay it**) | 1.67 ms |
-
-   The ~2 ms the spec expected is the cost of recording the chunk reference, which an upload needs whether or not dedup is on, so it is not dedup overhead.
-5. **Bloom false-positive rate: 0 of 633 questions** (0 of 625 for random media). The filter is sized for 1 M chunks at 1%, and these runs fill about 0.05% of it, so the expected rate at this fill is about 1e-24. "Below 1%" holds trivially; this run says nothing about the filter near capacity.
-
-### Follow-up: do images that really share a base reach the expected savings?
-
-A reviewer pointed out that the first result came from a poor workload and suggested three Python versions (`python:3.11-slim`, `3.10-slim`, `3.9-slim`) on the assumption that they "all share the same Debian base layer". That assumption was **checked before running anything, and it is false**: the three images have no layer in common (every layer ID and every layer SHA-256 differs), because they were built on different dates (2025-10-31, 2026-10-06, 2026-11-05) from different Debian snapshots. The measurement was run anyway, together with a workload that does share a base by construction.
-
-**Workload C, Python versions** (`BenchmarkDedup_PythonVersions`): the layers of 3.11, 3.10 and 3.9 slim, in that order (365 MiB, 372 chunks).
-
-**Workload D, shared base, constructed** (`BenchmarkDedup_SharedBase`): three application images built `FROM python:3.11-slim`, each adding one layer with `pip install` of `requests`, `flask` and `numpy` (481 MiB, 488 chunks). This is how many images in a real registry relate to each other; it is built by `build_app_images.sh`, not pulled.
-
-| Metric | C: Python versions, dedup on | C: dedup off | D: shared base, dedup on | D: dedup off |
-|---|---|---|---|---|
-| Chunks deduplicated | **54 of 372 (14.5%)** | 0 | **252 of 488 (51.6%)** | 0 |
-| Bytes sent to workers | 623 MiB | 731 MiB | **467 MiB** | 961 MiB |
-| **Storage ratio** | **1.17x** | n/a | **2.06x** | n/a |
-| Upload time per chunk | 22.2 ms | 25.7 ms | **13.6 ms** | 26.7 ms |
-| Bloom false positives | 0 of 372 | n/a | 0 of 488 | n/a |
-
-| Image (dedup on / off) | Chunks written / deduplicated | Sent to workers | Upload time |
-|---|---|---|---|
-| C: python:3.11-slim | 126 / 0 | 247 / 247 MiB | 3.04 s / 3.21 s |
-| C: python:3.10-slim | 71 / **52** | **138** / 242 MiB (-43%) | **2.04 s** / 3.14 s (1.5x faster) |
-| C: python:3.9-slim | 121 / 2 | 237 / 241 MiB | 3.18 s / 3.23 s |
-| D: app-requests (first) | 140 / 0 | 275 / 275 MiB | 3.34 s / 3.62 s |
-| D: app-flask | 16 / **126** | **31** / 279 MiB (-89%) | **0.92 s** / 3.77 s (**4.1x faster**) |
-| D: app-numpy | 80 / **126** | **160** / 407 MiB (-61%) | **2.38 s** / 5.62 s (2.4x faster) |
-
-What this shows:
-
-1. **No whole layer is shared between the Python versions, yet 14.5% of their chunks still deduplicate.** The 3.10 and 3.11 base layers are different layers but come from two nearby Debian snapshots, so their tar archives contain mostly the same files in the same order. 52 chunks line up at the same positions in both and hash identically. The 3.9 base is an older Debian and only 2 chunks line up. This is a real effect of fixed 1 MiB chunking, but it is fragile: it works only while the content before a chunk is the same length in both files.
-2. **The reviewer's expected 60 to 70% savings is not reached by real, independently built images (workload C: 14.5%).** It is reached in the sense that matters only when images truly share their base layers.
-3. **With a truly shared base (workload D), dedup removes 51.6% of chunks and uploads of the second and third image are 2.4x to 4.1x faster.** The storage ratio of 2.06x is the **maximum possible for this data**: the three images contain about 233 MiB of unique bytes (the shared 124 MiB base plus three app layers, the largest being numpy's 80 MiB), and 481 MiB / 233 MiB = 2.06. Dedup found every byte that could be found. It cannot reach 3x here because the images are not that similar.
-4. **Dedup savings depend on the workload, not only on the code.** Same system, same code: 1.00x on random data, 1.14x on five unrelated images, 1.17x on three Python versions, 2.06x on three images built from one base.
-
-### Honest limits of this benchmark
-
-* **Latency percentiles are weak here.** Only 18 files were uploaded, so P99 is just the largest file and per-file latency mostly measures file size. Per-image throughput and per-chunk time above are the comparable numbers. (`upload_p50_ms` and `upload_p99_ms` are in the JSON output.)
-* **Everything runs on one machine.** Network cost is loopback and all four workers share one disk, so the "sent to workers" saving would be worth more on a real network.
-* **MiniDFS is not recommended for raw media ingest.** For data with no repeated content it stores 2 copies like any replicated store and has the extra metadata work; it neither helps nor measurably hurts.
-* **Fixed 1 MiB chunking only finds whole-chunk matches.** Two files that share content but shift it by a few bytes (an inserted header, for example) do not deduplicate.
+### Honest limits
+* **The tail is not clearly better.** For Docker layers the slowest file with dedup on was slower than with it off (max 140.3 against 95.3 ms per chunk, P99 63.8 against 58.2). With 126 files per mode, P99 is the second-largest value, so this may be one slow file; the data cannot tell.
+* **Dedup helped less than in the first write-up of this benchmark.** The baseline got faster when replica pushes became parallel (commit 12baf06): off-mode per-chunk P50 is now 19.3 ms, where it was about 26 ms, so the saved network transfer is a smaller share of the total.
+* Chunks are cut at fixed 1 MiB boundaries, so one inserted byte shifts every later chunk and dedup finds nothing after it. A content-defined chunker might find more in the Python versions, which share content but no whole layer; that was not tested.
+* Layers are uncompressed tar files extracted from `docker save`; compressed layers would likely dedupe much less; that was not tested.
 
 ### Reproduce
-
 ```bash
-test/benchmarks/fetch_layers.sh                       # once: extracts the layers into testdata/layers (git-ignored)
-go test ./test/benchmarks/ -run '^$' -bench 'Dedup_' -benchtime=1x          # the four workload runs
-go test ./test/benchmarks/ -run '^$' -bench 'PythonVersions|SharedBase' -benchtime=1x   # the follow-up workloads
-test/benchmarks/build_app_images.sh                   # once: builds the three FROM-one-base images used by SharedBase
-test/benchmarks/fetch_layers.sh minidfs-bench-app-requests:1 minidfs-bench-app-flask:1 minidfs-bench-app-numpy:1
-go test ./test/benchmarks/ -run '^$' -bench 'DedupCheck_' -benchmem         # cost of each step of the check
-go test ./test/benchmarks/ -run '^$' -bench 'RawMedia' -benchtime=1x -count=3
-BENCH_OUT=/some/dir go test ... -bench 'Dedup_'       # also writes the full per-file and per-image JSON
+test/benchmarks/fetch_layers.sh && test/benchmarks/build_app_images.sh
+go test ./test/benchmarks/ -run '^$' -bench 'Dedup_' -benchtime=1x -timeout 5h
+go test ./test/benchmarks/ -run '^$' -bench 'DedupCheck_' -count=7
 ```
-
-The workload benchmarks skip with a clear message when the layers have not been fetched.
-
----
 
 ## 2. RF=2 availability during worker failure
 
 ### Workload
-Small single-chunk objects of 64 KiB of random bytes on a 4-worker cluster, then workers are killed (the server is closed, so connections are refused) and **every object is downloaded again**. A download counts as *served* only if the body's SHA-256 equals what was uploaded; a 200 with the wrong bytes would be counted as *corrupt*. Two replication modes: RF=2 (normal) and RF=1 (`Server.UseSingleReplica()`, only the primary stores the chunk). Run at the spec's 200 objects and at 2000 for tighter statistics.
+* 4 workers. 200 objects of 64 KiB (one chunk each) per repetition, random content, uploaded and read back once to confirm all are served. Then 1 or 2 workers are killed (their servers go away) and every object is read again, with every body checked against its SHA-256.
+* Each configuration is run with RF=2 (the system) and RF=1 (a baseline with `Server.UseSingleReplica()`, one copy per chunk). Random content means different objects land on different workers in each repetition, so the unavailable counts vary and show their range.
+* Failure detection: three workers are killed one after another on a cluster with heartbeats and the health monitor running as in production; each kill gives one sample (n=21 over 7 repetitions).
 
 ### Results
+| Configuration | Objects per rep | Served correctly | Unavailable | Unavailable, all reps pooled | Served corrupt | Expected unavailable |
+|---|---|---|---|---|---|---|
+| RF=2, 1 worker down | 200 | 200 | 0 | 0.0% | 0 | 0 |
+| RF=1, 1 worker down | 200 | 154 (149-166) | 46 (34-51) | 22.0% | 0 | 46 (34-51) |
+| RF=2, 2 workers down | 200 | 181 (175-186) | 19 (14-25) | 9.5% | 0 | 19 (14-25) |
+| RF=1, 2 workers down | 200 | 114 (102-120) | 86 (80-98) | 44.1% | 0 | 86 (80-98) |
 
-| Scenario | Objects | Served correctly | Unavailable | Corrupt bytes | Status of unavailable |
-|---|---|---|---|---|---|
-| **RF=2, 1 worker down** | 200 / 2000 | **100% / 100%** | 0 / 0 | **0** | n/a |
-| RF=1, 1 worker down | 200 / 2000 | 77.5% / 77.3% | 45 / 455 | 0 | 503 |
-| **RF=2, 2 workers down** | 200 / 2000 | 89.5% / 90.8% | 21 / 184 | **0** | 503 |
-| RF=1, 2 workers down | 200 / 2000 | 55.5% / 55.3% | 89 / 895 | 0 | 503 |
+| Configuration | Reads | P50 ms | P95 ms | P99 ms | max ms | n |
+|---|---|---|---|---|---|---|
+| RF=2, 1 down | before | 0.35 | 0.71 | 0.93 | 3.49 | 1400 |
+| RF=2, 1 down | after | 0.34 | 0.72 | 0.94 | 2.03 | 1400 |
+| RF=1, 1 down | before | 0.33 | 0.67 | 1.01 | 1.93 | 1400 |
+| RF=1, 1 down | after | 0.30 | 0.61 | 0.84 | 1.05 | 1092 |
+| RF=2, 2 down | before | 0.32 | 0.66 | 0.91 | 2.44 | 1400 |
+| RF=2, 2 down | after | 0.32 | 0.65 | 0.86 | 1.16 | 1267 |
+| RF=1, 2 down | before | 0.33 | 0.69 | 0.92 | 2.14 | 1400 |
+| RF=1, 2 down | after | 0.30 | 0.61 | 0.79 | 1.13 | 782 |
 
-| Latency (200 objects, RF=2, 1 worker down) | Before failure | After failure |
-|---|---|---|
-| P50 | 0.38 ms | 0.40 ms |
-| P99 | 0.97 ms | 1.02 ms |
-| Objects that had to be served from their secondary | | 48 |
+Status codes of the unavailable objects, RF=2 / 2 down, all reps: {'503': 133}
 
-**Detection time.** With real heartbeats (every 2 s) and the health monitor, a killed worker was declared OFFLINE after **5.3, 5.3 and 6.5 seconds** (lease 6 s, monitor tick 1 s).
+Failure detection (seconds from kill to OFFLINE, n=21 kills): min 5.29, P50 5.30, P95 6.51, P99 6.51, max 6.51
 
 ### What the data says
-1. **With RF=2 every object survives one worker failure: 100% served, 0 corrupt, no measurable latency penalty.** About a fifth of the objects (48 of 200, 476 of 2000) had their primary on the dead worker and were served from the secondary.
-2. **RF=1 loses exactly the dead worker's share: 22.8% of 2000 objects** (the spec said ~25%). The share is not exactly 1/4 because placement follows the consistent-hash ring, where worker2 owns 22.4% of the hash space (see the ring view). The first 200-object run lost only 16.5%; that was sampling noise (it is 200 draws from a 22% chance), which is why the 2000-object run exists.
-3. **RF=2 tolerates one failure, not two, and fails honestly.** With two workers down, the objects whose two copies were *both* on those workers (9.2% of 2000) are unavailable and answer **503**, never wrong bytes. In every run the number of unavailable objects equals exactly the number whose every copy was on a dead worker; the benchmark fails if it does not.
-4. **The post-failure latency penalty is nil here because the failure is the cheap kind.** A refused connection fails in microseconds, so falling back to the secondary costs nothing visible. A worker that *hangs* instead of refusing is the case hedged reads exist for (benchmark 4).
-
-### A defect this benchmark found and fixed
-For the first ~6 seconds after a worker died (until its lease expires), a download of an object with both copies on dead workers answered **502 Bad Gateway** instead of the spec's **503 Service Unavailable**, because the controller chose the status from the health table, which had not noticed yet. It now classifies by what actually happened: if both replicas failed because the worker could not be reached (connection refused, timeout, or an open circuit breaker), the answer is 503 at once. Workers that answer but hold no valid data still give 502. Before the fix the RF=1 run returned 502 for 455 of 457 unavailable objects; after it, 503 for all.
+1. **With RF=2, one worker down loses nothing.** 200 of 200 objects were served in every repetition, none with wrong bytes, and reads after the failure are as fast as before (P99 0.94 against 0.93 ms, n=1400 each).
+2. **RF=1 shows what replication buys.** One worker down made 22.0% of objects unavailable (34 to 51 of 200 per repetition), the share of data that worker held.
+3. **Two workers down hurts even RF=2, but only for objects that had both copies on them.** 9.5% (14 to 25 of 200). Each of those was reported as 503 (133 of 133 across the repetitions) rather than an error that suggests corruption.
+4. **Never a wrong byte.** 0 objects were served with wrong content in any configuration, and in every repetition the unavailable set equalled the set of objects whose copies were all on dead workers. The benchmark stops if either is violated.
+5. **Detection takes 5.3 to 6.5 seconds** (P50 5.30 s, n=21), set by the 2 s heartbeat and 6 s lease. Reads do not wait for it: the download path falls back to the secondary at once when a connection fails.
 
 ### Honest limits
-* Failure here means "connection refused", the fastest way to fail. Slow failures are measured in benchmark 4.
-* A worker is killed once and not restored; recovery is benchmark 5.
-* One machine, loopback network, so latencies are lower than a real network. The availability percentages do not depend on that.
+* The killed server refuses connections immediately, so the fallback is fast. A worker that hangs instead of refusing is the case hedged reads address (benchmark 4).
+* 64 KiB objects over loopback; large objects read from a secondary would add transfer time.
+* Objects are single chunks; an object of many chunks is lost when any one chunk is.
+
+### A defect this benchmark found and fixed
+The download first returned 502 when no replica could be reached, where the spec asks for 503. It now returns 503 when both replicas are unreachable (including a tripped circuit breaker) and 502 only when a reachable worker does not have a valid copy (commit caafd09).
 
 ### Reproduce
 ```bash
-go test ./test/benchmarks/ -run '^$' -bench 'Availability_' -benchtime=1x
-BENCH_OBJECTS=2000 go test ./test/benchmarks/ -run '^$' -bench 'Availability_RF' -benchtime=1x
+go test ./test/benchmarks/ -run '^$' -bench 'Availability_' -benchtime=1x -timeout 5h
 ```
-
----
 
 ## 3. Scrubber: corruption caught before a user reads it
 
 ### Workload
-50 objects of 2 MiB (100 chunks, 200 copies on 4 workers). **10 distinct chunks** each lose one copy to corruption, chosen with a fixed seed so every run damages the same copies. Two kinds of damage:
-
-* **Footer:** the 4-byte CRC32C footer of the chunk file is overwritten with `0xFF` (the spec's scenario). The data bytes are untouched.
-* **Data (bit rot):** one byte inside the chunk's data is inverted.
-
-Each is run without a scrubber and with one scrubber pass on every worker before reading. "Direct reads" fetch every chunk straight from the workers (what a store with no end-to-end check would deliver); "controller" downloads go through MiniDFS, which verifies the SHA-256 of every chunk.
+* 4 workers, RF=2. 50 objects of 2 MiB (100 chunks, 200 copies on disk). 10 copies are damaged, in two ways: **footer damage** overwrites the stored CRC32C with 0xFF bytes and leaves the data intact; **bit rot** flips bytes inside the chunk data.
+* Each damage type is run without a scrubber and with one full scrubber pass on every worker before reading. "Direct reads" fetch every copy straight from its worker, which is what a system without end-to-end verification would return.
+* The 50 objects are then read through the controller; every body is checked against its SHA-256. The read-latency rows are the 50 reads per repetition (n=350).
+* **Pass duration:** one worker, 1000 chunks of 1 MiB, 10 of them corrupted, with no pause between chunks and with the default 10 ms pause.
 
 ### Results
-
-| | Footer, no scrubber | Footer, scrubber | Data, no scrubber | Data, scrubber |
+| Metric (median over reps, min-max) | footer, no scrubber | footer, scrubber | bit rot, no scrubber | bit rot, scrubber |
 |---|---|---|---|---|
 | Corrupt copies injected | 10 | 10 | 10 | 10 |
-| Direct worker reads returning wrong bytes (of 200) | 0 | 0 | **10** | **10** (measured before the pass) |
-| **Objects the controller served with wrong bytes** | **0** | **0** | **0** | **0** |
-| Objects served correctly (of 50) | 50 | 50 | 50 | 50 |
-| SHA-256 mismatches hit by readers (each a wasted fetch + fallback) | 0 | 0 | **6** | **0** |
-| Copies quarantined by the scrubber | 0 | **10** | 0 | **10** |
-| Corrupt copies still on disk after the run | 10 | **0** | 4 | **0** |
-| Slowest scrubber pass | n/a | 34 ms | n/a | 37 ms |
+| Direct worker reads returning wrong bytes | 0 | 0 | 10 | 10 |
+| Objects the controller served with wrong bytes | 0 | 0 | 0 | 0 |
+| Objects unavailable | 0 | 0 | 0 | 0 |
+| SHA-256 mismatches hit by readers | 0 | 0 | 6 | 0 |
+| Copies quarantined by the scrubber | 0 | 10 | 0 | 10 |
+| Corrupt copies still on disk afterwards | 10 | 0 | 4 | 0 |
+| Slowest scrubber pass, ms | 0.0 | 82.0 (34.4-91.9) | 0.0 | 42.6 (38.7-169.8) |
+| Object read ms, P50 (n=350) | 5.14 | 5.27 | 5.50 | 5.40 |
+| Object read ms, P95 (n=350) | 6.62 | 6.77 | 7.83 | 6.91 |
+| Object read ms, P99 (n=350) | 7.23 | 7.95 | 8.63 | 7.80 |
+| Object read ms, max (n=350) | 7.81 | 9.08 | 9.80 | 10.27 |
 
-**Scrubber pass duration** (one worker, 1000 chunks of 1 MiB, 10 corrupted, all 10 found):
-
-| Pause between chunks | Time for 1000 chunks | Throughput |
+| Pause between chunks | Seconds for 1000 x 1 MiB chunks | Chunks/s |
 |---|---|---|
-| none | **0.57 s** | 1741 chunks/s (~1.7 GiB/s) |
-| 10 ms (the default) | **13.6 s** | 73 chunks/s |
+| none | 0.30 (0.24-0.56) | 3,340 (1,781-4,162) |
+| 10 ms (default) | 11.47 (11.17-11.92) | 87 |
+
+Corrupt chunks found per pass: 10 of 10
 
 ### What the data says
-1. **The failure the spec worries about, wrong bytes delivered to a user, never happens in either configuration, and the scrubber is not what prevents it.** The controller checks the SHA-256 of every chunk it reads, so it served 0 wrong objects even with no scrubber and real bit rot. Without that check, 10 of the 200 chunk reads from workers would have returned corrupt data silently.
-2. **What the scrubber adds is finding damage that no read would ever surface.**
-   * **Footer damage is invisible to readers:** the data is fine, so every read succeeds and nothing complains; the corrupt footer stays forever. Only the scrubber finds it (10 of 10).
-   * **Bit rot on a copy that is never read stays hidden.** Without a scrubber, 4 of the 10 damaged copies were still on disk after all 50 objects were downloaded: they were the secondary copies, which reads never touch. The other 6 were primaries, hit by a read and healed by read-repair. A damaged secondary is a latent single point of failure: lose the other copy and the data is gone.
-   * **It removes the cost of discovering damage on the read path.** Without a scrubber 6 readers each fetched a corrupt 1 MiB chunk, failed the hash check and fell back; with the scrubber 0 did.
-3. **The scrubber quarantines but does not restore.** After the pass, 10 chunks had fewer than 2 good copies. Bringing them back to 2 is the reconciler's job (benchmark 5); the two together close the window.
-4. **A scrubber pass is cheap but deliberately paced.** CRC32C verification runs at ~1.7 GiB/s on this machine, so 1000 chunks take 0.57 s flat out. The default 10 ms pause between chunks (to avoid competing with reads) turns that into 13.6 s per 1000 chunks, about 73 chunks/s. It is a setting (`SCRUB_PAUSE_MS`), so the trade between background load and time-to-detect is explicit.
+1. **The failure the spec worries about, wrong bytes delivered to a user, never happens, and the scrubber is not what prevents it.** The controller checks the SHA-256 of every chunk it reads, so it served 0 wrong objects even with no scrubber. Without that check, 10 direct reads under bit rot would have returned wrong bytes.
+2. **What the scrubber adds is finding damage that no read surfaces.** Footer damage leaves the data correct, so every read succeeds and nothing complains: 10 damaged copies stay on disk without a scrubber, 0 with one. Under bit rot, 4 of the 10 damaged copies were still on disk after all reads without a scrubber: they were secondary copies, which reads never touch, so a second failure could have lost the data.
+3. **It removes damage from the read path.** Without a scrubber, 6 reads fetched a corrupt chunk, failed the hash check and fell back to the other copy; with one, 0. The cost is visible in the tail but small: P95 7.83 against 6.91 ms and P99 8.63 against 7.80 ms; the maximum is not different (9.80 against 10.27 ms).
+4. **The scrubber quarantines, it does not restore.** Ten chunks end with a single good copy; the reconciler (benchmark 5) brings them back to two.
+5. **A pass is cheap, and deliberately paced.** Unpaced, 1000 chunks took 0.30 s with a wide range (0.24 to 0.56 s, 1,781 to 4,162 chunks/s); with the default 10 ms pause 11.47 s (87 chunks/s). The pause is a setting (`SCRUB_PAUSE_MS`) that trades time-to-detect against background load.
 
 ### Honest limits
-* The spec's expected "silent corrupt data returned: possible" applies only to a system without end-to-end verification. MiniDFS has one, so that column reads 0 everywhere. The direct-read row shows what would have happened without it.
-* The scrub passes ran on a quiet cluster with the OS page cache warm; a cold disk is slower.
-* Corruption was injected into one copy per chunk. If both copies of a chunk are corrupted before anyone notices, the data is lost, and the system reports it as unavailable instead of returning bad bytes (benchmark 2).
+* The scrubber ran on a quiet cluster with a warm page cache; a cold disk is slower, and the unpaced range shows how much the first pass can vary.
+* Damage was injected into one copy per chunk. If both copies of a chunk are damaged before anyone notices, the data is lost and reported as unavailable instead of being returned wrong (benchmark 2).
+* The spec's "silent corrupt data possible" column does not apply here because of the controller-side verification; the direct-read row is what that column would have shown.
 
 ### Reproduce
 ```bash
-go test ./test/benchmarks/ -run '^$' -bench 'Scrubber_' -benchtime=1x
+go test ./test/benchmarks/ -run '^$' -bench 'Scrubber_' -benchtime=1x -timeout 5h
 ```
 
 ## 4. Hedged reads: tail latency when one worker is slow
 
 ### Workload
-* Real in-process cluster, 4 workers, RF=2, loopback HTTP. `worker1` sits behind a proxy that holds back every chunk read by a chosen delay; writes are not delayed.
-* 100 objects of 32 KiB (one chunk each), picked so that `worker1` is the primary. Every object is read 3 times per setting (300 reads), each verified against its SHA-256.
-* Hedge threshold 25 ms (the default) versus hedging disabled (`HEDGE_THRESHOLD_MS=0`). Delay on the slow worker: 0, 10, 30, 50, 100 ms.
+* 4 workers, RF=2, `worker1` behind a proxy that holds back every chunk read by a chosen delay. 100 objects of 32 KiB (one chunk each) chosen so `worker1` is the primary; each is read once per repetition (n=700 reads per cell), every body verified.
+* Hedge threshold 25 ms (the default) against hedging disabled (`HEDGE_THRESHOLD_MS=0`), with the slow worker's delay at 0, 10, 30, 50 and 100 ms.
+* Threshold sweep: the delay is 100 ms on a random 10% of reads and zero on the rest, 100 objects read twice per repetition (n=1400 per row).
 
-### Results (300 reads per row, every read of every object slowed)
+### Results (all in ms)
+| Slow-worker delay | Off P50 | Off P95 | Off P99 | Off max | On P50 | On P95 | On P99 | On max | Hedges fired | P99 off / on |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 ms | 0.3 | 0.6 | 1.1 | 1.8 | 0.3 | 0.6 | 1.1 | 2.0 | 0 of 700 | 1.0x |
+| 10 ms | 11.9 | 12.7 | 13.2 | 13.7 | 11.9 | 12.7 | 13.1 | 13.6 | 0 of 700 | 1.0x |
+| 30 ms | 32.3 | 33.2 | 33.4 | 33.8 | 26.8 | 27.5 | 27.9 | 28.4 | 700 of 700 | 1.2x |
+| 50 ms | 52.4 | 53.2 | 53.4 | 53.7 | 26.5 | 27.2 | 27.7 | 28.3 | 700 of 700 | 1.9x |
+| 100 ms | 102.4 | 103.2 | 103.5 | 103.7 | 26.9 | 27.6 | 28.0 | 28.2 | 700 of 700 | 3.7x |
 
-| Slow-worker delay | Hedging off P50 | Hedging off P99 | Hedging on P50 | Hedging on P99 | Hedges fired | P99 improvement |
+(all in ms; n=700 reads per cell; per-repetition P99 spread, hedging on: 0 ms: 1.0 (0.8-1.3), 10 ms: 12.9 (12.7-13.3), 30 ms: 27.8 (27.5-28.0), 50 ms: 27.6 (27.3-28.0), 100 ms: 27.9 (27.5-28.1); hedging off: 0 ms: 0.9 (0.6-1.2), 10 ms: 13.1 (12.7-13.5), 30 ms: 33.4 (33.3-33.5), 50 ms: 53.3 (53.2-53.4), 100 ms: 103.4 (103.3-103.5))
+
+| Threshold | P50 | P95 | P99 | max | Hedges fired | P99 per rep (median, min-max) |
 |---|---|---|---|---|---|---|
-| 0 ms (all fast) | 0.4 ms | 1.0 ms | 0.4 ms | 1.1 ms | **0 of 300** | none needed |
-| 10 ms | 11.4 ms | 12.3 ms | 11.4 ms | 12.2 ms | 0 of 300 | none (under threshold) |
-| 30 ms | 31.5 ms | 32.4 ms | 26.9 ms | 27.5 ms | 300 of 300 | 1.2x |
-| 50 ms | 51.7 ms | 52.4 ms | 27.0 ms | 27.5 ms | 300 of 300 | 1.9x |
-| 100 ms | 101.7 ms | 102.5 ms | 27.0 ms | 27.7 ms | 300 of 300 | **3.7x** |
-
-### Threshold sweep: worker slow (100 ms) on a random 10% of reads, the rest fast (500 reads per row)
-
-| Threshold | P50 | P95 | P99 | Hedges fired |
-|---|---|---|---|---|
-| off | 0.5 ms | 101.4 ms | 101.7 ms | 0 |
-| 2 ms | 0.4 ms | 2.7 ms | 3.0 ms | 46 (9.2%) |
-| 5 ms | 0.4 ms | 5.9 ms | 6.2 ms | 46 (9.2%) |
-| 10 ms | 0.4 ms | 11.0 ms | 11.5 ms | 46 (9.2%) |
-| 25 ms (default) | 0.4 ms | 26.5 ms | 27.1 ms | 46 (9.2%) |
-| 50 ms | 0.4 ms | 51.8 ms | 52.1 ms | 46 (9.2%) |
-| 100 ms | 0.4 ms | 101.4 ms | 101.7 ms | 46 (9.2%) |
+| off | 0.4 | 102.1 | 102.5 | 102.9 | 0 of 1400 (0.0%) | 102.4 (102.3-102.8) |
+| 2 ms | 0.3 | 2.5 | 2.7 | 3.4 | 119 of 1400 (8.5%) | 2.7 (2.6-2.8) |
+| 5 ms | 0.4 | 5.7 | 6.0 | 6.3 | 119 of 1400 (8.5%) | 5.9 (5.8-6.1) |
+| 10 ms | 0.4 | 11.0 | 12.0 | 12.5 | 119 of 1400 (8.5%) | 11.9 (11.6-12.1) |
+| 25 ms | 0.4 | 26.7 | 27.2 | 27.8 | 119 of 1400 (8.5%) | 27.2 (27.0-27.3) |
+| 50 ms | 0.4 | 51.5 | 52.2 | 53.0 | 119 of 1400 (8.5%) | 52.1 (51.9-52.3) |
+| 100 ms | 0.4 | 101.6 | 102.1 | 102.8 | 119 of 1400 (8.5%) | 102.1 (101.9-102.2) |
 
 ### What the data says
-1. **A slow worker costs a read at most the threshold plus a fast read.** With hedging on, P99 is 27.5 ms whether the slow worker adds 30 ms or 100 ms; with it off, P99 follows the slow worker (102.5 ms at 100 ms). The benefit grows with how slow the worker is.
-2. **Hedging never fires when nothing is slow.** All-fast: 0 hedges in 300 reads, so the unnecessary-hedge rate is 0%, and P50/P99 are the same as with hedging off (the 0.1 ms difference is noise).
-3. **It does nothing below the threshold.** At 10 ms the primary answers before the 25 ms timer, no hedge starts, and the result matches hedging off. That is the design: the secondary is not asked unless the primary is late.
-4. **When the worker is slow only some of the time, hedging is what removes the tail.** At 10% slow reads, P95 falls from 101 ms to 26.5 ms, and P50 does not move because fast reads never hedge.
-5. **Cost: extra load only on the reads that were slow.** 46 of 500 reads (9.2%, matching the 10% injected) fired one extra chunk fetch each. The rest sent none.
+1. **A slow worker costs a read at most the threshold plus a fast read.** With hedging, P99 is about 28 ms whether the slow worker adds 30, 50 or 100 ms; without it, P99 follows the delay (103.5 ms at 100 ms). The per-repetition P99 range is tight (27.3 to 28.1 ms with hedging at 30 to 100 ms), so this is not an artifact of pooling.
+2. **Hedging never fires when nothing is slow.** All fast: 0 hedges in 700 reads (unnecessary-hedge rate 0%), and P50 to P99 are identical with hedging on and off.
+3. **It does nothing below the threshold.** At 10 ms the primary answers before the 25 ms timer and the result matches hedging off. At 30 ms the gain is only 1.2x, because the saving is just the difference between the delay and the threshold.
+4. **When the worker is slow only some of the time, hedging removes the tail.** At 10% slow reads P95 falls from 102.1 to 26.7 ms; P50 does not move because fast reads never hedge.
+5. **The tail tracks the threshold.** P99 is the threshold plus about 1 to 2 ms at every setting (2.7 ms at 2 ms, 27.2 at 25 ms, 52.2 at 50 ms). A hedge costs one extra chunk fetch, and only for reads that were slow: 119 of 1400 reads (8.5%) at every threshold in the sweep.
 
-### What this does not prove
-* **The 25 ms threshold is a margin, not an optimum.** On loopback a normal read takes 0.4 ms, so even a 2 ms threshold hedged only the slow reads (the sweep shows the same 46 hedges at every threshold), and a lower threshold would have cut P99 further here. On a real network the normal P99 is larger and a threshold under it would hedge healthy reads and double the read load. 25 ms is chosen to sit well above a normal chunk read; it should be set from the P99 of real traffic.
-* The slowness is injected as a fixed delay on one worker. A worker that is slow because it is overloaded would also slow the extra hedge requests sent to it for other chunks.
-* Each object is one 32 KiB chunk, so the numbers are per-chunk. A multi-chunk object hedges each chunk separately.
+### Honest limits
+* **The 25 ms threshold is a margin, not an optimum.** On loopback a normal read takes 0.4 ms, so even a 2 ms threshold hedged only the slow reads, and lower is better here. On a real network the normal P99 is higher, a threshold under it would hedge healthy reads and double the read load, and 25 ms should be re-chosen from the P99 of real traffic.
+* **The 10% slowness follows a fixed pseudo-random sequence,** the same in every repetition, so those 7 repetitions confirm repeatability, not independent samples of the slow pattern.
+* The slowness is a fixed delay on one worker. A worker that is slow because it is overloaded would also slow the extra hedge requests sent to it.
+* Each object is one chunk; a multi-chunk object hedges each chunk separately.
 
 ### A defect this benchmark found and fixed
-At 30 ms and above, the first run showed hedges stopping after 5 reads: from the sixth read on, the slow worker was never asked at all. Cause: when the secondary wins, the slow primary's request is cancelled, and the worker client counted that cancellation as a worker failure. Five hedged reads in a row opened the circuit breaker on a healthy but slow worker. A cancelled call is not a failure of the worker and is no longer counted (commit 3942b64), with tests for both cases: cancellations leave the breaker closed, and real errors still open it.
+In the first run hedges stopped after 5 reads. When the secondary wins, the slow primary's request is cancelled, and the worker client counted that cancellation as a worker failure; five hedged reads in a row opened the circuit breaker on a healthy but slow worker. A cancelled call is no longer counted (commit 3942b64), with tests for both cases.
 
 ### Reproduce
 ```bash
-go test ./test/benchmarks/ -run '^$' -bench 'Hedge_' -benchtime=1x
+go test ./test/benchmarks/ -run '^$' -bench 'Hedge_' -benchtime=1x -timeout 5h
 ```
 
-## 5. Reconciler: time to restore redundancy after a worker comes back empty
+## 5. Reconciler: time to restore redundancy
 
 ### Workload
-* Real in-process cluster, 4 workers, RF=2, bbolt metadata, loopback HTTP, real files with fsync.
-* Single-chunk objects are uploaded until `worker2` holds exactly N chunks (N = 10, 100, 500). Then `worker2` is "restarted with an empty disk": its chunk files are deleted while it stays online and registered. Every one of those N chunks now has one copy instead of two.
-* Without a reconciler: wait 3 s and count the chunks that still have one copy. With it: time one `Reconciler.Pass`, which scans every worker, finds the missing copies and copies each back from the surviving holder (worker to worker). Afterwards every copy is counted on disk and every object is downloaded and checked against its SHA-256.
-* 64 KiB chunks for 10/100/500; a fourth run uses 100 chunks of 1 MiB to get a byte rate.
+* 4 workers, RF=2. Single-chunk objects are uploaded until `worker2` holds exactly N chunks; then `worker2` is "restarted with an empty disk": its chunk files are deleted while it stays registered and online. Every one of those chunks now has one copy.
+* Without a reconciler: wait 1 s and count the chunks that still have one copy. With it: time one `Reconciler.Pass`, which scans every worker and copies each missing chunk back from the surviving holder (worker to worker, 4 copies in flight at once). Then every copy is counted on disk and every object is downloaded and checked.
+* N = 10, 100 and 500 chunks of 64 KiB, and 100 chunks of 1 MiB. One pass is one sample per repetition, so the table gives the median and range of 7 pass times; there are too few samples per cell for a percentile.
 
 ### Results
-
-| Chunks lost | Chunk size | One-copy chunks after 3 s, no reconciler | Pass time | Chunks/s | MiB/s | Two copies after | Objects unreadable |
+| Chunks lost | One copy before | One copy after a 1 s wait, no reconciler | Pass ms | Chunks/s | MiB/s | Two copies after the pass | Objects unreadable |
 |---|---|---|---|---|---|---|---|
-| 10 | 64 KiB | 10 of 10 | 75 ms | 134 | 8.4 | 10 of 10 | 0 |
-| 100 | 64 KiB | 100 of 100 | 405 ms | 247 | 15.4 | 100 of 100 | 0 |
-| 500 | 64 KiB | 500 of 500 | 2.01 s | 248 | 15.5 | 500 of 500 | 0 |
-| 100 | 1 MiB | 100 of 100 | 856 ms | 117 | 117 | 100 of 100 | 0 |
+| 10 x 64 KiB | 10 | 10 | 46 (37-164) | 219 (61-267) | 13.7 (3.8-16.7) | 10 | 0 |
+| 100 x 64 KiB | 100 | 100 | 204 (188-263) | 489 (380-533) | 30.6 (23.8-33.3) | 100 | 0 |
+| 500 x 64 KiB | 500 | 500 | 960 (750-1,493) | 521 (335-667) | 32.6 (20.9-41.7) | 500 | 0 |
+| 100 x 1024 KiB | 100 | 100 | 347 (333-452) | 288 (221-300) | 288.3 (221.0-300.5) | 100 | 0 |
 
 ### What the data says
-1. **Without the reconciler nothing heals.** After 3 s all lost chunks still have one copy, and they stay that way: a second failure of the one worker that holds them would lose the data. This is the exposure the reconciler closes.
-2. **With it, redundancy is fully restored in one pass.** In every run each lost chunk was copied back (restored count equals lost count), two copies exist on disk, no object is unreadable, and the pass reports 0 lost chunks. A second pass restores nothing.
-3. **Time grows linearly with the number of chunks.** 100 and 500 chunks both run at about 248 chunks/s (about 4 ms per chunk). The 10-chunk run looks slower per chunk (134/s) because the fixed cost of scanning all workers and metadata (about 35 ms) is a large share of a 75 ms pass.
-4. **For large chunks the rate is bytes, not chunks.** 1 MiB chunks restore at 117 MiB/s, so the 4 ms per 64 KiB chunk is mostly per-chunk overhead (fsync, two HTTP calls, a metadata update), not copying. For a worker that lost 100 GiB of 1 MiB chunks that extrapolates to about 15 minutes (100 GiB at 117 MiB/s), and that is how long the data stays single-copy: the window of exposure is set by this rate.
+1. **Without the reconciler nothing heals.** After a 1 s wait every lost chunk still has one copy, in every repetition; a second failure of the one worker holding them would lose the data. This is the exposure the reconciler closes.
+2. **With it, redundancy is fully restored in one pass.** Every lost chunk was copied back, each has two copies on disk, no object is unreadable, and the pass reports 0 lost chunks, in all 7 repetitions of every row.
+3. **Time grows with the number of chunks, roughly linearly.** 100 chunks take 204 ms and 500 take 960 ms (489 and 521 chunks/s). The 10-chunk run is slower per chunk (219/s) and very variable (37 to 164 ms), because the fixed cost of scanning every worker is a large share of a 46 ms pass.
+4. **For large chunks the rate is bytes, not chunks.** 1 MiB chunks restore at 288 MiB/s (221 to 300). At 64 KiB the per-chunk overhead (fsync, two HTTP calls, a metadata update) dominates and the rate is 31 to 33 MiB/s. A worker that lost 100 GiB of 1 MiB chunks would take about 6 minutes at 288 MiB/s, and that is how long the data stays at one copy.
 
 ### Honest limits
-* The reconciler restores chunks one at a time inside a pass. The numbers above are that sequential rate; copying several chunks at once would be faster and is the obvious improvement if recovery time matters.
-* Everything runs on one machine over loopback, so there is no network transfer cost between workers. A real network at 1 Gbit/s (about 119 MiB/s) would cap the 1 MiB rate at about the same figure; at 64 KiB the per-chunk overhead would be higher with real latency.
-* The 3 s wait stands in for "no reconciler running"; the point is that the count does not change, not the length of the wait.
-* The pass time includes the scan of every online worker's chunk list, so a cluster with many more chunks on healthy workers would add to the fixed cost.
+* **This benchmark ran after the reconciler was made parallel (commit afc0e27).** An earlier sequential version measured 248 chunks/s at 500 x 64 KiB and 117 MiB/s at 100 x 1 MiB, once each on the same machine; this version is 2.1x and 2.5x faster. That earlier measurement was a single run and is context, not a controlled comparison.
+* Everything runs over loopback on one machine, so there is no network transfer cost between workers; a real network at 1 Gbit/s (about 119 MiB/s) would cap the large-chunk rate well below 288 MiB/s.
+* The pass time includes the scan of every online worker's chunk list, so healthy workers holding many chunks add to the fixed cost.
+* The 1 s wait stands in for "no reconciler running"; the point is that the count does not change.
 
 ### Reproduce
 ```bash
-go test ./test/benchmarks/ -run '^$' -bench 'Reconciler_' -benchtime=1x
+go test ./test/benchmarks/ -run '^$' -bench 'Reconciler_' -benchtime=1x -timeout 5h
 ```
 
-## 6. Upload throughput: how dedup compounds over repeated image pushes
+## 6. Upload latency: how dedup compounds over repeated image pushes
 
 ### Workload
-* Real in-process cluster, 4 workers, RF=2, loopback HTTP, real files with fsync.
-* 10 images pushed one after another. Each image is 10 chunks of 1 MiB: the same 7 chunks (a shared base) followed by 3 chunks that are unique to that image. The chunk contents are deterministic pseudo-random bytes, so nothing else in them repeats.
-* Dedup on versus the same uploads with `Server.DisableDedup()`. Each configuration ran 3 times on a fresh cluster; the table shows the median time per push.
+* 4 workers, RF=2. 10 images pushed one after another. Each image is 10 chunks of 1 MiB: the same 7 chunks (a shared base) then 3 chunks unique to that image, all pseudo-random so nothing else repeats.
+* Dedup on against dedup off, alternating order, 7 repetitions each. Push 1 has n=7 samples (one per repetition); pushes 2 to 10 pool n=63.
 
 ### Results
+| Metric | Dedup on | Dedup off |
+|---|---|---|
+| Push 1 ms (n=7) | P50 236, max 272 | P50 271, max 694 |
+| Pushes 2-10 ms, P50 (n=63) | 142 | 249 |
+| Pushes 2-10 ms, P95 (n=63) | 207 | 365 |
+| Pushes 2-10 ms, P99 (n=63) | 386 | 455 |
+| Pushes 2-10 ms, max (n=63) | 386 | 455 |
+| MiB sent, first push | 20 | 20 |
+| MiB sent, each later push | 6 | 20 |
+| MiB sent, all 10 pushes | 74 | 200 |
+| Seconds, all 10 pushes | 1.54 (1.17-1.97) | 2.39 (2.30-3.11) |
 
-| Push | Dedup on: time | Dedup on: bytes sent to workers | Dedup off: time | Dedup off: bytes sent |
-|---|---|---|---|---|
-| 1 | 264 ms | 20 MiB | 257 ms | 20 MiB |
-| 2 | 124 ms | 6 MiB | 256 ms | 20 MiB |
-| 3 | 117 ms | 6 MiB | 256 ms | 20 MiB |
-| 5 | 118 ms | 6 MiB | 249 ms | 20 MiB |
-| 8 | 107 ms | 6 MiB | 233 ms | 20 MiB |
-| 10 | 110 ms | 6 MiB | 254 ms | 20 MiB |
-| **All 10** | **1435 ms** | **74 MiB** | **2435 ms** | **200 MiB** |
+Total time off / on: 1.55x (95% CI 1.39-2.09); median later push off / on: 1.75x (95% CI 1.58-2.00); bytes off / on: 2.70x
 
 ### What the data says
-1. **The first push gains nothing** (264 vs 257 ms, same 20 MiB): there is nothing to deduplicate yet.
-2. **Every later push sends 6 MiB instead of 20 MiB** (the 3 unique chunks x 2 replicas), and takes about 110 ms instead of about 250 ms, 2.2x faster.
-3. **The gain compounds with the number of pushes.** After 10 pushes 74 MiB was sent instead of 200 MiB (2.7x less) and the total time was 1.7x shorter (1435 vs 2435 ms). The longer the series, the closer the bytes ratio gets to its limit for this workload: 3 of 10 chunks (30%) are always new, so bytes tend to 3.3x less.
-4. **Time falls less than bytes.** A push with 70% of its chunks already stored still takes about 110 ms, not 30% of 250 ms: for each deduplicated chunk the controller still checks the Bloom filter, looks the chunk up in bbolt and writes the reference, and the metadata for the whole object is committed regardless.
+1. **The first push gains nothing.** Both send 20 MiB. The 236 against 271 ms P50 for push 1 comes from only 7 samples and one 694 ms outlier in dedup-off, so it is noise, not a gain.
+2. **Every later push sends 6 MiB instead of 20 MiB** (3 unique chunks x 2 replicas) and is faster: P50 142 against 249 ms, P95 207 against 365 ms, and the median later push is 1.75x faster (CI 1.58-2.00).
+3. **The gain compounds with the number of pushes.** After 10 pushes 74 MiB was sent instead of 200 (2.70x) and the total time was 1.55x shorter (CI 1.39-2.09). Three of ten chunks are always new, so the bytes ratio tends to 3.33x for longer series.
+4. **Time falls less than bytes.** A push with 70% of its chunks already stored still takes 142 ms, not 30% of 249 ms: for every deduplicated chunk the controller still checks the Bloom filter, looks the chunk up in bbolt and records the reference, and the object's metadata is committed regardless.
 
 ### Honest limits
-* This is a constructed workload with an assumed 70% shared share, matching the spec's 7 shared and 3 unique. Real images share what benchmark 1 measured (1.14x for unrelated images, 2.06x for images that share a base layer).
-* Disk use is the same with dedup on or off here (74 MiB after 10 pushes either way): chunks are content-addressed, so identical chunks overwrite the same file. What dedup saves is network transfer, worker writes and time, which is what the table shows.
-* Loopback transfers are fast; on a real network the 14 MiB saved per push would count for more than it does here.
+* Constructed workload with an assumed 70% shared share, matching the spec's 7 shared and 3 unique. Real images share what benchmark 1 measured.
+* P99 over 63 samples is the maximum, so it is only a tail indicator (386 against 455 ms).
+* Disk use is the same with dedup on or off (chunks are content-addressed); dedup saves transfer, worker writes and time.
+* Loopback transfers are fast; on a real network the 14 MiB saved per push would count for more.
 
 ### Reproduce
 ```bash
-go test ./test/benchmarks/ -run '^$' -bench 'Compounding_' -benchtime=1x
+go test ./test/benchmarks/ -run '^$' -bench 'Compounding_' -benchtime=1x -timeout 5h
 ```
 
 ## 7. Random media: what dedup costs when it cannot help
 
 ### Workload
-* 4 workers, RF=2. 10 files of 5 MiB from `crypto/rand` (50 chunks, 100 MiB), uploaded back to back. No two chunks can match, so dedup has nothing to find.
-* Dedup on versus off, 7 runs each on a fresh cluster, alternating which goes first to cancel warm-up and drift.
+* 4 workers, RF=2. 10 files of 5 MiB from `crypto/rand` (50 chunks, 100 MiB), uploaded back to back; no two chunks can match.
+* Dedup on against off, alternating order, 7 repetitions each. n=70 file uploads per mode.
 
 ### Results
-
-| | Dedup on | Dedup off |
+| Metric | Dedup on | Dedup off |
 |---|---|---|
-| Median upload time per chunk | **23.8 ms** | **24.4 ms** |
-| Per-chunk time, all 7 runs | 23.5 to 27.3 ms | 23.2 to 38.1 ms (first run an outlier) |
-| Storage on worker disks | 100 MiB x 2 replicas | same |
-| Storage ratio | **1.00x** | 1.00x |
+| Upload ms per 5 MiB file, P50 (n=70) | 105.8 | 103.9 |
+| Upload ms per 5 MiB file, P95 (n=70) | 152.0 | 202.5 |
+| Upload ms per 5 MiB file, P99 (n=70) | 295.3 | 584.7 |
+| Upload ms per 5 MiB file, max (n=70) | 295.3 | 584.7 |
+| Upload ms per chunk (median over reps, min-max) | 21.5 (20.4-25.9) | 22.2 (20.4-31.5) |
+| Stored (MiB) | 100 | 100 |
+| Storage ratio | 1.00 | 1.00 |
+
+Per-chunk time off / on: 1.03x (95% CI 0.91-1.45)
 
 ### What the data says
-1. **No storage is saved and none was promised: the ratio is 1.00x.**
-2. **The dedup path costs nothing measurable.** The median per-chunk time with dedup on is not higher than with it off (23.8 vs 24.4 ms, a 2% difference inside the run-to-run spread of 23 to 27 ms). The work dedup adds per chunk is a Bloom filter check (45 ns), a Bloom add (93 ns) and, when the filter says "maybe", a bbolt lookup (2.0 µs, measured in benchmark 1); for new random chunks the filter answers "no", so that cost is about 140 ns against a 24 ms upload.
-3. **The spec's expected ~2 ms of overhead per chunk is not what this system shows.** The cost the spec had in mind is a metadata lookup per chunk. Here the lookup is skipped by the Bloom filter for chunks that are new, and the one write a new chunk always needs is paid with dedup on or off.
+1. **No storage is saved and none was promised: the ratio is 1.00x** with both modes.
+2. **The dedup path costs nothing distinguishable.** Median per-chunk time 21.5 ms against 22.2 ms, ratio 1.03 with a 95% interval of 0.91 to 1.45 that contains 1.00; P50 per file 105.8 against 103.9 ms. The extra work is a 46 ns Bloom lookup and a 93 ns insert per chunk (benchmark 1).
+3. **The spec's expected overhead of about 2 ms per chunk is not what this system shows.** Bloom filter answers "no" for new chunks, so no metadata lookup happens; the reference write a new chunk needs is paid in both modes.
 
 ### Honest limits
-* The comparison rests on medians of 7 runs with 2 to 5% spread; a real difference below a few percent would not show.
-* Both modes write each chunk's reference to bbolt, so that cost (about 1.7 ms) is in both columns and is not part of the difference.
-* Hard evidence that Bloom false positives stay low on random data is in benchmark 1 (0 of 625).
+* The interval is wide at the top (up to 1.45) because a few uploads were slow outliers in both modes; a real difference below about 10% would not show in 7 repetitions.
+* P99 per file (295 against 585 ms) is the second-largest of 70 samples and is dominated by those outliers; it does not show a systematic difference.
+* Both modes write each chunk's reference to bbolt, so that cost (1.64 ms) is in both columns and is not part of the difference.
 
 ### Reproduce
 ```bash
-go test ./test/benchmarks/ -run '^$' -bench 'RandomMedia_' -benchtime=1x
+go test ./test/benchmarks/ -run '^$' -bench 'RandomMedia_' -benchtime=1x -timeout 5h
 ```
 
 ## 8. Consistent hashing: how many chunks move when a worker is added
 
 ### Workload
-* 10,000 chunk ids (SHA-256 of `chunk-0` to `chunk-9999`, as lowercase hex), placed with the real `placement.Ring` (50 virtual nodes per worker). Pure computation, no cluster.
+* 7 sets of 10,000 chunk ids each (SHA-256 of a salted counter, as lowercase hex), placed with the real `placement.Ring` (50 virtual nodes per worker). Pure computation, no cluster; the 7 repetitions are the 7 id sets.
 * Baseline: modulo placement, `owner = first 8 bytes of the chunk hash mod worker count`.
-* For each cluster size, the share of chunks whose **primary** worker changes when one worker is added. Measured directly at 4 to 5, 9 to 10, 19 to 20 and 39 to 40 workers.
+* For each cluster size, the share of chunks whose **primary** worker changes when one worker is added (4 to 5, 9 to 10, 19 to 20, 39 to 40), and how evenly the primaries spread over the workers.
 
 ### Results
+| Workers | Ideal | Consistent hashing (primary moved) | Modulo (primary moved) | Ring: primary or secondary changed |
+|---|---|---|---|---|
+| 4 to 5 | 20.0% | 18.8 (18.5-19.0)% | 79.9 (79.7-80.9)% | 44.4 (44.0-45.0)% |
+| 9 to 10 | 10.0% | 10.7 (10.4-11.3)% | 89.9 (89.4-90.2)% | 19.9 (19.5-20.4)% |
+| 19 to 20 | 5.0% | 5.9 (5.8-6.0)% | 94.9 (94.7-95.4)% | 10.7 (10.5-11.3)% |
+| 39 to 40 | 2.5% | 2.7 (2.5-3.0)% | 97.4 (97.3-97.6)% | 5.6 (5.3-5.8)% |
 
-| Workers | Ideal (1/new count) | Consistent hashing | Modulo |
-|---|---|---|---|
-| 4 to 5 | 20.0% | **19.0%** (1895 chunks) | 79.9% (7986 chunks) |
-| 9 to 10 | 10.0% | **10.3%** (1025 chunks) | 89.9% (8987 chunks) |
-| 19 to 20 | 5.0% | **5.7%** (568 chunks) | 95.2% (9520 chunks) |
-| 39 to 40 | 2.5% | **2.9%** (288 chunks) | 97.8% (9778 chunks) |
+| Workers | Fair share | Smallest share | Largest share | Spread (CV) |
+|---|---|---|---|---|
+| 4 | 25.0% | 22.4 (21.9-22.8)% | 29.1 (28.6-29.3)% | 10.4 (10.2-12.0)% |
+| 10 | 10.0% | 7.8 (7.6-8.0)% | 12.6 (12.4-12.8)% | 17.2 (15.9-18.6)% |
+| 20 | 5.0% | 3.7 (3.6-4.0)% | 6.3 (6.2-6.5)% | 14.3 (13.3-15.6)% |
 
 ### What the data says
-1. **Adding a worker moves close to the minimum possible.** With consistent hashing the share that moves is within a point of the ideal 1/(N+1) at every size, and it only moves onto the new worker (checked by a test). Modulo placement moves 80% to 98%, which at 20 workers would mean re-copying nearly every chunk to add one machine.
-2. **The gap widens with scale.** Moved chunks per added worker fall as the cluster grows (19.0%, 10.3%, 5.7%, 2.9%) while modulo's rise towards 100%.
+1. **Adding a worker moves close to the minimum possible.** Consistent hashing moves within 1.2 points of the ideal 1/(N+1) at every size (18.8% against 20.0%, 10.7% against 10.0%, 5.9% against 5.0%, 2.7% against 2.5%), and only onto the new worker (checked by a test). Modulo moves 80% to 97%, so adding one machine to a 20-worker cluster would mean re-copying nearly every chunk.
+2. **The gap widens with scale.** The moved share falls as the cluster grows while modulo's rises towards 100%.
+3. **The result is stable.** The range over 7 different id sets is under 1.5 points at every size.
 
 ### Where it is less good than it looks
-* **Balance is uneven.** With 50 virtual nodes, a worker's share of primaries varied from 21.9% to 29.6% at 4 workers (fair share 25%), 8.1% to 12.5% at 10 and 3.9% to 6.4% at 20; the standard deviation is 12 to 16% of the fair share. The busiest worker holds about 1.3x its fair share. More virtual nodes would even this out; the number is fixed at 50 in the code and was not varied here.
-* **RF=2 moves more than the primary alone.** The numbers above are primaries only. Counting chunks whose primary *or* secondary changed: 44% at 4 to 5, 19% at 9 to 10, 10.7% at 19 to 20, 5.5% at 39 to 40, roughly double, because each chunk's second copy can shift too.
-* **Chunk ids are SHA-256 hashes of generated names, so the input is uniformly distributed** by construction. Real chunk hashes are too, since they are hashes of content.
+* **Balance is uneven.** With 50 virtual nodes, a worker's share of primaries ranges from 22.4% to 29.1% at 4 workers (fair share 25%), 7.8% to 12.6% at 10 and 3.7% to 6.3% at 20; the busiest worker holds up to 1.26x its fair share. More virtual nodes would even this out; the number is fixed at 50 in the code and was not varied here.
+* **RF=2 moves more than the primary alone.** Counting chunks whose primary or secondary changed, 44.4% at 4 to 5, 19.9% at 9 to 10, 10.7% at 19 to 20 and 5.6% at 39 to 40, roughly double the primary-only figure.
+* Chunk ids here are hashes of generated names, so they are uniformly distributed by construction; real chunk ids are hashes of content and are too.
 
 ### Reproduce
 ```bash
 go test ./test/benchmarks/ -run '^$' -bench 'Ring_' -benchtime=1x
 ```
+
+---
+
+## Running everything
+
+```bash
+BENCH_OUT=out BENCH_COMMIT=$(git rev-parse --short HEAD) go test ./test/benchmarks/ -run '^$' \
+  -bench 'Dedup_|Availability_|Scrubber_|Hedge_|Reconciler_|Compounding_|RandomMedia_|Ring_' -benchtime=1x -timeout 5h
+python3 test/benchmarks/report.py out
+```
+
+The full run takes about 36 minutes and needs about 3 GB of scratch disk. `BENCH_REPS` changes the number of measured repetitions (default 7), and `BENCH_OBJECTS` the number of objects in the availability runs (default 200).
+
+## A defect that nearly stopped the benchmarks
+
+The first complete run filled the disk. The upload handler works on a copy of the request (`r.WithContext`), so net/http's own cleanup never saw the parsed multipart form, and every uploaded file over 32 MiB left a temp file in the controller's temp directory for good. Uploading the 124 MiB media files and the Docker layers used up the roughly 21 GB of free space in one run, and the random-media benchmark then failed with a worker write error. The handler now removes the form's temp files when the request ends (commit 405d8f0), with tests for both the success and the rejected-upload path, and the full run above shows no disk growth.
