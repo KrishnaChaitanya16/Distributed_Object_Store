@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -31,6 +29,7 @@ type hedgeRun struct {
 	Hedges       uint64  `json:"hedge_requests_fired"`
 	HedgeRatePct float64 `json:"hedge_rate_pct"`
 	Failed       int     `json:"failed_reads"`
+	samples      []float64
 }
 
 // loadPrimaryOnSlow stores n single-chunk objects whose primary is worker1, which sits behind the slow proxy.
@@ -77,6 +76,7 @@ func measureReads(tb testing.TB, c *cluster, objs []objectRec, passes int) hedge
 		}
 	}
 	run.Reads = len(lat) + run.Failed
+	run.samples = lat
 	run.P50Ms, run.P95Ms, run.P99Ms = percentile(lat, 50), percentile(lat, 95), percentile(lat, 99)
 	run.MaxMs = percentile(lat, 100)
 	run.Hedges = events.Default.Counts()["download.hedge"] - before
@@ -105,53 +105,100 @@ func runDelays(tb testing.TB, thresholdMs int, delays []time.Duration, objects, 
 	return out
 }
 
-func saveHedge(b *testing.B, name string, v any) {
-	if out := os.Getenv("BENCH_OUT"); out != "" {
-		if err := writeJSON(filepath.Join(out, "hedge-"+name+".json"), v); err != nil {
-			b.Fatal(err)
-		}
+type hedgeCell struct {
+	ThresholdMs  int     `json:"hedge_threshold_ms"`
+	DelayMs      float64 `json:"slow_worker_delay_ms"`
+	SlowShare    float64 `json:"share_of_reads_slowed"`
+	ReadMs       Latency `json:"read_ms"`
+	Reads        int     `json:"reads_all_reps"`
+	Hedges       uint64  `json:"hedge_requests_all_reps"`
+	HedgeRatePct float64 `json:"hedge_rate_pct"`
+	Failed       int     `json:"failed_reads"`
+}
+
+// foldHedge combines one cell (a threshold and delay) across repetitions.
+func foldHedge(cells []hedgeRun) hedgeCell {
+	out := hedgeCell{ThresholdMs: cells[0].ThresholdMs, DelayMs: cells[0].DelayMs, SlowShare: cells[0].SlowShare}
+	var per [][]float64
+	for _, c := range cells {
+		per = append(per, c.samples)
+		out.Reads += c.Reads
+		out.Hedges += c.Hedges
+		out.Failed += c.Failed
 	}
+	out.ReadMs = latencyOf(per)
+	if out.Reads > 0 {
+		out.HedgeRatePct = 100 * float64(out.Hedges) / float64(out.Reads)
+	}
+	return out
 }
 
 var hedgeDelays = []time.Duration{0, 10 * time.Millisecond, 30 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond}
 
-// BenchmarkHedge_Enabled runs the five slow-worker delays with the default 25 ms threshold.
-func BenchmarkHedge_Enabled(b *testing.B) {
+// BenchmarkHedge_Delays reads from a worker that is slow by a fixed delay, with hedging at the default 25 ms and with it disabled.
+func BenchmarkHedge_Delays(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		runs := runDelays(b, 25, hedgeDelays, 100, 3)
-		for _, r := range runs {
-			b.ReportMetric(r.P99Ms, fmt.Sprintf("p99_ms_delay%.0f", r.DelayMs))
-			b.ReportMetric(float64(r.Hedges), fmt.Sprintf("hedges_delay%.0f", r.DelayMs))
+		byTh := map[int][][]hedgeRun{}
+		repeat(b, repCount(), func(rep int) {
+			order := []int{25, 0}
+			if rep%2 != 0 {
+				order = []int{0, 25}
+			}
+			for _, th := range order {
+				runs := runDelays(b, th, hedgeDelays, 100, 1)
+				if rep >= 0 {
+					byTh[th] = append(byTh[th], runs)
+				}
+			}
+		})
+		out := map[string][]hedgeCell{}
+		for th, reps := range byTh {
+			name := "hedging_on_25ms"
+			if th == 0 {
+				name = "hedging_off"
+			}
+			for d := range hedgeDelays {
+				var cells []hedgeRun
+				for _, r := range reps {
+					cells = append(cells, r[d])
+				}
+				out[name] = append(out[name], foldHedge(cells))
+			}
 		}
-		saveHedge(b, "enabled", runs)
-	}
-}
-
-// BenchmarkHedge_Disabled runs the same delays with hedging switched off.
-func BenchmarkHedge_Disabled(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		runs := runDelays(b, 0, hedgeDelays, 100, 3)
-		for _, r := range runs {
-			b.ReportMetric(r.P99Ms, fmt.Sprintf("p99_ms_delay%.0f", r.DelayMs))
+		for _, c := range out["hedging_on_25ms"] {
+			b.ReportMetric(c.ReadMs.Pooled.P99, fmt.Sprintf("on_p99_ms_delay%.0f", c.DelayMs))
 		}
-		saveHedge(b, "disabled", runs)
+		for _, c := range out["hedging_off"] {
+			b.ReportMetric(c.ReadMs.Pooled.P99, fmt.Sprintf("off_p99_ms_delay%.0f", c.DelayMs))
+		}
+		saveReport(b, "hedge-delays", out)
 	}
 }
 
 // BenchmarkHedge_ThresholdSweep uses a worker that is slow (100 ms) for 10% of reads and measures several hedge thresholds.
 func BenchmarkHedge_ThresholdSweep(b *testing.B) {
+	thresholds := []int{0, 2, 5, 10, 25, 50, 100}
 	for i := 0; i < b.N; i++ {
-		var runs []hedgeRun
-		for _, th := range []int{0, 2, 5, 10, 25, 50, 100} {
-			b.Setenv("HEDGE_THRESHOLD_MS", strconv.Itoa(th))
-			c := newClusterWith(b, options{workers: 4, slowWorker: "worker1"})
-			objs := loadPrimaryOnSlow(b, c, 100)
-			c.slow["worker1"].SetIntermittent(100*time.Millisecond, 0.10)
-			r := measureReads(b, c, objs, 5)
-			r.ThresholdMs, r.DelayMs, r.SlowShare = th, 100, 0.10
-			runs = append(runs, r)
+		byTh := map[int][]hedgeRun{}
+		repeat(b, repCount(), func(rep int) {
+			for _, th := range thresholds {
+				b.Setenv("HEDGE_THRESHOLD_MS", strconv.Itoa(th))
+				c := newClusterWith(b, options{workers: 4, slowWorker: "worker1"})
+				objs := loadPrimaryOnSlow(b, c, 100)
+				c.slow["worker1"].SetIntermittent(100*time.Millisecond, 0.10)
+				r := measureReads(b, c, objs, 2)
+				r.ThresholdMs, r.DelayMs, r.SlowShare = th, 100, 0.10
+				if rep >= 0 {
+					byTh[th] = append(byTh[th], r)
+				}
+				c.Close()
+			}
+		})
+		var out []hedgeCell
+		for _, th := range thresholds {
+			out = append(out, foldHedge(byTh[th]))
 		}
-		saveHedge(b, "threshold_sweep", runs)
+		saveReport(b, "hedge-threshold_sweep", out)
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -120,23 +119,61 @@ func runHeal(tb testing.TB, lost, size int, wait time.Duration) healResult {
 	return res
 }
 
+type healReport struct {
+	LostChunks     int    `json:"chunks_lost_by_restarted_worker"`
+	ChunkKiB       int    `json:"chunk_kib"`
+	OneCopyBefore  Spread `json:"chunks_with_one_copy_before"`
+	OneCopyWaiting Spread `json:"chunks_with_one_copy_after_wait_without_reconciler"`
+	PassMs         Spread `json:"reconciler_pass_ms"`
+	ChunksPerSec   Spread `json:"chunks_per_s"`
+	MiBPerSec      Spread `json:"mib_per_s"`
+	Restored       Spread `json:"replicas_restored"`
+	TwoCopiesAfter Spread `json:"chunks_with_two_copies_after"`
+	Unreadable     Spread `json:"objects_unreadable_after"`
+	LostReported   Spread `json:"lost_chunks_reported"`
+}
+
+func foldHeal(runs []healResult) healReport {
+	f := func(g func(healResult) float64) Spread { return spreadOf(col(runs, g)) }
+	return healReport{
+		LostChunks: runs[0].LostChunks, ChunkKiB: runs[0].ChunkKiB,
+		OneCopyBefore:  f(func(r healResult) float64 { return float64(r.SingleCopyBefore) }),
+		OneCopyWaiting: f(func(r healResult) float64 { return float64(r.SingleCopyNoRecon) }),
+		PassMs:         f(func(r healResult) float64 { return r.PassMs }),
+		ChunksPerSec:   f(func(r healResult) float64 { return r.ChunksPerSec }),
+		MiBPerSec:      f(func(r healResult) float64 { return r.MiBPerSec }),
+		Restored:       f(func(r healResult) float64 { return float64(r.Restored) }),
+		TwoCopiesAfter: f(func(r healResult) float64 { return float64(r.TwoCopiesAfter) }),
+		Unreadable:     f(func(r healResult) float64 { return float64(r.Unreadable) }),
+		LostReported:   f(func(r healResult) float64 { return float64(r.LostReported) }),
+	}
+}
+
+// BenchmarkReconciler_TimeToHeal loses N chunks on one worker and times the reconciler pass that restores them.
 func BenchmarkReconciler_TimeToHeal(b *testing.B) {
+	type shape struct{ chunks, size int }
+	shapes := []shape{{10, 64 << 10}, {100, 64 << 10}, {500, 64 << 10}, {100, 1 << 20}}
 	for i := 0; i < b.N; i++ {
-		var runs []healResult
-		for _, n := range []int{10, 100, 500} {
-			r := runHeal(b, n, 64<<10, 3*time.Second)
-			runs = append(runs, r)
-			b.ReportMetric(r.PassMs, fmt.Sprintf("pass_ms_%dchunks", n))
-			b.ReportMetric(r.ChunksPerSec, fmt.Sprintf("chunks_per_s_%d", n))
-		}
-		r := runHeal(b, 100, 1<<20, 3*time.Second)
-		runs = append(runs, r)
-		b.ReportMetric(r.MiBPerSec, "mib_per_s_100x1MiB")
-		if out := os.Getenv("BENCH_OUT"); out != "" {
-			if err := writeJSON(filepath.Join(out, "reconciler.json"), runs); err != nil {
-				b.Fatal(err)
+		runs := make([][]healResult, len(shapes))
+		repeat(b, repCount(), func(rep int) {
+			for k, sh := range shapes {
+				r := runHeal(b, sh.chunks, sh.size, time.Second)
+				if r.Restored != sh.chunks || r.TwoCopiesAfter != sh.chunks || r.Unreadable != 0 {
+					b.Fatalf("%d chunks of %d KiB: %+v", sh.chunks, sh.size>>10, r)
+				}
+				if rep >= 0 {
+					runs[k] = append(runs[k], r)
+				}
+				closeLive()
 			}
+		})
+		var out []healReport
+		for k, sh := range shapes {
+			rep := foldHeal(runs[k])
+			out = append(out, rep)
+			b.ReportMetric(rep.PassMs.Median, fmt.Sprintf("pass_ms_%dx%dKiB", sh.chunks, sh.size>>10))
 		}
+		saveReport(b, "reconciler", out)
 	}
 }
 

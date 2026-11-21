@@ -71,6 +71,7 @@ type dedupResult struct {
 	BloomFPRate     float64     `json:"bloom_false_positive_rate"`
 	BloomEstimateFP float64     `json:"bloom_estimated_fp_at_end"`
 	ElapsedS        float64     `json:"elapsed_s"`
+	UploadSeconds   float64     `json:"upload_seconds"`
 	PerImage        []imageStat `json:"per_image,omitempty"`
 	PerFile         []fileStat  `json:"per_file"`
 }
@@ -179,6 +180,7 @@ func runWorkload(tb testing.TB, name string, items []workItem, dedupOn bool) *de
 	res.PushedBytes = c.pool.putBytes.Load()
 	res.ChunksWritten = int(c.pool.puts.Load()) / replicationFactor
 	res.ChunksDeduped = res.Chunks - res.ChunksWritten
+	res.UploadSeconds = uploadTime.Seconds()
 	if res.Chunks > 0 {
 		res.MsPerChunk = ms(uploadTime) / float64(res.Chunks)
 	}
@@ -236,23 +238,88 @@ func totalBytes(tb testing.TB, items []workItem) int64 {
 	return n
 }
 
-func report(b *testing.B, r *dedupResult) {
-	mib := float64(1 << 20)
-	b.ReportMetric(float64(r.UploadedBytes)/mib, "uploaded_MiB")
-	b.ReportMetric(float64(r.DiskBytes)/mib, "disk_MiB")
-	b.ReportMetric(float64(r.PushedBytes)/mib, "sent_to_workers_MiB")
-	b.ReportMetric(r.StorageRatio, "storage_ratio_x")
-	b.ReportMetric(float64(r.ChunksDeduped), "chunks_deduped")
-	b.ReportMetric(r.P50Ms, "p50_ms")
-	b.ReportMetric(r.P99Ms, "p99_ms")
-	b.ReportMetric(r.MsPerChunk, "ms_per_chunk")
-	b.ReportMetric(r.BloomFPRate*100, "bloom_fp_%")
-	if out := os.Getenv("BENCH_OUT"); out != "" {
-		name := fmt.Sprintf("dedup-%s-dedup_%v.json", r.Workload, map[bool]string{true: "on", false: "off"}[r.DedupOn])
-		if err := writeJSON(filepath.Join(out, name), r); err != nil {
-			b.Fatal(err)
+type dedupSide struct {
+	DedupOn        bool    `json:"dedup_on"`
+	SentMiB        Spread  `json:"bytes_sent_to_workers_mib"`
+	DiskMiB        Spread  `json:"bytes_on_worker_disks_mib"`
+	ChunksDeduped  Spread  `json:"chunks_deduplicated"`
+	StorageRatio   Spread  `json:"storage_ratio"`
+	BloomFPPct     Spread  `json:"bloom_false_positive_pct"`
+	ChunkMs        Latency `json:"upload_ms_per_chunk,omitempty"`
+	UploadSeconds  Spread  `json:"upload_seconds"`
+	ThroughputMiBs Spread  `json:"throughput_mib_per_s"`
+}
+
+type dedupReport struct {
+	Workload      string    `json:"workload"`
+	Files         int       `json:"files"`
+	Chunks        int       `json:"chunks"`
+	UploadedMiB   float64   `json:"uploaded_mib"`
+	On            dedupSide `json:"dedup_on"`
+	Off           dedupSide `json:"dedup_off"`
+	TimeOffOverOn Ratio     `json:"upload_time_off_over_on"`
+}
+
+// fileChunkMs is the upload time per chunk of each file, one sample per file.
+func fileChunkMs(r *dedupResult) []float64 {
+	out := make([]float64, 0, len(r.PerFile))
+	for _, f := range r.PerFile {
+		if n := chunksOf(f.Bytes); n > 0 {
+			out = append(out, f.Ms/float64(n))
 		}
 	}
+	return out
+}
+
+func foldDedup(on bool, runs []*dedupResult) dedupSide {
+	mib := float64(1 << 20)
+	var perRep [][]float64
+	for _, r := range runs {
+		perRep = append(perRep, fileChunkMs(r))
+	}
+	return dedupSide{
+		DedupOn:        on,
+		SentMiB:        spreadOf(col(runs, func(r *dedupResult) float64 { return float64(r.PushedBytes) / mib })),
+		DiskMiB:        spreadOf(col(runs, func(r *dedupResult) float64 { return float64(r.DiskBytes) / mib })),
+		ChunksDeduped:  spreadOf(col(runs, func(r *dedupResult) float64 { return float64(r.ChunksDeduped) })),
+		StorageRatio:   spreadOf(col(runs, func(r *dedupResult) float64 { return r.StorageRatio })),
+		BloomFPPct:     spreadOf(col(runs, func(r *dedupResult) float64 { return 100 * r.BloomFPRate })),
+		ChunkMs:        latencyOf(perRep),
+		UploadSeconds:  spreadOf(col(runs, func(r *dedupResult) float64 { return r.UploadSeconds })),
+		ThroughputMiBs: spreadOf(col(runs, func(r *dedupResult) float64 { return float64(r.UploadedBytes) / mib / r.UploadSeconds })),
+	}
+}
+
+// runDedupPair uploads the items with dedup on and off, alternating which goes first each repetition, and reports both sides.
+func runDedupPair(b *testing.B, name string, items []workItem) {
+	var on, off []*dedupResult
+	repeat(b, repCount(), func(rep int) {
+		order := []bool{true, false}
+		if rep%2 != 0 {
+			order = []bool{false, true}
+		}
+		for _, mode := range order {
+			r := runWorkload(b, name, items, mode)
+			if rep < 0 {
+				continue
+			}
+			if mode {
+				on = append(on, r)
+			} else {
+				off = append(off, r)
+			}
+		}
+	})
+	rep := dedupReport{
+		Workload: name, Files: on[0].Files, Chunks: on[0].Chunks, UploadedMiB: float64(on[0].UploadedBytes) / float64(1<<20),
+		On: foldDedup(true, on), Off: foldDedup(false, off),
+		TimeOffOverOn: ratioOf(col(off, func(r *dedupResult) float64 { return r.UploadSeconds }), col(on, func(r *dedupResult) float64 { return r.UploadSeconds })),
+	}
+	b.ReportMetric(rep.On.StorageRatio.Median, "storage_ratio_x")
+	b.ReportMetric(rep.On.ChunkMs.Pooled.P99, "on_p99_ms_per_chunk")
+	b.ReportMetric(rep.Off.ChunkMs.Pooled.P99, "off_p99_ms_per_chunk")
+	b.ReportMetric(rep.TimeOffOverOn.Value, "time_off_over_on")
+	saveReport(b, "dedup-"+name, rep)
 }
 
 func writeJSON(path string, v any) error {
@@ -266,17 +333,26 @@ func writeJSON(path string, v any) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
-func benchDockerLayers(b *testing.B, name string, images []string, dedupOn bool) {
+func benchDockerLayers(b *testing.B, name string, images []string) {
 	items := layerItems(b, images)
 	for i := 0; i < b.N; i++ {
-		r := runWorkload(b, name, items, dedupOn)
-		if i == b.N-1 {
-			report(b, r)
-		}
+		runDedupPair(b, name, items)
 	}
 }
 
-func benchRawMedia(b *testing.B, dedupOn bool) {
+// BenchmarkDedup_DockerLayers uploads the layers of five real images with dedup on and off.
+func BenchmarkDedup_DockerLayers(b *testing.B) { benchDockerLayers(b, "docker_layers", layerImages) }
+
+// BenchmarkDedup_PythonVersions uploads python 3.11, 3.10 and 3.9 slim, which share no whole layer.
+func BenchmarkDedup_PythonVersions(b *testing.B) {
+	benchDockerLayers(b, "python_versions", pythonImages)
+}
+
+// BenchmarkDedup_SharedBase uploads three application images built FROM python:3.11-slim, so they share its layers exactly.
+func BenchmarkDedup_SharedBase(b *testing.B) { benchDockerLayers(b, "shared_base", sharedBaseImages) }
+
+// BenchmarkDedup_RawMedia uploads random bytes of the same total size as the Docker workload, where no chunk repeats.
+func BenchmarkDedup_RawMedia(b *testing.B) {
 	// the raw-media total matches the Docker workload when the layers exist, otherwise 5 x 20 MiB
 	var each int64 = 20 << 20
 	if files, missing := findLayers(layerDir(), layerImages); len(missing) == 0 {
@@ -288,51 +364,16 @@ func benchRawMedia(b *testing.B, dedupOn bool) {
 		}
 		each = n / 5
 	}
-	dir := b.TempDir()
+	dir, err := os.MkdirTemp("", "minidfs-media-")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
 	items := makeRandomMedia(b, dir, 5, each)
 	for i := 0; i < b.N; i++ {
-		r := runWorkload(b, "raw_media", items, dedupOn)
-		if i == b.N-1 {
-			report(b, r)
-		}
+		runDedupPair(b, "raw_media", items)
 	}
 }
-
-// BenchmarkDedup_DockerLayers uploads the layers of five real images with deduplication on.
-func BenchmarkDedup_DockerLayers(b *testing.B) {
-	benchDockerLayers(b, "docker_layers", layerImages, true)
-}
-
-// BenchmarkDedup_DockerLayers_DedupOff is the baseline: the same layers with every chunk written again.
-func BenchmarkDedup_DockerLayers_DedupOff(b *testing.B) {
-	benchDockerLayers(b, "docker_layers", layerImages, false)
-}
-
-// BenchmarkDedup_PythonVersions uploads python 3.11, 3.10 and 3.9 slim, which turn out to share no whole layer.
-func BenchmarkDedup_PythonVersions(b *testing.B) {
-	benchDockerLayers(b, "python_versions", pythonImages, true)
-}
-
-// BenchmarkDedup_PythonVersions_DedupOff is the baseline for the Python-versions workload.
-func BenchmarkDedup_PythonVersions_DedupOff(b *testing.B) {
-	benchDockerLayers(b, "python_versions", pythonImages, false)
-}
-
-// BenchmarkDedup_SharedBase uploads three application images built FROM python:3.11-slim, so they share its layers exactly.
-func BenchmarkDedup_SharedBase(b *testing.B) {
-	benchDockerLayers(b, "shared_base", sharedBaseImages, true)
-}
-
-// BenchmarkDedup_SharedBase_DedupOff is the baseline for the shared-base workload.
-func BenchmarkDedup_SharedBase_DedupOff(b *testing.B) {
-	benchDockerLayers(b, "shared_base", sharedBaseImages, false)
-}
-
-// BenchmarkDedup_RawMedia uploads random bytes, where no chunk repeats, with deduplication on.
-func BenchmarkDedup_RawMedia(b *testing.B) { benchRawMedia(b, true) }
-
-// BenchmarkDedup_RawMedia_DedupOff is the same random bytes with deduplication off.
-func BenchmarkDedup_RawMedia_DedupOff(b *testing.B) { benchRawMedia(b, false) }
 
 // --- the cost of the dedup check itself ---
 

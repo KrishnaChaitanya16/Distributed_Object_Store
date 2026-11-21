@@ -40,6 +40,7 @@ type scrubRun struct {
 	ScrubPassMs   float64 `json:"slowest_scrubber_pass_ms"`
 	BadCopiesLeft int     `json:"corrupt_copies_still_served"`
 	Under2Healthy int     `json:"chunks_with_fewer_than_2_good_copies"`
+	readMs        []float64
 }
 
 // seededObject returns the same pseudo-random content for the same i, so two clusters can be loaded with identical data.
@@ -173,10 +174,11 @@ func runScrub(tb testing.TB, variant string, withScrubber bool, objects, size in
 
 	mismatchBefore := events.Default.Counts()["download.corrupt"]
 	for i, id := range ids {
-		code, body, _ := c.download(id)
+		code, body, d := c.download(id)
 		switch {
 		case code == http.StatusOK && sha256.Sum256(body) == sha256.Sum256(seededObject(i, size)):
 			r.Served++
+			r.readMs = append(r.readMs, ms(d))
 		case code == http.StatusOK:
 			r.WrongBytes++
 		default:
@@ -219,50 +221,86 @@ func collectChunks(c *cluster) map[string]bool {
 	return m
 }
 
-func reportScrub(b *testing.B, name string, r *scrubRun) {
-	b.ReportMetric(float64(r.DirectWrong), "direct_wrong_bytes")
-	b.ReportMetric(float64(r.WrongBytes), "controller_wrong_bytes")
-	b.ReportMetric(float64(r.MismatchSeen), "sha256_mismatches_at_read")
-	b.ReportMetric(float64(r.Quarantined), "quarantined")
-	b.ReportMetric(r.ScrubPassMs, "scrub_pass_ms")
-	if out := os.Getenv("BENCH_OUT"); out != "" {
-		if err := writeJSON(filepath.Join(out, "scrubber-"+name+".json"), r); err != nil {
-			b.Fatal(err)
-		}
+type scrubReport struct {
+	Corruption       string  `json:"corruption"`
+	ScrubberRan      bool    `json:"scrubber_pass_run"`
+	Objects          int     `json:"objects"`
+	Chunks           int     `json:"chunks"`
+	CorruptInjected  Spread  `json:"corrupt_copies_injected"`
+	DirectWrongBytes Spread  `json:"direct_worker_reads_returning_wrong_bytes"`
+	ControllerWrong  Spread  `json:"controller_objects_served_wrong_bytes"`
+	Unavailable      Spread  `json:"controller_objects_unavailable"`
+	MismatchAtRead   Spread  `json:"sha256_mismatches_hit_by_readers"`
+	Quarantined      Spread  `json:"copies_quarantined_by_scrubber"`
+	BadCopiesLeft    Spread  `json:"corrupt_copies_still_on_disk"`
+	Under2Healthy    Spread  `json:"chunks_with_fewer_than_2_good_copies"`
+	SlowestPassMs    Spread  `json:"slowest_scrubber_pass_ms"`
+	ReadMs           Latency `json:"object_read_ms_after_corruption"`
+}
+
+func foldScrub(runs []*scrubRun) scrubReport {
+	f := func(g func(*scrubRun) float64) Spread { return spreadOf(col(runs, g)) }
+	var reads [][]float64
+	for _, r := range runs {
+		reads = append(reads, r.readMs)
 	}
-	if r.WrongBytes != 0 {
-		b.Fatalf("%d objects were served with wrong bytes", r.WrongBytes)
+	return scrubReport{
+		Corruption: runs[0].Variant, ScrubberRan: runs[0].WithScrubber, Objects: runs[0].Objects, Chunks: runs[0].Chunks,
+		CorruptInjected:  f(func(r *scrubRun) float64 { return float64(r.CorruptCopies) }),
+		DirectWrongBytes: f(func(r *scrubRun) float64 { return float64(r.DirectWrong) }),
+		ControllerWrong:  f(func(r *scrubRun) float64 { return float64(r.WrongBytes) }),
+		Unavailable:      f(func(r *scrubRun) float64 { return float64(r.Unavailable) }),
+		MismatchAtRead:   f(func(r *scrubRun) float64 { return float64(r.MismatchSeen) }),
+		Quarantined:      f(func(r *scrubRun) float64 { return float64(r.Quarantined) }),
+		BadCopiesLeft:    f(func(r *scrubRun) float64 { return float64(r.BadCopiesLeft) }),
+		Under2Healthy:    f(func(r *scrubRun) float64 { return float64(r.Under2Healthy) }),
+		SlowestPassMs:    f(func(r *scrubRun) float64 { return r.ScrubPassMs }),
+		ReadMs:           latencyOf(reads),
+	}
+}
+
+// benchScrub runs one corruption scenario through the common protocol.
+func benchScrub(b *testing.B, name, variant string, withScrubber bool) {
+	for i := 0; i < b.N; i++ {
+		var runs []*scrubRun
+		repeat(b, repCount(), func(rep int) {
+			r := runScrub(b, variant, withScrubber, 50, 2<<20)
+			if r.WrongBytes != 0 {
+				b.Fatalf("%d objects were served with wrong bytes", r.WrongBytes)
+			}
+			if rep >= 0 {
+				runs = append(runs, r)
+			}
+		})
+		rep := foldScrub(runs)
+		b.ReportMetric(rep.MismatchAtRead.Median, "sha256_mismatches_at_read")
+		b.ReportMetric(rep.ReadMs.Pooled.P99, "read_p99_ms")
+		saveReport(b, "scrubber-"+name, rep)
 	}
 }
 
 func BenchmarkScrubber_Footer_NoScrubber(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		reportScrub(b, "footer_no_scrubber", runScrub(b, "footer", false, 50, 2<<20))
-	}
+	benchScrub(b, "footer_no_scrubber", "footer", false)
 }
 
 func BenchmarkScrubber_Footer_WithScrubber(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		reportScrub(b, "footer_with_scrubber", runScrub(b, "footer", true, 50, 2<<20))
-	}
+	benchScrub(b, "footer_with_scrubber", "footer", true)
 }
 
 func BenchmarkScrubber_Data_NoScrubber(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		reportScrub(b, "data_no_scrubber", runScrub(b, "data", false, 50, 2<<20))
-	}
+	benchScrub(b, "data_no_scrubber", "data", false)
 }
 
 func BenchmarkScrubber_Data_WithScrubber(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		reportScrub(b, "data_with_scrubber", runScrub(b, "data", true, 50, 2<<20))
-	}
+	benchScrub(b, "data_with_scrubber", "data", true)
 }
 
 // passDuration writes n chunks of 1 MiB on one worker, corrupts 10 of them and times a scrubber pass with the given pause between chunks.
 func passDuration(tb testing.TB, n int, pause time.Duration) (dur time.Duration, scanned, found int) {
 	tb.Helper()
-	dir := tb.TempDir()
+	dir, err := os.MkdirTemp("", "minidfs-scrub-")
+	require.NoError(tb, err)
+	defer os.RemoveAll(dir)
 	st, err := storage.New(dir)
 	require.NoError(tb, err)
 	ctx := context.Background()
@@ -296,15 +334,24 @@ func passDuration(tb testing.TB, n int, pause time.Duration) (dur time.Duration,
 // BenchmarkScrubber_PassDuration times one full scrubber pass over 1000 chunks of 1 MiB, with no pause and with the default 10 ms pause between chunks.
 func BenchmarkScrubber_PassDuration(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		fast, scanned, found := passDuration(b, 1000, 0)
-		paced, _, _ := passDuration(b, 1000, 10*time.Millisecond)
-		b.ReportMetric(fast.Seconds(), "pass_no_pause_s")
-		b.ReportMetric(paced.Seconds(), "pass_10ms_pause_s")
-		b.ReportMetric(float64(scanned)/fast.Seconds(), "chunks_per_s_no_pause")
-		b.ReportMetric(float64(found), "corrupt_found")
-		if out := os.Getenv("BENCH_OUT"); out != "" {
-			_ = writeJSON(filepath.Join(out, "scrubber-pass_duration.json"), map[string]any{"chunks": scanned, "chunk_mib": 1, "no_pause_s": fast.Seconds(), "pause_10ms_s": paced.Seconds(), "corrupt_found": found})
-		}
+		var fast, paced, rate []float64
+		var found []float64
+		repeat(b, repCount(), func(rep int) {
+			f, scanned, bad := passDuration(b, 1000, 0)
+			p, _, _ := passDuration(b, 1000, 10*time.Millisecond)
+			if bad != 10 {
+				b.Fatalf("found %d corrupt chunks, want 10", bad)
+			}
+			if rep >= 0 {
+				fast, paced = append(fast, f.Seconds()), append(paced, p.Seconds())
+				rate = append(rate, float64(scanned)/f.Seconds())
+				found = append(found, float64(bad))
+			}
+		})
+		out := map[string]any{"chunks": 1000, "chunk_mib": 1, "no_pause_seconds": spreadOf(fast), "pause_10ms_seconds": spreadOf(paced), "no_pause_chunks_per_s": spreadOf(rate), "corrupt_found": spreadOf(found)}
+		b.ReportMetric(medianOf(fast), "pass_no_pause_s")
+		b.ReportMetric(medianOf(paced), "pass_10ms_pause_s")
+		saveReport(b, "scrubber-pass_duration", out)
 	}
 }
 

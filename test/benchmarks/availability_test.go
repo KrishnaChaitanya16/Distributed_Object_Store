@@ -8,8 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"net/http"
 	"os"
-	"path/filepath"
-	"sort"
 	"testing"
 	"time"
 
@@ -38,6 +36,7 @@ type availResult struct {
 	AfterP99Ms      float64     `json:"after_failure_p99_ms"`
 	FallbackServed  int         `json:"served_from_secondary_after_failure"`
 	DetectionSecond []float64   `json:"detection_seconds,omitempty"`
+	before, after   []float64
 }
 
 // uploadSmallObjects stores n single-chunk objects of random bytes and records where each landed.
@@ -117,6 +116,7 @@ func runAvailability(tb testing.TB, n int, singleReplica bool, kill []string) *a
 		tb.Fatalf("before any failure: %d of %d served, %d corrupt", served, n, corrupt)
 	}
 	r.BeforeP50Ms, r.BeforeP99Ms = percentile(before, 50), percentile(before, 99)
+	r.before = before
 
 	for _, k := range kill {
 		c.kill(k)
@@ -127,6 +127,7 @@ func runAvailability(tb testing.TB, n int, singleReplica bool, kill []string) *a
 	r.Unavailable = n - r.Served - r.Corrupt
 	r.SuccessRate = 100 * float64(r.Served) / float64(n)
 	r.AfterP50Ms, r.AfterP99Ms = percentile(after, 50), percentile(after, 99)
+	r.after = after
 	dead := map[string]bool{}
 	for _, k := range kill {
 		dead[k] = true
@@ -140,22 +141,68 @@ func runAvailability(tb testing.TB, n int, singleReplica bool, kill []string) *a
 	return r
 }
 
-func reportAvail(b *testing.B, name string, r *availResult) {
-	b.ReportMetric(r.SuccessRate, "success_%")
-	b.ReportMetric(float64(r.Unavailable), "unavailable")
-	b.ReportMetric(float64(r.Corrupt), "corrupt")
-	b.ReportMetric(r.AfterP99Ms, "after_p99_ms")
-	b.ReportMetric(r.BeforeP99Ms, "before_p99_ms")
-	if out := os.Getenv("BENCH_OUT"); out != "" {
-		if err := writeJSON(filepath.Join(out, "availability-"+name+".json"), r); err != nil {
-			b.Fatal(err)
+type availReport struct {
+	Config               string      `json:"config"`
+	Replicas             int         `json:"replicas"`
+	ObjectsPerRep        int         `json:"objects_per_rep"`
+	Killed               []string    `json:"killed_workers"`
+	Served               Spread      `json:"served_correctly"`
+	Unavailable          Spread      `json:"unavailable"`
+	ExpectedUnavailable  Spread      `json:"expected_unavailable"`
+	Corrupt              Spread      `json:"served_corrupt"`
+	FallbackServed       Spread      `json:"served_from_secondary_after_failure"`
+	UnavailablePctPooled float64     `json:"unavailable_pct_all_reps"`
+	StatusCodes          map[int]int `json:"unavailable_status_codes_all_reps"`
+	Before               Latency     `json:"read_ms_before_failure"`
+	After                Latency     `json:"read_ms_after_failure"`
+}
+
+// foldAvailability combines the repetitions of one configuration.
+func foldAvailability(name string, runs []*availResult) availReport {
+	r := availReport{Config: name, Replicas: runs[0].Replicas, ObjectsPerRep: runs[0].Objects, Killed: runs[0].Killed, StatusCodes: map[int]int{}}
+	var before, after [][]float64
+	var objects, unavailable int
+	for _, run := range runs {
+		before, after = append(before, run.before), append(after, run.after)
+		objects += run.Objects
+		unavailable += run.Unavailable
+		for c, n := range run.StatusCodes {
+			r.StatusCodes[c] += n
 		}
 	}
-	if r.Corrupt != 0 {
-		b.Fatalf("%d objects were served with wrong bytes", r.Corrupt)
+	f := func(g func(*availResult) int) Spread {
+		return spreadOf(col(runs, func(x *availResult) float64 { return float64(g(x)) }))
 	}
-	if r.Unavailable != r.ExpectedLost {
-		b.Fatalf("%d objects unavailable but only %d had every copy on a dead worker", r.Unavailable, r.ExpectedLost)
+	r.Served = f(func(x *availResult) int { return x.Served })
+	r.Unavailable = f(func(x *availResult) int { return x.Unavailable })
+	r.ExpectedUnavailable = f(func(x *availResult) int { return x.ExpectedLost })
+	r.Corrupt = f(func(x *availResult) int { return x.Corrupt })
+	r.FallbackServed = f(func(x *availResult) int { return x.FallbackServed })
+	r.UnavailablePctPooled = 100 * float64(unavailable) / float64(objects)
+	r.Before, r.After = latencyOf(before), latencyOf(after)
+	return r
+}
+
+// benchAvailability runs one failure configuration through the common protocol.
+func benchAvailability(b *testing.B, name string, singleReplica bool, kill []string) {
+	for i := 0; i < b.N; i++ {
+		var runs []*availResult
+		repeat(b, repCount(), func(rep int) {
+			r := runAvailability(b, objectCount(), singleReplica, kill)
+			if r.Corrupt != 0 {
+				b.Fatalf("%d objects were served with wrong bytes", r.Corrupt)
+			}
+			if r.Unavailable != r.ExpectedLost {
+				b.Fatalf("%d objects unavailable but only %d had every copy on a dead worker", r.Unavailable, r.ExpectedLost)
+			}
+			if rep >= 0 {
+				runs = append(runs, r)
+			}
+		})
+		rep := foldAvailability(name, runs)
+		b.ReportMetric(rep.UnavailablePctPooled, "unavailable_%")
+		b.ReportMetric(rep.After.Pooled.P99, "after_p99_ms")
+		saveReport(b, "availability-"+name, rep)
 	}
 }
 
@@ -171,55 +218,56 @@ func objectCount() int {
 }
 
 func BenchmarkAvailability_RF2_OneWorkerDown(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		reportAvail(b, "rf2_one_down", runAvailability(b, objectCount(), false, []string{"worker2"}))
-	}
+	benchAvailability(b, "rf2_one_down", false, []string{"worker2"})
 }
 
 func BenchmarkAvailability_RF1_OneWorkerDown(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		reportAvail(b, "rf1_one_down", runAvailability(b, objectCount(), true, []string{"worker2"}))
-	}
+	benchAvailability(b, "rf1_one_down", true, []string{"worker2"})
 }
 
 func BenchmarkAvailability_RF2_TwoWorkersDown(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		reportAvail(b, "rf2_two_down", runAvailability(b, objectCount(), false, []string{"worker2", "worker3"}))
-	}
+	benchAvailability(b, "rf2_two_down", false, []string{"worker2", "worker3"})
 }
 
 func BenchmarkAvailability_RF1_TwoWorkersDown(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		reportAvail(b, "rf1_two_down", runAvailability(b, objectCount(), true, []string{"worker2", "worker3"}))
-	}
+	benchAvailability(b, "rf1_two_down", true, []string{"worker2", "worker3"})
 }
 
-// BenchmarkAvailability_DetectionTime measures how long after a worker dies the health monitor declares it OFFLINE.
+// detectionSeconds kills three workers one after another and times how long the health monitor takes to declare each OFFLINE.
+func detectionSeconds(tb testing.TB) []float64 {
+	tb.Helper()
+	c := newClusterWith(tb, options{workers: 4, heartbeats: true})
+	time.Sleep(2500 * time.Millisecond)
+	var secs []float64
+	for _, id := range []string{"worker1", "worker2", "worker3"} {
+		start := time.Now()
+		c.kill(id)
+		for c.table.GetWorkerStatus(id) != models.WorkerOffline {
+			if time.Since(start) > 20*time.Second {
+				tb.Fatalf("%s was never declared offline", id)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		secs = append(secs, time.Since(start).Seconds())
+		time.Sleep(700 * time.Millisecond)
+	}
+	return secs
+}
+
+// BenchmarkAvailability_DetectionTime measures how long after a worker dies the health monitor declares it OFFLINE (one sample per killed worker).
 func BenchmarkAvailability_DetectionTime(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		c := newClusterWith(b, options{workers: 4, heartbeats: true})
-		time.Sleep(2500 * time.Millisecond)
-		var secs []float64
-		for _, id := range []string{"worker1", "worker2", "worker3"} {
-			start := time.Now()
-			c.kill(id)
-			for c.table.GetWorkerStatus(id) != models.WorkerOffline {
-				if time.Since(start) > 20*time.Second {
-					b.Fatalf("%s was never declared offline", id)
-				}
-				time.Sleep(20 * time.Millisecond)
+		var all []float64
+		repeat(b, repCount(), func(rep int) {
+			secs := detectionSeconds(b)
+			if rep >= 0 {
+				all = append(all, secs...)
 			}
-			secs = append(secs, time.Since(start).Seconds())
-			time.Sleep(700 * time.Millisecond)
-		}
-		sort.Float64s(secs)
-		b.ReportMetric(secs[0], "detect_min_s")
-		b.ReportMetric(secs[len(secs)-1], "detect_max_s")
-		if out := os.Getenv("BENCH_OUT"); out != "" {
-			if err := writeJSON(filepath.Join(out, "availability-detection.json"), map[string]any{"detection_seconds": secs}); err != nil {
-				b.Fatal(err)
-			}
-		}
+		})
+		d := distOf(all)
+		b.ReportMetric(d.P50, "detect_p50_s")
+		b.ReportMetric(d.Max, "detect_max_s")
+		saveReport(b, "availability-detection", map[string]any{"seconds": d, "samples": all})
 	}
 }
 

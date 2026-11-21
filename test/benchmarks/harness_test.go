@@ -172,3 +172,92 @@ func TestRunWorkloadAccountsForEveryChunkPerImage(t *testing.T) {
 	assert.EqualValues(t, 0, off.BloomQueries)
 	assert.Equal(t, on.DiskBytes, off.DiskBytes, "content addressing: rewriting a chunk replaces the same file")
 }
+
+func TestDistOfUsesNearestRankPercentiles(t *testing.T) {
+	var s []float64
+	for i := 1; i <= 100; i++ {
+		s = append(s, float64(i))
+	}
+	d := distOf(s)
+	assert.Equal(t, Dist{N: 100, Min: 1, P50: 50, P95: 95, P99: 99, Max: 100}, d)
+	assert.Equal(t, Dist{}, distOf(nil))
+	assert.Equal(t, 7.0, distOf([]float64{7}).P99)
+}
+
+func TestMedianOfHandlesOddEvenAndEmpty(t *testing.T) {
+	assert.Equal(t, 3.0, medianOf([]float64{5, 1, 3}))
+	assert.Equal(t, 2.5, medianOf([]float64{4, 1, 3, 2}))
+	assert.Equal(t, 0.0, medianOf(nil))
+	in := []float64{3, 1, 2}
+	medianOf(in)
+	assert.Equal(t, []float64{3, 1, 2}, in, "the input is not reordered")
+}
+
+func TestSpreadIsReproducibleAndItsIntervalBracketsTheMedian(t *testing.T) {
+	v := []float64{10, 11, 12, 13, 14, 15, 30}
+	a, b := spreadOf(v), spreadOf(v)
+	assert.Equal(t, a, b, "same input, same interval")
+	assert.Equal(t, 13.0, a.Median)
+	assert.Equal(t, 10.0, a.Min)
+	assert.Equal(t, 30.0, a.Max)
+	assert.LessOrEqual(t, a.CILo, a.Median)
+	assert.GreaterOrEqual(t, a.CIHi, a.Median)
+	one := spreadOf([]float64{4})
+	assert.Equal(t, 4.0, one.CILo)
+	assert.Equal(t, 4.0, one.CIHi)
+	assert.Equal(t, Spread{}, spreadOf(nil))
+}
+
+func TestRatioIntervalContainsOneForEqualSamplesAndExcludesItForADoubling(t *testing.T) {
+	a := []float64{10, 10.4, 9.8, 10.2, 10.1, 9.9, 10.3}
+	b := []float64{10.1, 9.9, 10.2, 10.0, 10.3, 9.8, 10.4}
+	same := ratioOf(a, b)
+	assert.LessOrEqual(t, same.Lo, 1.0)
+	assert.GreaterOrEqual(t, same.Hi, 1.0)
+	double := make([]float64, len(b))
+	for i, x := range b {
+		double[i] = 2 * x
+	}
+	d := ratioOf(double, b)
+	assert.InDelta(t, 2.0, d.Value, 0.05)
+	assert.Greater(t, d.Lo, 1.5)
+	assert.Equal(t, Ratio{}, ratioOf(nil, b))
+	assert.Equal(t, Ratio{}, ratioOf(a, []float64{0, 0}), "a zero denominator gives no ratio")
+}
+
+func TestLatencyOfPoolsSamplesAndKeepsPerRepetitionPercentiles(t *testing.T) {
+	l := latencyOf([][]float64{{1, 2, 3}, nil, {10, 20, 30}})
+	assert.Equal(t, 6, l.Pooled.N)
+	assert.Equal(t, 30.0, l.Pooled.Max)
+	assert.Equal(t, 2, l.RepP50.N, "an empty repetition contributes nothing")
+	assert.Equal(t, 11.0, l.RepP50.Median)
+}
+
+func TestRepeatRunsOneWarmupThenTheMeasuredRepetitions(t *testing.T) {
+	var seen []int
+	repeat(t, 3, func(rep int) { seen = append(seen, rep) })
+	assert.Equal(t, []int{-1, 0, 1, 2}, seen)
+}
+
+func TestRepCountReadsTheEnvironmentAndIgnoresBadValues(t *testing.T) {
+	t.Setenv("BENCH_REPS", "")
+	assert.Equal(t, 7, repCount())
+	t.Setenv("BENCH_REPS", "3")
+	assert.Equal(t, 3, repCount())
+	for _, bad := range []string{"0", "-2", "x"} {
+		t.Setenv("BENCH_REPS", bad)
+		assert.Equal(t, 7, repCount(), bad)
+	}
+}
+
+func TestClusterCloseRemovesItsFilesAndIsIdempotent(t *testing.T) {
+	c := newCluster(t, 4, true)
+	dirs := append([]string(nil), c.dirs...)
+	require.Len(t, dirs, 5, "metadata plus four workers")
+	c.Close()
+	c.Close()
+	for _, d := range dirs {
+		_, err := os.Stat(d)
+		assert.True(t, os.IsNotExist(err), d)
+	}
+}

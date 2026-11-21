@@ -75,6 +75,53 @@ type cluster struct {
 	ctx     context.Context
 	slow    map[string]*slowControl
 	opts    options
+	cancel  context.CancelFunc
+	dirs    []string
+	once    sync.Once
+}
+
+var (
+	liveMu sync.Mutex
+	live   []*cluster
+)
+
+// mkdir makes a scratch directory that Close removes.
+func (c *cluster) mkdir() string {
+	d, err := os.MkdirTemp("", "minidfs-bench-")
+	if err != nil {
+		c.tb.Fatal(err)
+	}
+	c.dirs = append(c.dirs, d)
+	return d
+}
+
+// Close stops every server and deletes every file the cluster wrote; it is safe to call more than once.
+func (c *cluster) Close() {
+	c.once.Do(func() {
+		c.cancel()
+		c.ctrl.Close()
+		for _, w := range c.workers {
+			w.srv.Close()
+		}
+		for _, s := range c.slow {
+			s.srv.Close()
+		}
+		c.meta.Close()
+		for _, d := range c.dirs {
+			os.RemoveAll(d)
+		}
+	})
+}
+
+// closeLive closes every cluster created since the last call.
+func closeLive() {
+	liveMu.Lock()
+	all := live
+	live = nil
+	liveMu.Unlock()
+	for _, c := range all {
+		c.Close()
+	}
 }
 
 // options tunes a cluster for one benchmark.
@@ -94,7 +141,11 @@ func newCluster(tb testing.TB, n int, dedup bool) *cluster {
 func newClusterWith(tb testing.TB, o options) *cluster {
 	tb.Helper()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	store, err := metadata.NewMetadataStore(filepath.Join(tb.TempDir(), "meta.db"))
+	metaDir, err := os.MkdirTemp("", "minidfs-bench-")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	store, err := metadata.NewMetadataStore(filepath.Join(metaDir, "meta.db"))
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -110,21 +161,14 @@ func newClusterWith(tb testing.TB, o options) *cluster {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctrl := httptest.NewServer(srv.Handler())
-	c := &cluster{tb: tb, ctrl: ctrl, api: srv, pool: pool, meta: store, ring: ring, table: table, client: &http.Client{}, ctx: ctx, slow: map[string]*slowControl{}, opts: o}
+	c := &cluster{tb: tb, ctrl: ctrl, api: srv, pool: pool, meta: store, ring: ring, table: table, client: &http.Client{}, ctx: ctx, slow: map[string]*slowControl{}, opts: o, cancel: cancel, dirs: []string{metaDir}}
+	liveMu.Lock()
+	live = append(live, c)
+	liveMu.Unlock()
 	if o.heartbeats {
 		health.NewMonitor(table).Start(ctx)
 	}
-	tb.Cleanup(func() {
-		cancel()
-		ctrl.Close()
-		for _, w := range c.workers {
-			w.srv.Close()
-		}
-		for _, s := range c.slow {
-			s.srv.Close()
-		}
-		store.Close()
-	})
+	tb.Cleanup(c.Close)
 	for i := 1; i <= o.workers; i++ {
 		c.addWorker(fmt.Sprintf("worker%d", i))
 	}
@@ -178,7 +222,7 @@ func newSlowProxy(target string) *slowControl {
 
 func (c *cluster) addWorker(id string) {
 	c.tb.Helper()
-	dir := c.tb.TempDir()
+	dir := c.mkdir()
 	st, err := storage.New(dir)
 	if err != nil {
 		c.tb.Fatal(err)

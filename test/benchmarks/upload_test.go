@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -57,40 +55,92 @@ func pushImages(tb testing.TB, dedupOn bool, images, shared, unique int) []pushS
 	return out
 }
 
-func median(v []float64) float64 { return percentile(v, 50) }
+type pushSide struct {
+	DedupOn      bool    `json:"dedup_on"`
+	FirstPushMs  Dist    `json:"first_push_ms"`
+	LaterPushMs  Latency `json:"pushes_2_to_10_ms"`
+	TotalSeconds Spread  `json:"total_seconds_10_pushes"`
+	FirstSentMiB Spread  `json:"first_push_sent_mib"`
+	LaterSentMiB Spread  `json:"each_later_push_sent_mib"`
+	TotalSentMiB Spread  `json:"total_sent_mib"`
+	TotalDiskMiB Spread  `json:"total_disk_mib"`
+}
 
-// BenchmarkCompounding_ImagePushes pushes 10 images of 7 shared + 3 unique 1 MiB chunks, three times each way, and keeps the median push times.
+type pushReport struct {
+	On             pushSide `json:"dedup_on"`
+	Off            pushSide `json:"dedup_off"`
+	TimeOffOverOn  Ratio    `json:"total_time_off_over_on"`
+	LaterPushRatio Ratio    `json:"later_push_median_off_over_on"`
+	BytesOffOverOn float64  `json:"total_bytes_off_over_on"`
+}
+
+func foldPushes(on bool, runs [][]pushStat) pushSide {
+	var first []float64
+	var later [][]float64
+	var total, sentFirst, sentLater, sent, disk []float64
+	for _, r := range runs {
+		first = append(first, r[0].Ms)
+		var l []float64
+		for _, p := range r[1:] {
+			l = append(l, p.Ms)
+		}
+		later = append(later, l)
+		last := r[len(r)-1]
+		total = append(total, last.CumMs/1000)
+		sentFirst = append(sentFirst, float64(r[0].PutBytes)/mib)
+		sentLater = append(sentLater, float64(r[1].PutBytes)/mib)
+		sent = append(sent, float64(last.CumBytes)/mib)
+		disk = append(disk, float64(last.DiskBytes)/mib)
+	}
+	return pushSide{DedupOn: on, FirstPushMs: distOf(first), LaterPushMs: latencyOf(later), TotalSeconds: spreadOf(total), FirstSentMiB: spreadOf(sentFirst), LaterSentMiB: spreadOf(sentLater), TotalSentMiB: spreadOf(sent), TotalDiskMiB: spreadOf(disk)}
+}
+
+func pooledLater(runs [][]pushStat) []float64 {
+	var out []float64
+	for _, r := range runs {
+		for _, p := range r[1:] {
+			out = append(out, p.Ms)
+		}
+	}
+	return out
+}
+
+func totals(runs [][]pushStat) []float64 {
+	out := make([]float64, len(runs))
+	for i, r := range runs {
+		out[i] = r[len(r)-1].CumMs
+	}
+	return out
+}
+
+// BenchmarkCompounding_ImagePushes pushes 10 images of 7 shared + 3 unique 1 MiB chunks, with dedup on and off.
 func BenchmarkCompounding_ImagePushes(b *testing.B) {
 	for n := 0; n < b.N; n++ {
-		const reps = 3
 		var on, off [][]pushStat
-		for r := 0; r < reps; r++ {
-			on = append(on, pushImages(b, true, 10, 7, 3))
-			off = append(off, pushImages(b, false, 10, 7, 3))
-		}
-		fold := func(runs [][]pushStat) []pushStat {
-			var out []pushStat
-			for i := range runs[0] {
-				var t, cum []float64
-				for _, r := range runs {
-					t = append(t, r[i].Ms)
-					cum = append(cum, r[i].CumMs)
+		repeat(b, repCount(), func(rep int) {
+			order := []bool{true, false}
+			if rep%2 != 0 {
+				order = []bool{false, true}
+			}
+			for _, mode := range order {
+				r := pushImages(b, mode, 10, 7, 3)
+				if rep < 0 {
+					continue
 				}
-				s := runs[0][i]
-				s.Ms, s.CumMs = median(t), median(cum)
-				out = append(out, s)
+				if mode {
+					on = append(on, r)
+				} else {
+					off = append(off, r)
+				}
 			}
-			return out
-		}
-		fOn, fOff := fold(on), fold(off)
-		b.ReportMetric(fOn[9].CumMs, "dedup_on_total_ms")
-		b.ReportMetric(fOff[9].CumMs, "dedup_off_total_ms")
-		b.ReportMetric(float64(fOff[9].CumBytes)/float64(fOn[9].CumBytes), "bytes_sent_ratio")
-		if out := os.Getenv("BENCH_OUT"); out != "" {
-			if err := writeJSON(filepath.Join(out, "compounding.json"), map[string]any{"dedup_on": fOn, "dedup_off": fOff}); err != nil {
-				b.Fatal(err)
-			}
-		}
+		})
+		rep := pushReport{On: foldPushes(true, on), Off: foldPushes(false, off)}
+		rep.TimeOffOverOn = ratioOf(totals(off), totals(on))
+		rep.LaterPushRatio = ratioOf(pooledLater(off), pooledLater(on))
+		rep.BytesOffOverOn = rep.Off.TotalSentMiB.Median / rep.On.TotalSentMiB.Median
+		b.ReportMetric(rep.TimeOffOverOn.Value, "total_time_off_over_on")
+		b.ReportMetric(rep.On.LaterPushMs.Pooled.P99, "on_later_push_p99_ms")
+		saveReport(b, "compounding", rep)
 	}
 }
 
@@ -101,9 +151,10 @@ type mediaRun struct {
 	PerChunkMs  float64 `json:"per_chunk_ms"`
 	StoredBytes int64   `json:"stored_bytes"`
 	LogicalByte int64   `json:"logical_bytes_x_replicas"`
+	fileMs      []float64
 }
 
-// pushRandomMedia uploads `files` objects of fileMiB random MiB each and times the whole upload.
+// pushRandomMedia uploads `files` objects of fileMiB random MiB each and times every upload.
 func pushRandomMedia(tb testing.TB, dedupOn bool, files, fileMiB int) mediaRun {
 	tb.Helper()
 	c := newCluster(tb, 4, dedupOn)
@@ -112,45 +163,76 @@ func pushRandomMedia(tb testing.TB, dedupOn bool, files, fileMiB int) mediaRun {
 		blobs[i] = make([]byte, fileMiB*mib)
 		_, _ = rand.Read(blobs[i])
 	}
+	res := mediaRun{DedupOn: dedupOn, Chunks: files * fileMiB}
 	start := time.Now()
 	for i, d := range blobs {
+		t := time.Now()
 		if _, err := c.uploadBytes(fmt.Sprintf("media-%d", i), d); err != nil {
 			tb.Fatal(err)
 		}
+		res.fileMs = append(res.fileMs, ms(time.Since(t)))
 	}
-	total := time.Since(start)
-	chunks := files * fileMiB
-	disk, _ := c.diskUsage()
-	return mediaRun{DedupOn: dedupOn, Chunks: chunks, TotalMs: ms(total), PerChunkMs: ms(total) / float64(chunks), StoredBytes: disk, LogicalByte: int64(chunks) * mib * 2}
+	res.TotalMs = ms(time.Since(start))
+	res.PerChunkMs = res.TotalMs / float64(res.Chunks)
+	res.StoredBytes, _ = c.diskUsage()
+	res.LogicalByte = int64(res.Chunks) * mib * 2
+	return res
 }
 
-// BenchmarkRandomMedia_Overhead uploads 10 x 5 MiB of random bytes with dedup on and off, alternating, seven times each.
+type mediaSide struct {
+	DedupOn      bool    `json:"dedup_on"`
+	FileMs       Latency `json:"upload_ms_per_5mib_file"`
+	PerChunkMs   Spread  `json:"ms_per_chunk"`
+	StoredMiB    Spread  `json:"stored_mib"`
+	StorageRatio Spread  `json:"storage_ratio"`
+}
+
+type mediaReport struct {
+	Chunks        int       `json:"chunks_per_rep"`
+	On            mediaSide `json:"dedup_on"`
+	Off           mediaSide `json:"dedup_off"`
+	TimeOffOverOn Ratio     `json:"per_chunk_time_off_over_on"`
+}
+
+func foldMedia(on bool, runs []mediaRun) mediaSide {
+	var per [][]float64
+	for _, r := range runs {
+		per = append(per, r.fileMs)
+	}
+	return mediaSide{
+		DedupOn: on, FileMs: latencyOf(per),
+		PerChunkMs:   spreadOf(col(runs, func(r mediaRun) float64 { return r.PerChunkMs })),
+		StoredMiB:    spreadOf(col(runs, func(r mediaRun) float64 { return float64(r.StoredBytes) / mib })),
+		StorageRatio: spreadOf(col(runs, func(r mediaRun) float64 { return float64(r.LogicalByte) / float64(r.StoredBytes) })),
+	}
+}
+
+// BenchmarkRandomMedia_Overhead uploads 10 x 5 MiB of random bytes with dedup on and off.
 func BenchmarkRandomMedia_Overhead(b *testing.B) {
 	for n := 0; n < b.N; n++ {
-		const reps = 7
 		var on, off []mediaRun
-		var onMs, offMs []float64
-		for r := 0; r < reps; r++ {
-			first, second := true, false
-			if r%2 == 1 {
-				first, second = false, true
+		repeat(b, repCount(), func(rep int) {
+			order := []bool{true, false}
+			if rep%2 != 0 {
+				order = []bool{false, true}
 			}
-			for _, mode := range []bool{first, second} {
-				run := pushRandomMedia(b, mode, 10, 5)
+			for _, mode := range order {
+				r := pushRandomMedia(b, mode, 10, 5)
+				if rep < 0 {
+					continue
+				}
 				if mode {
-					on, onMs = append(on, run), append(onMs, run.PerChunkMs)
+					on = append(on, r)
 				} else {
-					off, offMs = append(off, run), append(offMs, run.PerChunkMs)
+					off = append(off, r)
 				}
 			}
-		}
-		b.ReportMetric(median(onMs), "dedup_on_ms_per_chunk")
-		b.ReportMetric(median(offMs), "dedup_off_ms_per_chunk")
-		if out := os.Getenv("BENCH_OUT"); out != "" {
-			if err := writeJSON(filepath.Join(out, "random-media.json"), map[string]any{"dedup_on": on, "dedup_off": off}); err != nil {
-				b.Fatal(err)
-			}
-		}
+		})
+		rep := mediaReport{Chunks: on[0].Chunks, On: foldMedia(true, on), Off: foldMedia(false, off)}
+		rep.TimeOffOverOn = ratioOf(col(off, func(r mediaRun) float64 { return r.PerChunkMs }), col(on, func(r mediaRun) float64 { return r.PerChunkMs }))
+		b.ReportMetric(rep.On.FileMs.Pooled.P99, "on_p99_ms_per_file")
+		b.ReportMetric(rep.Off.FileMs.Pooled.P99, "off_p99_ms_per_file")
+		saveReport(b, "random-media", rep)
 	}
 }
 

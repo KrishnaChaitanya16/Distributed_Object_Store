@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
 	"sort"
 	"testing"
 
@@ -102,26 +100,76 @@ func measureSpread(keys []string, n int) spread {
 	return spread{Workers: n, Chunks: len(keys), MinPct: shares[0], MaxPct: shares[n-1], FairPct: mean, CV: 100 * math.Sqrt(ss/float64(n)) / mean}
 }
 
+func saltedKeys(n int, salt string) []string {
+	keys := make([]string, n)
+	for i := range keys {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s-chunk-%d", salt, i)))
+		keys[i] = hex.EncodeToString(sum[:])
+	}
+	return keys
+}
+
+type movementReport struct {
+	From, To    int
+	Ideal       float64 `json:"ideal_pct"`
+	RingPct     Spread  `json:"ring_primary_moved_pct"`
+	ModuloPct   Spread  `json:"modulo_primary_moved_pct"`
+	RingPairPct Spread  `json:"ring_primary_or_secondary_changed_pct"`
+	RingMoved   Spread  `json:"ring_chunks_moved"`
+	ModuloMoved Spread  `json:"modulo_chunks_moved"`
+}
+
+type spreadReport struct {
+	Workers int     `json:"workers"`
+	FairPct float64 `json:"fair_share_pct"`
+	MinPct  Spread  `json:"min_share_pct"`
+	MaxPct  Spread  `json:"max_share_pct"`
+	CVPct   Spread  `json:"coefficient_of_variation_pct"`
+}
+
 // BenchmarkRing_ChunkMovement counts how many of 10,000 chunks change primary worker when one worker is added.
+// It is pure computation, so a repetition is a different set of 10,000 chunk ids rather than a re-run of the same one, and there is no warm-up.
 func BenchmarkRing_ChunkMovement(b *testing.B) {
-	keys := chunkKeys(10000)
+	pairs := [][2]int{{4, 5}, {9, 10}, {19, 20}, {39, 40}}
+	sizes := []int{4, 10, 20}
 	for n := 0; n < b.N; n++ {
-		var runs []moveResult
-		for _, p := range [][2]int{{4, 5}, {9, 10}, {19, 20}, {39, 40}} {
-			r := measureMove(keys, p[0], p[1])
-			runs = append(runs, r)
-			b.ReportMetric(r.RingPct, fmt.Sprintf("ring_moved_pct_%d_to_%d", p[0], p[1]))
-			b.ReportMetric(r.ModuloPct, fmt.Sprintf("modulo_moved_pct_%d_to_%d", p[0], p[1]))
-		}
-		var spreads []spread
-		for _, w := range []int{4, 10, 20} {
-			spreads = append(spreads, measureSpread(keys, w))
-		}
-		if out := os.Getenv("BENCH_OUT"); out != "" {
-			if err := writeJSON(filepath.Join(out, "ring.json"), map[string]any{"movement": runs, "spread": spreads}); err != nil {
-				b.Fatal(err)
+		moves := make([][]moveResult, len(pairs))
+		spreads := make([][]spread, len(sizes))
+		for rep := 0; rep < repCount(); rep++ {
+			keys := saltedKeys(10000, fmt.Sprintf("set%d", rep))
+			for k, p := range pairs {
+				moves[k] = append(moves[k], measureMove(keys, p[0], p[1]))
+			}
+			for k, w := range sizes {
+				spreads[k] = append(spreads[k], measureSpread(keys, w))
 			}
 		}
+		var out struct {
+			Movement []movementReport `json:"movement"`
+			Balance  []spreadReport   `json:"balance"`
+		}
+		for k, p := range pairs {
+			m := moves[k]
+			r := movementReport{From: p[0], To: p[1], Ideal: m[0].IdealPct,
+				RingPct:     spreadOf(col(m, func(x moveResult) float64 { return x.RingPct })),
+				ModuloPct:   spreadOf(col(m, func(x moveResult) float64 { return x.ModuloPct })),
+				RingPairPct: spreadOf(col(m, func(x moveResult) float64 { return x.RingPairMovedPc })),
+				RingMoved:   spreadOf(col(m, func(x moveResult) float64 { return float64(x.RingMoved) })),
+				ModuloMoved: spreadOf(col(m, func(x moveResult) float64 { return float64(x.ModuloMoved) })),
+			}
+			out.Movement = append(out.Movement, r)
+			b.ReportMetric(r.RingPct.Median, fmt.Sprintf("ring_moved_pct_%d_to_%d", p[0], p[1]))
+			b.ReportMetric(r.ModuloPct.Median, fmt.Sprintf("modulo_moved_pct_%d_to_%d", p[0], p[1]))
+		}
+		for k, w := range sizes {
+			sp := spreads[k]
+			out.Balance = append(out.Balance, spreadReport{Workers: w, FairPct: sp[0].FairPct,
+				MinPct: spreadOf(col(sp, func(x spread) float64 { return x.MinPct })),
+				MaxPct: spreadOf(col(sp, func(x spread) float64 { return x.MaxPct })),
+				CVPct:  spreadOf(col(sp, func(x spread) float64 { return x.CV })),
+			})
+		}
+		saveReport(b, "ring", out)
 	}
 }
 
