@@ -26,7 +26,8 @@ export function topology(workers) {
     fig.append(svg('path', { class: `link ${alive ? 'alive' : dead ? 'dead' : ''}`, d, 'stroke-dasharray': dead ? '2 7' : undefined, 'stroke-linecap': 'round' }));
     if (alive) {
       for (let k = 0; k < 2; k++) {
-        const dot = svg('circle', { class: 'pulse', r: 3.4, cx: x, cy: y - 30 });
+        // animateMotion adds the path to the shape's own position, so the dot must start at the origin
+        const dot = svg('circle', { class: 'pulse', r: 3.4, cx: 0, cy: 0 });
         dot.append(svg('animateMotion', { dur: '2s', begin: `${k}s`, repeatCount: 'indefinite', path: d }));
         fig.append(dot);
       }
