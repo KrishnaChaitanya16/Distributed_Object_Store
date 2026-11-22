@@ -25,6 +25,7 @@ type Server struct {
 	selfAddr string
 	peer     *http.Client
 	scrub    ScrubberControl
+	metrics  *workerMetrics
 }
 
 // ScrubberControl is the part of the scrubber the HTTP API exposes; *scrubber.Scrubber satisfies it.
@@ -35,22 +36,33 @@ type ScrubberControl interface {
 
 // New builds a Server; selfAddr is this worker's advertised host:port, peer is used for replicate-peer pushes.
 func New(store models.ChunkStore, workerID, selfAddr string, peer *http.Client) *Server {
-	return &Server{store: store, workerID: workerID, selfAddr: selfAddr, peer: peer}
+	s := &Server{store: store, workerID: workerID, selfAddr: selfAddr, peer: peer}
+	s.metrics = newWorkerMetrics(s)
+	return s
+}
+
+// WithDiskStats exposes free and total bytes of the chunk filesystem on /metrics.
+func (s *Server) WithDiskStats(stats func() (free, total int64)) *Server {
+	s.metrics.registerDisk(stats)
+	return s
 }
 
 // WithScrubber exposes the scrubber's status and manual trigger; without it those routes answer 404.
 func (s *Server) WithScrubber(sc ScrubberControl) *Server {
 	s.scrub = sc
+	s.metrics.registerScrubber(sc)
 	return s
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /internal/chunks/{id}", s.putChunk)
-	mux.HandleFunc("GET /internal/chunks/{id}", s.getChunk)
-	mux.HandleFunc("DELETE /internal/chunks/{id}", s.deleteChunk)
-	mux.HandleFunc("GET /internal/workers/{id}/chunks", s.inventory)
-	mux.HandleFunc("POST /internal/workers/replicate-peer", s.replicatePeer)
+	m := s.metrics.instrument
+	mux.HandleFunc("PUT /internal/chunks/{id}", m("put", s.putChunk))
+	mux.HandleFunc("GET /internal/chunks/{id}", m("get", s.getChunk))
+	mux.HandleFunc("DELETE /internal/chunks/{id}", m("delete", s.deleteChunk))
+	mux.HandleFunc("GET /internal/workers/{id}/chunks", m("inventory", s.inventory))
+	mux.HandleFunc("POST /internal/workers/replicate-peer", m("replicate_peer", s.replicatePeer))
+	mux.Handle("GET /metrics", s.metrics.handler())
 	if s.scrub != nil {
 		mux.HandleFunc("GET /internal/scrubber/status", s.scrubStatus)
 		mux.HandleFunc("POST /internal/scrubber/run", s.scrubRun)

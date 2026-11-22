@@ -56,7 +56,7 @@ func main() {
 	}
 	selfAddr := net.JoinHostPort(cfg.address, strconv.Itoa(cfg.port))
 	peer := &http.Client{Timeout: 30 * time.Second}
-	srv := newHTTPServer(cfg.port, api.New(store, cfg.workerID, selfAddr, peer).WithScrubber(scrub).Handler())
+	srv := newHTTPServer(cfg.port, api.New(store, cfg.workerID, selfAddr, peer).WithScrubber(scrub).WithDiskStats(diskStats(cfg.dataDir)).Handler())
 	// Listen before registering so the controller can reach us as soon as it knows about us.
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
@@ -155,6 +155,17 @@ func newHTTPServer(port int, h http.Handler) *http.Server {
 }
 
 // diskCapacity returns the total size of the filesystem holding dir, or 0 if it cannot be read.
+// diskStats reports the free and total bytes of the filesystem holding dir.
+func diskStats(dir string) func() (free, total int64) {
+	return func() (int64, int64) {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(dir, &st); err != nil {
+			return 0, 0
+		}
+		return int64(st.Bavail) * int64(st.Bsize), int64(st.Blocks) * int64(st.Bsize)
+	}
+}
+
 func diskCapacity(dir string) int64 {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(dir, &st); err != nil {
