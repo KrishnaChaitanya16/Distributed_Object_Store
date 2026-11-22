@@ -24,6 +24,9 @@ var layerImages = []string{"ubuntu_20.04", "ubuntu_22.04", "nginx_latest", "node
 // sharedBaseImages are three application images built FROM the same base; build_app_images.sh creates them.
 var sharedBaseImages = []string{"minidfs-bench-app-requests_1", "minidfs-bench-app-flask_1", "minidfs-bench-app-numpy_1"}
 
+// springImages are three Spring Boot style service images built FROM eclipse-temurin:17-jre-jammy; build_spring_images.sh creates them.
+var springImages = []string{"minidfs-bench-spring-user-service_1", "minidfs-bench-spring-order-service_1", "minidfs-bench-spring-payment-service_1"}
+
 // pythonImages is the variant a reviewer proposed: three Python versions that might share a base layer.
 var pythonImages = []string{"python_3.11-slim", "python_3.10-slim", "python_3.9-slim"}
 
@@ -350,6 +353,9 @@ func BenchmarkDedup_PythonVersions(b *testing.B) {
 
 // BenchmarkDedup_SharedBase uploads three application images built FROM python:3.11-slim, so they share its layers exactly.
 func BenchmarkDedup_SharedBase(b *testing.B) { benchDockerLayers(b, "shared_base", sharedBaseImages) }
+
+// BenchmarkDedup_SpringBase uploads three services built FROM one JRE image, where the shared base is almost the whole image.
+func BenchmarkDedup_SpringBase(b *testing.B) { benchDockerLayers(b, "spring_base", springImages) }
 
 // BenchmarkDedup_RawMedia uploads random bytes of the same total size as the Docker workload, where no chunk repeats.
 func BenchmarkDedup_RawMedia(b *testing.B) {

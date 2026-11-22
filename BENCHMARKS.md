@@ -21,7 +21,7 @@ All eight benchmarks use the same protocol, on the same commit and the same mach
 
 | # | Question | Result |
 |---|---|---|
-| 1 | Does dedup save storage and time? | Depends on content: 1.00x random media, 1.14x unrelated images, 2.06x images on a shared base. Upload time 1.56x faster on the shared base (CI 1.48-1.68), 1.10x on unrelated images (CI 1.05-1.21), not distinguishable on random media |
+| 1 | Does dedup save storage and time? | Depends on content: 1.00x random media, 1.14x unrelated images, 2.06x Python apps on a shared base, 2.95x Spring Boot services on a shared JRE base. Upload time 2.14x faster on the JRE base (CI 1.97-2.31), 1.56x on the Python base (CI 1.48-1.68), 1.10x on unrelated images (CI 1.05-1.21), not distinguishable on random media |
 | 2 | Does RF=2 keep data available? | One worker down: 200 of 200 served in all 7 repetitions, 0 wrong, no read slowdown. Two down: 9.5% unavailable, all 503. RF=1 one down: 22.0% unavailable |
 | 3 | What does the scrubber add? | 0 wrong bytes with or without it (the controller verifies SHA-256). It finds the 10 of 10 damaged copies that reads never see; without it 4 corrupt copies stay on disk |
 | 4 | Do hedged reads cut tail latency? | 100 ms slow worker: P99 28.0 ms with hedging vs 103.5 ms without (3.7x). 0 hedges in 700 reads when nothing is slow |
@@ -40,6 +40,7 @@ Defects found and fixed while benchmarking: the download returned 502 instead of
 * **A, Docker layers.** The layer tarballs of five real images, uploaded in this order: `ubuntu:20.04`, `ubuntu:22.04`, `nginx:latest`, `node:18-slim`, `python:3.11-slim` (18 files, 620 MiB, 633 chunks), extracted by `test/benchmarks/fetch_layers.sh`.
 * **C, Python versions.** `python:3.11-slim`, `3.10-slim`, `3.9-slim` (12 files, 365 MiB, 372 chunks). They share no whole layer, but some chunks are alike.
 * **D, shared base.** Three application images (requests, flask, numpy) built `FROM python:3.11-slim` by `build_app_images.sh`, so they share the base layers exactly (15 files, 481 MiB, 488 chunks).
+* **E, Spring Boot base.** Three service images (user, order, payment) built `FROM eclipse-temurin:17-jre-jammy` by `build_spring_images.sh`, each adding only a random 2 MiB file standing in for the application jar (18 files, 774 MiB, 789 chunks). The JRE layers are about 98% of each image. These are stand-ins, not real Spring Boot builds, whose jars are tens of MiB.
 * **B, random media.** 5 files of 124 MiB from `crypto/rand` (620 MiB, 625 chunks); no two chunks can match.
 * **Baseline, dedup off.** The same uploads through the same code with `Server.DisableDedup()`: every chunk is written to its workers again and the Bloom filter is skipped.
 * "Upload ms per chunk" is one sample per uploaded file: the time of the whole request divided by its number of chunks (files differ in size, so raw per-file time would mostly measure file size). "Storage ratio" is what a replicated store without dedup would write (`uploaded x 2`) divided by what is on the workers' disks.
@@ -99,6 +100,26 @@ Upload time off / on: 1.11x (95% CI 0.98-1.24)
 
 Upload time off / on: 1.56x (95% CI 1.48-1.68)
 
+**E. Three Spring Boot services on one JRE base** (18 files, 774 MiB, 789 chunks)
+
+| Metric (median over reps, min-max) | Dedup on | Dedup off |
+|---|---|---|
+| Chunks deduplicated | 520 | 0 |
+| Bytes sent to workers (MiB) | 524 | 1,548 |
+| Bytes on worker disks (MiB) | 524 | 524 |
+| Storage ratio | 2.95 | n/a |
+| Bloom false positives (% of checks) | 0.00 | n/a |
+| Upload ms per chunk, P50 (n=126 files) | 6.1 | 16.3 |
+| Upload ms per chunk, P95 (n=126 files) | 17.9 | 28.0 |
+| Upload ms per chunk, P99 (n=126 files) | 20.2 | 50.0 |
+| Upload ms per chunk, max (n=126 files) | 21.0 | 78.3 |
+| Whole upload, seconds | 6.9 (5.8-7.5) | 14.8 (13.3-15.8) |
+| Throughput, MiB/s | 112.3 (103.0-134.2) | 52.3 (49.1-58.3) |
+
+Upload time off / on: 2.14x (95% CI 1.97-2.31)
+
+This workload (E) was run separately from the others, on the same machine, after the heartbeat fix (commit 0d5ad66), with the same protocol: 1 warm-up and 7 repetitions.
+
 **B. Random media** (5 files, 620 MiB, 625 chunks)
 
 | Metric (median over reps, min-max) | Dedup on | Dedup off |
@@ -127,8 +148,8 @@ Upload time off / on: 1.05x (95% CI 0.95-1.08)
 | bbolt transaction recording a chunk reference (paid by both modes) | 1.64 ms (1.52-2.17) |
 
 ### What the data says
-1. **Savings depend entirely on what is uploaded, and they are exact.** Storage ratio 1.14x for unrelated images, 1.17x for three Python versions, 2.06x for three images on one base, 1.00x for random media. The counts were identical in all 7 repetitions. 2.06x is the theoretical limit for the shared-base workload (two of the three images are almost entirely duplicates of the first).
-2. **Sending less is faster only when a lot is saved.** Shared base: 1.56x less upload time (CI 1.48-1.68), per-chunk P50 6.8 ms against 19.1 ms, throughput 73 against 47 MiB/s. Unrelated images: 1.10x (CI 1.05-1.21), small but distinguishable. Python versions: 1.11x but the interval (0.98-1.24) contains 1.00, so not distinguishable.
+1. **Savings depend entirely on what is uploaded, and they are exact.** Storage ratio 1.14x for unrelated images, 1.17x for three Python versions, 2.06x for three images on one base, 1.00x for random media, 2.95x for three Spring Boot services on one JRE base. The counts were identical in all 7 repetitions. 2.06x is the theoretical limit for the shared-base workload (two of the three images are almost entirely duplicates of the first). The JRE workload reaches 2.95x of a theoretical 3.0x because the base is about 98% of each image: 520 of 789 chunks were deduplicated, and 524 MiB were stored instead of 1,548 MiB.
+2. **Sending less is faster only when a lot is saved.** Shared base: 1.56x less upload time (CI 1.48-1.68), per-chunk P50 6.8 ms against 19.1 ms, throughput 73 against 47 MiB/s. Unrelated images: 1.10x (CI 1.05-1.21), small but distinguishable. JRE base: 2.14x (CI 1.97-2.31), per-chunk P50 6.1 ms against 16.3 ms, throughput 112 against 52 MiB/s; the bigger the shared share, the bigger the gain. Python versions: 1.11x but the interval (0.98-1.24) contains 1.00, so not distinguishable.
 3. **When nothing repeats, dedup costs nothing measurable.** Random media: 1.05x (CI 0.95-1.08), P50 per chunk 20.1 against 21.7 ms, 0 Bloom false positives. The per-chunk work dedup adds is a 46 ns Bloom lookup and a 93 ns insert against a 20 ms upload. The spec expected about 2 ms of overhead per chunk; the cost it had in mind is a metadata lookup, which the Bloom filter avoids for new chunks, and the one write a new chunk needs (1.64 ms) is paid with dedup on or off.
 4. **Disk use is the same with dedup on or off.** Chunks are content-addressed, so writing an identical chunk again replaces the same file. What dedup saves is network transfer and worker writes (the "bytes sent" row), and the storage ratio is measured against the no-dedup size.
 
@@ -140,7 +161,7 @@ Upload time off / on: 1.05x (95% CI 0.95-1.08)
 
 ### Reproduce
 ```bash
-test/benchmarks/fetch_layers.sh && test/benchmarks/build_app_images.sh
+test/benchmarks/build_app_images.sh && test/benchmarks/build_spring_images.sh && test/benchmarks/fetch_layers.sh
 go test ./test/benchmarks/ -run '^$' -bench 'Dedup_' -benchtime=1x -timeout 5h
 go test ./test/benchmarks/ -run '^$' -bench 'DedupCheck_' -count=7
 ```

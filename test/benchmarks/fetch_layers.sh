@@ -4,8 +4,8 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 out="$root/testdata/layers"
-# default image set: benchmark 1 (Docker layers) and its Python-versions variant; pass image names as arguments to fetch others
-images=(ubuntu:20.04 ubuntu:22.04 nginx:latest node:18-slim python:3.11-slim python:3.10-slim python:3.9-slim)
+# default image set: benchmark 1 (Docker layers) and its variants; build_app_images.sh and build_spring_images.sh must have run first; pass image names as arguments to fetch others
+images=(ubuntu:20.04 ubuntu:22.04 nginx:latest node:18-slim python:3.11-slim python:3.10-slim python:3.9-slim minidfs-bench-app-requests:1 minidfs-bench-app-flask:1 minidfs-bench-app-numpy:1 minidfs-bench-spring-user-service:1 minidfs-bench-spring-order-service:1 minidfs-bench-spring-payment-service:1)
 if [ "$#" -gt 0 ]; then images=("$@"); fi
 
 for img in "${images[@]}"; do

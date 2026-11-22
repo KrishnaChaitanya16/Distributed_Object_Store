@@ -50,7 +50,9 @@ def env():
 
 
 def dedup():
-    for name, title in [("docker_layers", "A. Docker layers"), ("python_versions", "C. Python 3.11 / 3.10 / 3.9"), ("shared_base", "D. Three apps on one base image"), ("raw_media", "B. Random media")]:
+    for name, title in [("docker_layers", "A. Docker layers"), ("python_versions", "C. Python 3.11 / 3.10 / 3.9"), ("shared_base", "D. Three apps on one base image"), ("spring_base", "E. Three Spring Boot services on one JRE base"), ("raw_media", "B. Random media")]:
+        if not os.path.exists(os.path.join(D, "dedup-" + name + ".json")):
+            continue
         r = load("dedup-" + name)["results"]
         on, off = r["dedup_on"], r["dedup_off"]
         print(f"\n**{title}** ({r['files']} files, {r['uploaded_mib']:.0f} MiB, {r['chunks']} chunks)\n")
