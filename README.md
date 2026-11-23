@@ -100,7 +100,7 @@ physical worker, guaranteeing RF=2 on distinct machines.
 | Go | 1.22 |
 | Docker | 24 |
 | Docker Compose | v2 (plugin, not standalone) |
-| `mmdc` (optional) | For regenerating Mermaid diagrams |
+
 
 ---
 
