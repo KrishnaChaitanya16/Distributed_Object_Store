@@ -119,6 +119,12 @@ cd Distributed_Object_Store
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
+To run in the background (detached):
+
+```bash
+docker compose -f deploy/docker-compose.yml up --build -d
+```
+
 This starts seven containers:
 
 | Container | Port | Purpose |
@@ -132,7 +138,24 @@ This starts seven containers:
 | `prometheus` | 9090 | Metrics scraper |
 | `grafana` | 3000 | Dashboard (admin / admin) |
 
-### 3. Upload a file
+### 3. Verify the cluster is ready
+
+Wait a few seconds for the workers to register, then check that all four are online:
+
+```bash
+curl -s http://localhost:8080/api/v1/objects | head -c 200
+# Should return {"objects":[]} — means the controller is up and healthy
+```
+
+You can also check container status:
+
+```bash
+docker compose -f deploy/docker-compose.yml ps
+```
+
+All containers should show `running` (or `Up`).
+
+### 4. Upload a file
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/objects \
@@ -140,31 +163,83 @@ curl -X POST http://localhost:8080/api/v1/objects \
   -F "name=my-file"
 ```
 
-### 4. Download it back
+The response includes the `object_id` you will use for all subsequent operations:
+
+```json
+{"object_id":"abc123...","name":"my-file","size_bytes":1234,"content_type":"text/plain"}
+```
+
+### 5. List all objects
 
 ```bash
-# replace <object_id> with the id returned by the upload
+curl http://localhost:8080/api/v1/objects
+```
+
+### 6. Download an object
+
+```bash
+# Replace <object_id> with the id returned by the upload
 curl http://localhost:8080/api/v1/objects/<object_id> -o downloaded.txt
 ```
 
-### 5. Open the Web UI
+For a partial download (range request):
+
+```bash
+curl -H "Range: bytes=0-1023" \
+  http://localhost:8080/api/v1/objects/<object_id> -o first-1kb.bin
+```
+
+### 7. Get metadata
+
+```bash
+curl http://localhost:8080/api/v1/objects/<object_id>/metadata
+```
+
+### 8. Update metadata
+
+```bash
+curl -X PATCH http://localhost:8080/api/v1/objects/<object_id>/metadata \
+  -H "Content-Type: application/json" \
+  -d '{"name":"new-name.txt","content_type":"text/plain"}'
+```
+
+### 9. Delete an object
+
+```bash
+curl -X DELETE http://localhost:8080/api/v1/objects/<object_id>
+# Returns 204 No Content on success
+```
+
+### 10. Open the Web UI
 
 Navigate to **http://localhost:8081** to see the live cluster visualization —
 upload flow animation, hash ring, Bloom filter bit-cell view, worker health,
 and GC healing history.
 
-### 6. Open Grafana
+### 11. Open Grafana
 
-Navigate to **http://localhost:3000** (admin / admin).
+Navigate to **http://localhost:3000** and log in with **admin / admin**.
 The **MiniDFS Overview** dashboard is pre-provisioned — no setup required.
 
-### 7. Tear down
+### 12. View logs
 
 ```bash
-docker compose -f deploy/docker-compose.yml down -v
+# All containers
+docker compose -f deploy/docker-compose.yml logs -f
+
+# Controller only
+docker compose -f deploy/docker-compose.yml logs -f controller
 ```
 
-The `-v` flag removes the data volumes. Omit it to persist chunk data across restarts.
+### 13. Tear down
+
+```bash
+# Stop and remove containers, keeping data volumes
+docker compose -f deploy/docker-compose.yml down
+
+# Stop and remove containers AND wipe all data volumes
+docker compose -f deploy/docker-compose.yml down -v
+```
 
 ---
 
